@@ -15,6 +15,26 @@ has_permission = {
 	"Microsoft Calendar": "frappe_microsoft365.permissions.calendar_has_permission",
 }
 
+# ------------------------------------------------------------------------------
+# Microsoft 365 — post-migrate setup, Event sync, scheduler
+# ------------------------------------------------------------------------------
+after_migrate = "frappe_microsoft365.setup.after_migrate"
+
+doc_events = {
+	"Event": {
+		"on_update": "frappe_microsoft365.microsoft_calendar_sync.event_on_update",
+		"on_trash": "frappe_microsoft365.microsoft_calendar_sync.event_on_trash",
+	},
+}
+
+scheduler_events = {
+	"cron": {
+		"*/15 * * * *": [
+			"frappe_microsoft365.microsoft_calendar_sync.sync_all",
+		],
+	},
+}
+
 # Apps
 # ------------------
 

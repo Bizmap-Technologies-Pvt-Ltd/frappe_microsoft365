@@ -1,0 +1,67 @@
+"""Idempotent post-migrate setup for frappe_microsoft365.
+
+Creates the custom fields on the standard Frappe ``Event`` doctype that let an Event be
+mirrored to/from a Microsoft (Outlook) calendar. Safe to run on every migrate.
+"""
+
+import frappe
+from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+
+
+def after_migrate():
+	"""Dispatcher for all after_migrate work (compose future steps here)."""
+	create_event_custom_fields()
+
+
+def create_event_custom_fields():
+	"""Add Microsoft-sync custom fields to the Event doctype (idempotent)."""
+	custom_fields = {
+		"Event": [
+			{
+				"fieldname": "microsoft_calendar_section",
+				"fieldtype": "Section Break",
+				"label": "Microsoft Calendar",
+				"insert_after": "sync_with_google_calendar"
+				if frappe.db.has_column("Event", "sync_with_google_calendar")
+				else "description",
+				"collapsible": 1,
+			},
+			{
+				"fieldname": "custom_sync_with_microsoft_calendar",
+				"fieldtype": "Check",
+				"label": "Sync with Microsoft Calendar",
+				"insert_after": "microsoft_calendar_section",
+			},
+			{
+				"fieldname": "custom_microsoft_calendar",
+				"fieldtype": "Link",
+				"label": "Microsoft Calendar",
+				"options": "Microsoft Calendar",
+				"insert_after": "custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+			},
+			{
+				"fieldname": "custom_microsoft_calendar_column",
+				"fieldtype": "Column Break",
+				"insert_after": "custom_microsoft_calendar",
+			},
+			{
+				"fieldname": "custom_microsoft_event_id",
+				"fieldtype": "Data",
+				"label": "Microsoft Event ID",
+				"insert_after": "custom_microsoft_calendar_column",
+				"read_only": 1,
+				"no_copy": 1,
+			},
+			{
+				"fieldname": "custom_pulled_from_microsoft",
+				"fieldtype": "Check",
+				"label": "Pulled From Microsoft",
+				"insert_after": "custom_microsoft_event_id",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+		]
+	}
+	create_custom_fields(custom_fields, ignore_validate=True)
