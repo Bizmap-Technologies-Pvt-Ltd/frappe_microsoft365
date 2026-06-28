@@ -5,6 +5,16 @@ app_description = "Microsoft 365 integration for Frappe/ERPNext: Outlook calenda
 app_email = "suraj@bizmap.in"
 app_license = "mit"
 
+# ------------------------------------------------------------------------------
+# Microsoft 365 — permissions (per-user calendar scoping)
+# ------------------------------------------------------------------------------
+permission_query_conditions = {
+	"Microsoft Calendar": "frappe_microsoft365.permissions.calendar_pqc",
+}
+has_permission = {
+	"Microsoft Calendar": "frappe_microsoft365.permissions.calendar_has_permission",
+}
+
 # Apps
 # ------------------
 
