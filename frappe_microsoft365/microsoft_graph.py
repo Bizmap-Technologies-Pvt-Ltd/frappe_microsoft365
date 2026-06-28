@@ -32,8 +32,14 @@ class MsGraphError(frappe.ValidationError):
 
 # --- settings helpers ----------------------------------------------------------------
 
+def _settings_doc():
+	"""The Microsoft Settings single, WITHOUT the enabled check (pure config reads)."""
+	return frappe.get_cached_doc("Microsoft Settings")
+
+
 def get_settings():
-	s = frappe.get_cached_doc("Microsoft Settings")
+	"""Settings for LIVE operations — requires the integration to be enabled."""
+	s = _settings_doc()
 	if not s.enabled:
 		frappe.throw("Microsoft 365 integration is disabled. Enable it in Microsoft Settings.", MsGraphError)
 	return s
@@ -47,13 +53,13 @@ def _client_secret():
 
 
 def get_authority(settings=None):
-	settings = settings or get_settings()
+	settings = settings or _settings_doc()
 	tenant = (settings.tenant_id or "common").strip()
 	return f"https://login.microsoftonline.com/{tenant}"
 
 
 def get_scopes(settings=None):
-	settings = settings or get_settings()
+	settings = settings or _settings_doc()
 	raw = (settings.default_scopes or "").strip()
 	if raw:
 		return [s.strip() for s in raw.replace(",", " ").split() if s.strip()]
@@ -61,7 +67,7 @@ def get_scopes(settings=None):
 
 
 def get_redirect_uri(settings=None):
-	settings = settings or get_settings()
+	settings = settings or _settings_doc()
 	if settings.redirect_uri:
 		return settings.redirect_uri.strip()
 	return f"{get_url()}/api/method/{CALLBACK_METHOD}"
