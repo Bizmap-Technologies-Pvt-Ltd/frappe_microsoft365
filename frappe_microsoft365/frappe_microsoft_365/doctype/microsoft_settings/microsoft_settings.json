@@ -1,0 +1,41 @@
+{
+ "actions": [],
+ "creation": "2026-06-28 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "setup_help",
+  "app_section",
+  "tenant_id",
+  "client_id",
+  "client_secret",
+  "column_break_app",
+  "redirect_uri",
+  "default_scopes"
+ ],
+ "fields": [
+  {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled", "default": "0"},
+  {"fieldname": "setup_help", "fieldtype": "HTML", "label": "Setup Help", "options": "<div class='text-muted' style='font-size:12px;line-height:1.6'><b>Azure AD app registration</b><br>1. Entra portal &rarr; App registrations &rarr; New registration.<br>2. Add a <b>Web</b> redirect URI = the Redirect URI shown below.<br>3. Certificates &amp; secrets &rarr; new client secret &rarr; paste it here.<br>4. API permissions (Microsoft Graph, Delegated): <code>offline_access openid profile User.Read Calendars.ReadWrite OnlineMeetings.ReadWrite OnlineMeetingTranscript.Read.All</code> &rarr; Grant admin consent.<br>5. Copy Application (client) ID and Directory (tenant) ID here.</div>"},
+  {"fieldname": "app_section", "fieldtype": "Section Break", "label": "Azure AD Application"},
+  {"fieldname": "tenant_id", "fieldtype": "Data", "label": "Tenant ID", "description": "Directory (tenant) ID, or 'common' / 'organizations' for multi-tenant."},
+  {"fieldname": "client_id", "fieldtype": "Data", "label": "Client ID", "description": "Application (client) ID."},
+  {"fieldname": "client_secret", "fieldtype": "Password", "label": "Client Secret"},
+  {"fieldname": "column_break_app", "fieldtype": "Column Break"},
+  {"fieldname": "redirect_uri", "fieldtype": "Data", "label": "Redirect URI", "description": "Register this exact URI in Azure. Leave blank to use the site default (shown after first save)."},
+  {"fieldname": "default_scopes", "fieldtype": "Small Text", "label": "Delegated Scopes", "default": "User.Read Calendars.ReadWrite OnlineMeetings.ReadWrite OnlineMeetingTranscript.Read.All", "description": "Space-separated Graph delegated scopes (offline_access/openid/profile are added automatically)."}
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-06-28 00:00:00",
+ "module": "Frappe Microsoft 365",
+ "name": "Microsoft Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "read": 1, "write": 1, "role": "System Manager"}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
