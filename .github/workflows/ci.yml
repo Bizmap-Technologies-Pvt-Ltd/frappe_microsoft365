@@ -24,6 +24,12 @@ jobs:
         options: >-
           --health-cmd="mariadb-admin ping --host=localhost --password=root"
           --health-interval=5s --health-timeout=2s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
 
     steps:
       - name: Clone
@@ -42,7 +48,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mariadb-client redis-server libcups2-dev
+          sudo apt-get install -y mariadb-client redis-tools libcups2-dev
 
       - name: Install frappe-bench
         run: pip install frappe-bench
@@ -52,12 +58,16 @@ jobs:
           bench init --skip-redis-config-generation --skip-assets \
             --frappe-branch version-15 --python "$(which python)" ~/frappe-bench
 
-      - name: Configure MariaDB charset
+      - name: Point bench at the CI services
+        working-directory: /home/runner/frappe-bench
         run: |
+          bench set-config -g redis_cache    redis://localhost:6379
+          bench set-config -g redis_queue    redis://localhost:6379
+          bench set-config -g redis_socketio redis://localhost:6379
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
-      - name: Get app + create site + install
+      - name: Get app + create site + install + migrate
         working-directory: /home/runner/frappe-bench
         env:
           CI: "Yes"
@@ -65,7 +75,7 @@ jobs:
           bench get-app frappe_microsoft365 "${GITHUB_WORKSPACE}"
           bench new-site test_site \
             --mariadb-root-password root --admin-password admin \
-            --no-mariadb-socket --db-host 127.0.0.1 --db-port 3306
+            --db-host 127.0.0.1 --db-port 3306 --mariadb-user-host-login-scope='%'
           bench --site test_site install-app frappe_microsoft365
           bench --site test_site migrate
 
