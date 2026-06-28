@@ -113,6 +113,8 @@ def disconnect(calendar_name):
 
 @frappe.whitelist()
 def sync(calendar_name=None):
-	"""Two-way sync entrypoint. Full implementation lands in M2 (calendar sync)."""
+	"""Two-way sync entrypoint (M2). Owner-checked."""
+	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
+	_check_owner(doc)
 	from frappe_microsoft365.microsoft_calendar_sync import sync_calendar
 	return sync_calendar(calendar_name)
