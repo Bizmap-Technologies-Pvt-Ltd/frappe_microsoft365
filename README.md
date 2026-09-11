@@ -7,8 +7,9 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
 
 ## Features
 
-- **Outlook calendar two-way sync** — Microsoft events ↔ Frappe `Event` (pull on a schedule,
-  push on save/delete via doc events). Per-calendar `pull`/`push` toggles.
+- **Outlook calendar two-way sync** — Microsoft events ↔ Frappe `Event` (delta pull on a
+  schedule, push on save/delete via doc events). Per-calendar `pull`/`push` toggles.
+  Handles recurring series, deletions, paging and throttling; see *How the sync behaves*.
 - **Teams meeting creation** — create a calendar-associated Teams online meeting and get back the
   join URL / event id / online-meeting id (calendar association is the precondition for transcripts).
 - **Transcripts & recordings** — list and fetch Teams meeting transcripts (VTT) and recordings for
@@ -71,6 +72,37 @@ http://m365.localhost:8000/api/method/frappe_microsoft365.frappe_microsoft_365.d
    **Sync Now** to verify.
 
 Full walkthrough with screenshots-worthy detail: [`docs/azure-setup.md`](docs/azure-setup.md).
+
+## How the sync behaves
+
+Worth knowing before you trust it with a real calendar:
+
+- **Delta queries, not "modified since".** The pull runs `/me/calendarView/delta`, so recurring
+  series arrive as individual occurrences with stable ids (no duplicates on later runs) and
+  deletions arrive as `@removed` entries (no orphaned Frappe Events). The delta link is stored
+  on the Microsoft Calendar and is the sync watermark.
+- **A failed pull never advances the watermark.** If Graph errors halfway, the next run repeats
+  that window instead of skipping it. The reason is written to **Last Sync Error** on the form.
+- **Every page is read.** Collection reads follow `@odata.nextLink` to the end, so a calendar
+  with hundreds of events in the window imports completely, not just the first page.
+- **Origin decides who wins.** An Event that originated in Frappe keeps
+  `custom_pulled_from_microsoft = 0` for life: the pull refreshes its subject, times and
+  location from Outlook but never overwrites its description (Graph only returns a truncated
+  plain-text preview) and never flips the flag, so later local edits keep syncing out.
+  Events that originated in Microsoft are mirrors and are fully overwritten.
+- **Nothing is saved when nothing changed**, so `modified` does not churn and the push step does
+  not patch the same event back to Graph on every run.
+- **The delta window** covers 30 days back and 180 days forward, and is re-initialised
+  automatically when its far edge gets within 14 days.
+- **Concurrency and throttling.** Each calendar syncs under a file lock, so a slow run is never
+  overlapped by the next cron. A `429` is retried once after a short `Retry-After`; longer
+  backoffs are left to the next scheduled run. A `410` (expired delta token) restarts a full
+  sync automatically.
+- **Timezones.** Graph is asked for UTC, and Windows timezone ids (`Pacific Standard Time`) are
+  mapped to IANA rather than silently assumed to be UTC.
+
+Access to `Microsoft Calendar` is granted to **System Manager** and **Desk User** (the same
+pattern Frappe's Google Calendar uses), and each user only sees their own connection.
 
 ## How it's consumed (for app developers)
 

@@ -1,10 +1,11 @@
 """Smoke tests — assert the app installs cleanly and its core surface is present."""
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+
+from frappe_microsoft365.tests.base import BaseTestCase
 
 
-class TestMicrosoftSettings(FrappeTestCase):
+class TestMicrosoftSettings(BaseTestCase):
 	def test_doctypes_exist(self):
 		for dt in ("Microsoft Settings", "Microsoft Calendar"):
 			self.assertTrue(frappe.db.exists("DocType", dt), f"{dt} should be installed")
@@ -13,9 +14,9 @@ class TestMicrosoftSettings(FrappeTestCase):
 		self.assertTrue(frappe.get_meta("Microsoft Settings").issingle)
 
 	def test_core_modules_import(self):
-		from frappe_microsoft365 import (  # noqa: F401
-			microsoft_graph,
+		from frappe_microsoft365 import (
 			microsoft_calendar_sync,
+			microsoft_graph,
 			microsoft_meetings,
 			microsoft_transcripts,
 			permissions,

@@ -15,8 +15,8 @@ import frappe
 from frappe import _
 
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphError
 from frappe_microsoft365.microsoft_calendar_sync import _check_owner
+from frappe_microsoft365.microsoft_graph import MsGraphError
 from frappe_microsoft365.microsoft_meetings import _resolve_online_meeting_id
 
 _PERM_HINT = (

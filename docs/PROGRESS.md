@@ -51,3 +51,21 @@
 
 All whitelisted methods are owner-checked (caller must own the Microsoft Calendar, or be a
 System Manager / Administrator).
+
+## M5 — Sync correctness (done)
+- Pull rewritten on `/me/calendarView/delta`: stable occurrence ids (recurring series no
+  longer duplicate), `@removed` deletions, and a watermark (`delta_link`) that only advances
+  after a complete read. Window: -30/+180 days, re-initialised within 14 days of its end.
+- `microsoft_graph.graph_paged()` / `graph_delta()` follow `@odata.nextLink` to the end; no
+  read is capped at the first page any more.
+- Origin is permanent: the pull never flips `custom_pulled_from_microsoft` and never
+  overwrites the description of an event Frappe pushed.
+- Unchanged events are not re-saved (no `modified` churn, no push/patch ping-pong).
+- Per-calendar file lock around a sync run; `429` honours a short `Retry-After`; `410`
+  triggers an automatic full re-sync.
+- Windows timezone ids mapped to IANA instead of silently falling back to UTC.
+- Push also patches events edited while the connection was down.
+- `Microsoft Calendar` permissions: `All` -> `Desk User`. New fields: `last_error`,
+  `delta_window_end`, `oauth_state_expiry` (authorize links expire after 15 minutes).
+- Tests: `frappe_microsoft365/tests/` — 31 tests over the sync engine and Graph transport
+  with mocked Graph responses. CI matrix covers Frappe version-15 and version-16.

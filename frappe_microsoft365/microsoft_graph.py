@@ -7,11 +7,11 @@ authenticated Graph v1.0 calls. Secrets/tokens are never logged or returned to c
 See docs/graph-api-reference.md for the verified endpoint/permission contract.
 """
 
-import datetime
+import time
 
 import frappe
 import requests
-from frappe.utils import get_url, now_datetime, add_to_date, get_datetime
+from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -25,9 +25,21 @@ CALLBACK_METHOD = (
 	"frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback"
 )
 
+#: Graph asks us to back off with a Retry-After header. Wait inline only for short waits;
+#: anything longer is left to the next scheduled run.
+MAX_RETRY_AFTER_SECONDS = 10
+DEFAULT_RETRY_AFTER_SECONDS = 2
+
+#: Safety valve for link-following loops (nextLink / deltaLink paging).
+MAX_PAGES = 50
+
 
 class MsGraphError(frappe.ValidationError):
 	pass
+
+
+class MsGraphResyncRequired(MsGraphError):
+	"""Graph invalidated our delta token (410 Gone). The caller must restart from a full sync."""
 
 
 # --- settings helpers ----------------------------------------------------------------
@@ -96,7 +108,7 @@ def build_authorize_url(state):
 		"response_type": "code",
 		"redirect_uri": get_redirect_uri(settings),
 		"response_mode": "query",
-		"scope": " ".join(["offline_access", "openid", "profile"] + get_scopes(settings)),
+		"scope": " ".join(["offline_access", "openid", "profile", *get_scopes(settings)]),
 		"state": state,
 		"prompt": "select_account",
 	}
@@ -183,8 +195,25 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 		return graph_request(method, path, name, json=json, params=params, headers=headers, raw=raw, _retried=True)
 
 	if resp.status_code == 429 and not _retried:
-		# brief, single retry honouring Retry-After is left to the scheduler; surface clearly here
-		frappe.throw("Microsoft Graph rate limit hit (429). Try again shortly.", MsGraphError)
+		# Honour Retry-After for short waits; longer backoffs are left to the next run.
+		wait = _retry_after_seconds(resp)
+		if wait is not None:
+			time.sleep(wait)
+			return graph_request(
+				method, path, name, json=json, params=params, headers=headers, raw=raw, _retried=True
+			)
+
+	if resp.status_code == 429:
+		frappe.throw(
+			"Microsoft Graph rate limit hit (429). The next scheduled sync will retry.", MsGraphError
+		)
+
+	if resp.status_code == 410:
+		# Delta token expired/invalid — the caller has to restart with a full sync.
+		frappe.throw(
+			f"Microsoft Graph sync state expired ({_safe_error(resp)}). A full re-sync is required.",
+			MsGraphResyncRequired,
+		)
 
 	if resp.status_code >= 400:
 		detail = _safe_error(resp)
@@ -198,12 +227,61 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 
 
 def _safe_error(resp):
+	"""A short, safe description of a Graph failure (never echoes request headers/body)."""
 	try:
-		body = resp.json()
-		err = body.get("error", {})
+		err = (resp.json() or {}).get("error", {})
 		return err.get("code") or err.get("message") or resp.reason
 	except Exception:
 		return resp.reason
+
+
+def _retry_after_seconds(resp):
+	"""Seconds to wait per the Retry-After header, or None when the wait is too long to hold."""
+	raw = (resp.headers or {}).get("Retry-After")
+	try:
+		wait = int(float(raw)) if raw else DEFAULT_RETRY_AFTER_SECONDS
+	except (TypeError, ValueError):
+		wait = DEFAULT_RETRY_AFTER_SECONDS
+	if wait > MAX_RETRY_AFTER_SECONDS:
+		return None
+	return max(wait, 1)
+
+
+def graph_paged(path, calendar, headers=None, max_pages=MAX_PAGES):
+	"""GET every page of a Graph collection, following ``@odata.nextLink``.
+
+	Graph caps page size (``$top`` is a hint, not a guarantee), so any collection read that
+	is not explicitly "first N" MUST go through this instead of graph_request.
+	"""
+	items = []
+	next_path = path
+	for _ in range(max_pages):
+		resp = graph_request("GET", next_path, calendar, headers=headers)
+		items.extend(resp.get("value") or [])
+		next_path = resp.get("@odata.nextLink")
+		if not next_path:
+			break
+	return items
+
+
+def graph_delta(path, calendar, headers=None, max_pages=MAX_PAGES):
+	"""Follow a delta query to the end. Returns ``(items, delta_link)``.
+
+	``delta_link`` is the ``@odata.deltaLink`` to pass back on the next run; it is only
+	returned once every page has been consumed, so a partial read never advances the
+	watermark. Raises MsGraphResyncRequired (410) when the token is no longer valid.
+	"""
+	items = []
+	next_path = path
+	delta_link = None
+	for _ in range(max_pages):
+		resp = graph_request("GET", next_path, calendar, headers=headers)
+		items.extend(resp.get("value") or [])
+		delta_link = resp.get("@odata.deltaLink")
+		next_path = resp.get("@odata.nextLink")
+		if delta_link or not next_path:
+			break
+	return items, delta_link
 
 
 def whoami(calendar):

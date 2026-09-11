@@ -16,6 +16,13 @@ frappe.ui.form.on("Microsoft Calendar", {
 			frm.dashboard.set_headline(
 				__("Connected as {0}", [frm.doc.microsoft_user_email || "Microsoft account"])
 			);
+			if (frm.doc.last_error) {
+				// A failed sync leaves the watermark untouched and retries next run; say so.
+				frm.dashboard.set_headline_alert(
+					__("Last sync did not complete: {0}", [frm.doc.last_error]),
+					"orange"
+				);
+			}
 			frm.add_custom_button(__("Test Connection"), () => test_conn(frm), __("Microsoft"));
 			frm.add_custom_button(__("Sync Now"), () => sync_now(frm), __("Microsoft"));
 			frm.add_custom_button(__("Re-authorize"), () => authorize(frm), __("Microsoft"));
@@ -58,9 +65,15 @@ function sync_now(frm) {
 		callback: (r) => {
 			const m = r.message || {};
 			frappe.msgprint({
-				title: __("Sync complete"),
-				message: m.message || __("Pulled {0}, pushed {1}.", [m.pulled || 0, m.pushed || 0]),
-				indicator: "green",
+				title: m.ok ? __("Sync complete") : __("Sync incomplete"),
+				message:
+					m.message ||
+					__("Pulled {0}, deleted {1}, pushed {2}.", [
+						m.pulled || 0,
+						m.deleted || 0,
+						m.pushed || 0,
+					]),
+				indicator: m.ok ? "green" : "orange",
 			});
 			frm.reload_doc();
 		},

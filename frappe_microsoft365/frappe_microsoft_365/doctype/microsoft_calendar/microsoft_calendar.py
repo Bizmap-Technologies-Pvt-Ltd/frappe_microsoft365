@@ -7,8 +7,12 @@ Handles the OAuth authorize/callback round-trip (MSAL) and exposes the account f
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import add_to_date, get_datetime, now_datetime
 
 from frappe_microsoft365 import microsoft_graph as graph
+
+#: An authorize link that is never followed should not stay usable forever.
+OAUTH_STATE_TTL_MINUTES = 15
 
 
 class MicrosoftCalendar(Document):
@@ -35,7 +39,15 @@ def authorize_access(calendar_name, reauthorize=0):
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 	state = frappe.generate_hash(length=32)
-	doc.db_set("oauth_state", state, update_modified=False)
+	frappe.db.set_value(
+		"Microsoft Calendar",
+		calendar_name,
+		{
+			"oauth_state": state,
+			"oauth_state_expiry": add_to_date(now_datetime(), minutes=OAUTH_STATE_TTL_MINUTES),
+		},
+		update_modified=False,
+	)
 	frappe.db.commit()
 	return {"url": graph.build_authorize_url(state)}
 
@@ -55,9 +67,16 @@ def callback(code=None, state=None, error=None, error_description=None, **kwargs
 	doc = frappe.get_doc("Microsoft Calendar", name)
 	_check_owner(doc)
 
+	if not doc.oauth_state_expiry or get_datetime(doc.oauth_state_expiry) < now_datetime():
+		frappe.db.set_value("Microsoft Calendar", name, "oauth_state", "", update_modified=False)
+		frappe.db.commit()
+		frappe.throw(_("This authorization link has expired. Please click Authorize again."))
+
 	result = graph.exchange_code(code)
 	graph._store_tokens(name, result)  # stores access/refresh/expiry + email from claims
-	frappe.db.set_value("Microsoft Calendar", name, {"authorized": 1, "oauth_state": ""})
+	frappe.db.set_value(
+		"Microsoft Calendar", name, {"authorized": 1, "oauth_state": "", "oauth_state_expiry": None}
+	)
 	frappe.db.commit()
 
 	# best-effort: fill account email + default calendar
@@ -105,7 +124,8 @@ def disconnect(calendar_name):
 	_check_owner(doc)
 	frappe.db.set_value("Microsoft Calendar", calendar_name, {
 		"authorized": 0, "access_token": "", "refresh_token": "", "token_expiry": None,
-		"oauth_state": "", "delta_link": "",
+		"oauth_state": "", "oauth_state_expiry": None,
+		"delta_link": "", "delta_window_end": None, "last_error": "",
 	})
 	frappe.db.commit()
 	return {"disconnected": True}
