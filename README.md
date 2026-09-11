@@ -35,7 +35,8 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
 One codebase supports both. `main` is the source of truth; `version-15` and `version-16` track
 it so the usual `bench get-app --branch <version>` works. Nothing here is version-gated, and
 every change is proven against **both** versions in CI (install, migrate, and the full test
-suite on each) before it lands.
+suite on each) before it lands. [`docs/compatibility.md`](docs/compatibility.md) records the
+API-by-API evidence, including the one place where version-specific code exists.
 
 ## Install (existing bench)
 
