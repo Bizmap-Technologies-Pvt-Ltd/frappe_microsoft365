@@ -1,15 +1,30 @@
-"""Two-way calendar sync (Frappe Event <-> Microsoft Graph). Stage M2.
+"""Two-way calendar sync (Frappe Event <-> Microsoft Graph).
 
-Mirrors Frappe's Google Calendar sync:
-  * Pull: Graph events changed since last_sync are upserted as Frappe Events.
-  * Push: Frappe Events flagged for sync (and not pulled) are created in Graph.
-  * doc_events keep individual Frappe Event edits/deletes in sync (best-effort).
+How the pull works
+------------------
+Graph is asked for a *delta* of the user's calendar view
+(``/me/calendarView/delta``) rather than a "modified since" filter. That gives us three
+things a filter cannot:
 
-All Graph calls go through ``microsoft_graph.graph_request`` (auth/refresh/clean errors).
+  * a stable id space — ``calendarView`` expands recurring series into occurrences, and a
+    delta run keeps returning those same occurrence ids, so a recurring meeting is not
+    duplicated on every run;
+  * deletions — removed events arrive as ``@removed`` entries, so a hard-deleted Microsoft
+    event no longer leaves an orphaned Frappe Event behind;
+  * a watermark we only advance once every page has been consumed, so a failure mid-run
+    means the next run repeats the work instead of skipping it.
+
+Origin matters
+--------------
+An Event that originated in Frappe (we pushed it) keeps
+``custom_pulled_from_microsoft = 0`` forever. The pull never flips that flag and never
+overwrites the description of such an event, because Graph only hands back a truncated
+plain-text ``bodyPreview``. Events that originated in Microsoft are mirrors and are fully
+overwritten by the pull.
+
+All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors).
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.
 """
-
-import datetime
 
 import frappe
 from frappe import _
@@ -21,32 +36,108 @@ from frappe.utils import (
 )
 
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphError
+from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired
 
 EVENT_SELECT = (
 	"id,subject,bodyPreview,start,end,location,isAllDay,isCancelled,"
-	"onlineMeeting,webLink,lastModifiedDateTime"
+	"onlineMeeting,webLink,type,lastModifiedDateTime"
 )
+
+#: How much of the calendar the delta window covers. Graph fixes the window when the delta
+#: is initialised, so we re-initialise before the far edge gets close.
+WINDOW_PAST_DAYS = 30
+WINDOW_FUTURE_DAYS = 180
+WINDOW_REFRESH_MARGIN_DAYS = 14
+
+#: Ask Graph to hand back UTC so we never have to interpret a Windows timezone name.
+UTC_PREFER = {"Prefer": 'odata.maxpagesize=50, outlook.timezone="UTC"'}
+
+#: Graph may still echo a Windows timezone id (e.g. on data written by an Outlook client).
+#: ZoneInfo cannot parse those, and silently falling back to UTC moves meetings by hours,
+#: so the common ones are mapped explicitly.
+WINDOWS_TO_IANA = {
+	"UTC": "UTC",
+	"GMT Standard Time": "Europe/London",
+	"Greenwich Standard Time": "Atlantic/Reykjavik",
+	"W. Europe Standard Time": "Europe/Berlin",
+	"Central Europe Standard Time": "Europe/Budapest",
+	"Central European Standard Time": "Europe/Warsaw",
+	"Romance Standard Time": "Europe/Paris",
+	"E. Europe Standard Time": "Europe/Chisinau",
+	"FLE Standard Time": "Europe/Kiev",
+	"GTB Standard Time": "Europe/Bucharest",
+	"Turkey Standard Time": "Europe/Istanbul",
+	"Israel Standard Time": "Asia/Jerusalem",
+	"Arabian Standard Time": "Asia/Dubai",
+	"Arab Standard Time": "Asia/Riyadh",
+	"India Standard Time": "Asia/Kolkata",
+	"Sri Lanka Standard Time": "Asia/Colombo",
+	"Bangladesh Standard Time": "Asia/Dhaka",
+	"SE Asia Standard Time": "Asia/Bangkok",
+	"Singapore Standard Time": "Asia/Singapore",
+	"China Standard Time": "Asia/Shanghai",
+	"Tokyo Standard Time": "Asia/Tokyo",
+	"Korea Standard Time": "Asia/Seoul",
+	"AUS Eastern Standard Time": "Australia/Sydney",
+	"AUS Central Standard Time": "Australia/Darwin",
+	"W. Australia Standard Time": "Australia/Perth",
+	"New Zealand Standard Time": "Pacific/Auckland",
+	"Eastern Standard Time": "America/New_York",
+	"US Eastern Standard Time": "America/Indiana/Indianapolis",
+	"Central Standard Time": "America/Chicago",
+	"Central Standard Time (Mexico)": "America/Mexico_City",
+	"Mountain Standard Time": "America/Denver",
+	"US Mountain Standard Time": "America/Phoenix",
+	"Pacific Standard Time": "America/Los_Angeles",
+	"Alaskan Standard Time": "America/Anchorage",
+	"Hawaiian Standard Time": "Pacific/Honolulu",
+	"Atlantic Standard Time": "America/Halifax",
+	"SA Eastern Standard Time": "America/Cayenne",
+	"E. South America Standard Time": "America/Sao_Paulo",
+	"Argentina Standard Time": "America/Argentina/Buenos_Aires",
+	"SA Pacific Standard Time": "America/Bogota",
+	"South Africa Standard Time": "Africa/Johannesburg",
+	"W. Central Africa Standard Time": "Africa/Lagos",
+	"E. Africa Standard Time": "Africa/Nairobi",
+	"Egypt Standard Time": "Africa/Cairo",
+	"Morocco Standard Time": "Africa/Casablanca",
+	"Russian Standard Time": "Europe/Moscow",
+}
 
 
 # --- datetime helpers ----------------------------------------------------------------
 
+def _zone(tz_name):
+	"""Resolve a Graph timezone name (IANA or Windows) to a ZoneInfo, defaulting to UTC."""
+	from zoneinfo import ZoneInfo
+
+	name = (tz_name or "UTC").strip()
+	try:
+		return ZoneInfo(name)
+	except Exception:
+		pass
+	mapped = WINDOWS_TO_IANA.get(name)
+	if mapped:
+		try:
+			return ZoneInfo(mapped)
+		except Exception:
+			pass
+	# Unknown zone: log once per name so a wrong-by-hours event is traceable, not silent.
+	frappe.log_error(title=f"MS Calendar: unknown timezone '{name}', assuming UTC")
+	return ZoneInfo("UTC")
+
+
 def _ms_dt_to_system(dt):
 	"""Convert a Graph dateTimeTimeZone dict to a naive datetime in the system timezone."""
-	from dateutil import parser
 	from zoneinfo import ZoneInfo
+
+	from dateutil import parser
 
 	if not dt or not dt.get("dateTime"):
 		return None
-	raw = dt["dateTime"]
-	tz = dt.get("timeZone") or "UTC"
-	parsed = parser.parse(raw)
+	parsed = parser.parse(dt["dateTime"])
 	if parsed.tzinfo is None:
-		# Graph timeZone is an IANA/Windows name; UTC is the common default
-		try:
-			parsed = parsed.replace(tzinfo=ZoneInfo(tz))
-		except Exception:
-			parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+		parsed = parsed.replace(tzinfo=_zone(dt.get("timeZone")))
 	return parsed.astimezone(ZoneInfo(get_system_timezone())).replace(tzinfo=None)
 
 
@@ -57,13 +148,27 @@ def _system_dt_to_ms(dt):
 
 
 def _iso_utc(dt):
-	"""Render a naive/system datetime as a UTC ISO8601 string for $filter."""
+	"""Render a naive/system datetime as a UTC ISO8601 string for Graph query params."""
 	from zoneinfo import ZoneInfo
 
 	dt = get_datetime(dt)
 	if dt.tzinfo is None:
 		dt = dt.replace(tzinfo=ZoneInfo(get_system_timezone()))
 	return dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --- concurrency ---------------------------------------------------------------------
+
+def _calendar_lock(calendar_name):
+	"""Per-calendar lock so a long sync is never overlapped by the next scheduled run."""
+	try:
+		from frappe.utils.synchronization import filelock
+
+		return filelock(f"microsoft365_sync_{frappe.scrub(calendar_name)}", timeout=1)
+	except ImportError:  # pragma: no cover - older Frappe without filelock
+		from contextlib import nullcontext
+
+		return nullcontext()
 
 
 # --- entrypoints ---------------------------------------------------------------------
@@ -94,160 +199,275 @@ def sync_all():
 def sync_calendar(calendar_name=None):
 	"""Pull then push for a single Microsoft Calendar. Returns a JSON-serializable summary."""
 	if not calendar_name:
-		return {"ok": False, "pulled": 0, "pushed": 0, "message": "No calendar specified."}
+		return {"ok": False, "pulled": 0, "deleted": 0, "pushed": 0, "message": "No calendar specified."}
 
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	if not doc.enabled or not doc.authorized:
 		return {
 			"ok": False,
 			"pulled": 0,
+			"deleted": 0,
 			"pushed": 0,
 			"message": "Calendar is disabled or not authorized.",
 		}
 
-	pulled = pushed = 0
+	from frappe.utils.file_lock import LockTimeoutError
+
+	try:
+		with _calendar_lock(calendar_name):
+			return _sync_locked(doc)
+	except LockTimeoutError:
+		return {
+			"ok": False,
+			"pulled": 0,
+			"deleted": 0,
+			"pushed": 0,
+			"message": "Another sync is already running for this calendar.",
+		}
+
+
+def _sync_locked(doc):
+	calendar_name = doc.name
+	pulled = deleted = pushed = 0
 	messages = []
+	pull_ok = True
 
 	if doc.pull_from_microsoft_calendar:
 		try:
-			pulled = _pull(doc)
-		except MsGraphError as e:
+			pulled, deleted = _pull(doc)
+		except Exception as e:
+			pull_ok = False
 			messages.append(f"Pull failed: {e}")
 			frappe.log_error(title=f"MS Calendar pull failed: {calendar_name}")
-		except Exception as e:
-			messages.append(f"Pull error: {e}")
-			frappe.log_error(title=f"MS Calendar pull error: {calendar_name}")
 
 	if doc.push_to_microsoft_calendar:
 		try:
 			pushed = _push(doc)
-		except MsGraphError as e:
+		except Exception as e:
 			messages.append(f"Push failed: {e}")
 			frappe.log_error(title=f"MS Calendar push failed: {calendar_name}")
-		except Exception as e:
-			messages.append(f"Push error: {e}")
-			frappe.log_error(title=f"MS Calendar push error: {calendar_name}")
 
-	frappe.db.set_value("Microsoft Calendar", calendar_name, "last_sync", now_datetime())
+	# The watermark only moves when the pull actually completed. Advancing it after a
+	# failure would silently skip every change made inside the failed window.
+	updates = {"last_error": "; ".join(messages)[:500] or ""}
+	if pull_ok:
+		updates["last_sync"] = now_datetime()
+	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
 	frappe.db.commit()
 
 	return {
 		"ok": not messages,
 		"pulled": pulled,
+		"deleted": deleted,
 		"pushed": pushed,
-		"message": "; ".join(messages) or f"Pulled {pulled}, pushed {pushed}.",
+		"message": "; ".join(messages) or f"Pulled {pulled}, deleted {deleted}, pushed {pushed}.",
 	}
 
 
 # --- pull (Graph -> Frappe) ----------------------------------------------------------
 
+def _initial_delta_path():
+	start = _iso_utc(add_to_date(now_datetime(), days=-WINDOW_PAST_DAYS))
+	end = _iso_utc(add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS))
+	return (
+		f"/me/calendarView/delta?startDateTime={start}&endDateTime={end}"
+		f"&$select={EVENT_SELECT}"
+	)
+
+
+def _delta_window_is_stale(doc):
+	"""True when the stored delta window is close to its end and must be re-initialised."""
+	if not doc.delta_window_end:
+		return True
+	margin = add_to_date(now_datetime(), days=WINDOW_REFRESH_MARGIN_DAYS)
+	return get_datetime(doc.delta_window_end) <= margin
+
+
 def _pull(doc):
-	"""Pull changed Microsoft events into Frappe. Returns count upserted/processed."""
-	if doc.last_sync:
-		since = _iso_utc(doc.last_sync)
-		path = (
-			f"/me/events?$select={EVENT_SELECT}&$top=50"
-			f"&$orderby=lastModifiedDateTime desc"
-			f"&$filter=lastModifiedDateTime ge {since}"
-		)
-		resp = graph.graph_request("GET", path, doc.name)
-		events = resp.get("value", [])
-	else:
-		# first sync: a recent window via calendarView (expands recurrences, returns UTC)
-		start = _iso_utc(add_to_date(now_datetime(), days=-30))
-		end = _iso_utc(add_to_date(now_datetime(), days=60))
-		path = (
-			f"/me/calendarView?startDateTime={start}&endDateTime={end}"
-			f"&$select={EVENT_SELECT}&$top=50&$orderby=start/dateTime"
-		)
-		resp = graph.graph_request(
-			"GET", path, doc.name, headers={"Prefer": 'outlook.timezone="UTC"'}
-		)
-		events = resp.get("value", [])
+	"""Pull changes from Microsoft into Frappe. Returns (upserted, deleted)."""
+	reuse_delta = doc.delta_link and not _delta_window_is_stale(doc)
+	path = doc.delta_link if reuse_delta else _initial_delta_path()
+
+	try:
+		items, delta_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
+	except MsGraphResyncRequired:
+		# Token expired or the mailbox was moved: start the window again from scratch.
+		items, delta_link = graph.graph_delta(_initial_delta_path(), doc.name, headers=UTC_PREFER)
+		reuse_delta = False
 
 	frappe.flags.in_microsoft_sync = True
-	count = 0
+	upserted = removed = 0
 	try:
-		for ev in events:
+		for ev in items:
 			try:
-				_upsert_event(doc, ev)
-				count += 1
+				outcome = _upsert_event(doc, ev)
+				if outcome == "deleted":
+					removed += 1
+				elif outcome in ("created", "updated"):
+					upserted += 1
 			except Exception:
 				frappe.log_error(title=f"MS event upsert failed: {ev.get('id')}")
 	finally:
 		frappe.flags.in_microsoft_sync = False
-	return count
+
+	# Only store the new watermark once every page was consumed without raising. Without a
+	# delta link we simply redo this window next run, which repeats work but loses nothing.
+	if delta_link:
+		updates = {"delta_link": delta_link}
+		if not reuse_delta:
+			updates["delta_window_end"] = add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS)
+		frappe.db.set_value("Microsoft Calendar", doc.name, updates, update_modified=False)
+
+	return upserted, removed
+
+
+def _is_removed(ev):
+	return bool(ev.get("@removed")) or bool(ev.get("isCancelled"))
+
+
+def _target_values(doc, ev, locally_originated):
+	"""The Frappe Event field values a Microsoft event maps to."""
+	values = {
+		"subject": ev.get("subject") or "(No subject)",
+		"all_day": 1 if ev.get("isAllDay") else 0,
+		"custom_microsoft_calendar": doc.name,
+		"custom_sync_with_microsoft_calendar": 1,
+	}
+	starts_on = _ms_dt_to_system(ev.get("start"))
+	ends_on = _ms_dt_to_system(ev.get("end"))
+	if starts_on:
+		values["starts_on"] = starts_on
+	if ends_on:
+		values["ends_on"] = ends_on
+
+	location = (ev.get("location") or {}).get("displayName")
+	if location is not None:
+		values["location"] = location
+
+	# bodyPreview is a truncated plain-text preview. Writing it onto an Event that
+	# originated in Frappe would destroy the real description, so mirrors only.
+	if not locally_originated:
+		values["description"] = ev.get("bodyPreview") or ""
+
+	return values
 
 
 def _upsert_event(doc, ev):
+	"""Create/update/delete the Frappe mirror of one Microsoft event.
+
+	Returns "deleted", "updated", "created" or "skipped".
+	"""
 	ms_id = ev.get("id")
 	if not ms_id:
-		return
+		return "skipped"
 
-	existing = frappe.db.get_value(
-		"Event", {"custom_microsoft_event_id": ms_id}, "name"
-	)
+	existing = frappe.db.get_value("Event", {"custom_microsoft_event_id": ms_id}, "name")
 
-	# cancelled in Microsoft -> remove the Frappe mirror
-	if ev.get("isCancelled"):
+	if _is_removed(ev):
 		if existing:
 			frappe.delete_doc("Event", existing, ignore_permissions=True, force=True)
-		return
+			return "deleted"
+		return "skipped"
 
-	starts_on = _ms_dt_to_system(ev.get("start"))
-	ends_on = _ms_dt_to_system(ev.get("end"))
-	subject = ev.get("subject") or "(No subject)"
-	description = ev.get("bodyPreview") or ""
+	# calendarView returns occurrences; a seriesMaster would duplicate all of them.
+	if ev.get("type") == "seriesMaster":
+		return "skipped"
 
 	if existing:
 		event = frappe.get_doc("Event", existing)
+		locally_originated = not event.custom_pulled_from_microsoft
 	else:
 		event = frappe.new_doc("Event")
 		event.custom_microsoft_event_id = ms_id
+		event.custom_pulled_from_microsoft = 1
+		event.event_type = "Private"
+		locally_originated = False
 
-	event.subject = subject
-	if starts_on:
-		event.starts_on = starts_on
-	if ends_on:
-		event.ends_on = ends_on
-	event.all_day = 1 if ev.get("isAllDay") else 0
-	event.description = description
-	event.custom_microsoft_calendar = doc.name
-	event.custom_sync_with_microsoft_calendar = 1
-	event.custom_pulled_from_microsoft = 1
-	event.event_type = event.event_type or "Private"
+	values = _target_values(doc, ev, locally_originated)
+	changed = _apply(event, values)
+	if not existing:
+		changed = True
+	if not changed:
+		# Nothing moved. Saving anyway would bump `modified` and make the push step
+		# re-patch this event on the next run, forever.
+		return "skipped"
+
 	event.flags.ignore_permissions = True
 	event.flags.ignore_mandatory = True
 	event.save()
+	return "updated" if existing else "created"
+
+
+def _apply(doc, values):
+	"""Set values on a doc, returning True if anything actually changed."""
+	changed = False
+	for field, value in values.items():
+		current = doc.get(field)
+		if isinstance(value, str) or value is None:
+			same = (current or "") == (value or "")
+		elif field in ("starts_on", "ends_on"):
+			same = bool(current) and get_datetime(current) == get_datetime(value)
+		else:
+			same = current == value
+		if not same:
+			doc.set(field, value)
+			changed = True
+	return changed
 
 
 # --- push (Frappe -> Graph) ----------------------------------------------------------
 
 def _push(doc):
-	"""Create unsynced Frappe events in Microsoft. Returns count pushed."""
-	candidates = frappe.get_all(
+	"""Create new Frappe events in Microsoft and patch ones edited while offline."""
+	base_filters = {
+		"custom_sync_with_microsoft_calendar": 1,
+		"custom_microsoft_calendar": doc.name,
+		"custom_pulled_from_microsoft": 0,
+	}
+
+	count = 0
+	new_events = frappe.get_all(
 		"Event",
-		filters={
-			"custom_sync_with_microsoft_calendar": 1,
-			"custom_microsoft_calendar": doc.name,
-			"custom_pulled_from_microsoft": 0,
-			"custom_microsoft_event_id": ["in", ["", None]],
-		},
+		filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
 		pluck="name",
 	)
-	count = 0
-	for name in candidates:
+	for name in new_events:
 		try:
 			event = frappe.get_doc("Event", name)
 			created = _create_graph_event(doc.name, event)
 			if created.get("id"):
 				frappe.db.set_value(
-					"Event", name, "custom_microsoft_event_id", created["id"],
-					update_modified=False,
+					"Event", name, "custom_microsoft_event_id", created["id"], update_modified=False
 				)
 				count += 1
 		except Exception:
 			frappe.log_error(title=f"MS event push failed: {name}")
+
+	# Edits made while the connection was down never reached doc_events; catch them up.
+	if doc.last_sync:
+		edited = frappe.get_all(
+			"Event",
+			filters={
+				**base_filters,
+				# NOT IN with NULL never matches in SQL; "is set" is the NULL-safe form.
+				"custom_microsoft_event_id": ["is", "set"],
+				"modified": [">", doc.last_sync],
+			},
+			pluck="name",
+		)
+		for name in edited:
+			try:
+				event = frappe.get_doc("Event", name)
+				graph.graph_request(
+					"PATCH",
+					f"/me/events/{event.custom_microsoft_event_id}",
+					doc.name,
+					json=_event_to_graph_body(event),
+				)
+				count += 1
+			except Exception:
+				frappe.log_error(title=f"MS event patch failed: {name}")
+
 	frappe.db.commit()
 	return count
 
@@ -261,6 +481,8 @@ def _event_to_graph_body(event):
 	}
 	if getattr(event, "all_day", 0):
 		body["isAllDay"] = True
+	if getattr(event, "location", None):
+		body["location"] = {"displayName": event.location}
 	return body
 
 
@@ -327,7 +549,7 @@ def event_on_trash(doc, method=None):
 
 @frappe.whitelist()
 def fetch_events(calendar_name, start_datetime=None, end_datetime=None):
-	"""Return upcoming events from Graph (calendarView) as a clean list. Owner-checked."""
+	"""Return events from Graph (calendarView) as a clean list. Owner-checked, fully paged."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 
@@ -336,14 +558,12 @@ def fetch_events(calendar_name, start_datetime=None, end_datetime=None):
 
 	path = (
 		f"/me/calendarView?startDateTime={start}&endDateTime={end}"
-		f"&$select={EVENT_SELECT}&$top=100&$orderby=start/dateTime"
+		f"&$select={EVENT_SELECT}&$orderby=start/dateTime"
 	)
-	resp = graph.graph_request(
-		"GET", path, calendar_name, headers={"Prefer": 'outlook.timezone="UTC"'}
-	)
+	items = graph.graph_paged(path, calendar_name, headers=UTC_PREFER)
 
 	out = []
-	for ev in resp.get("value", []):
+	for ev in items:
 		online = ev.get("onlineMeeting") or {}
 		out.append(
 			{
@@ -352,6 +572,7 @@ def fetch_events(calendar_name, start_datetime=None, end_datetime=None):
 				"start": _ms_dt_to_system(ev.get("start")),
 				"end": _ms_dt_to_system(ev.get("end")),
 				"is_all_day": bool(ev.get("isAllDay")),
+				"location": (ev.get("location") or {}).get("displayName"),
 				"join_url": online.get("joinUrl"),
 				"web_link": ev.get("webLink"),
 			}

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, version-15, version-16]
   pull_request:
 
 concurrency:
@@ -11,8 +11,20 @@ concurrency:
 
 jobs:
   tests:
-    name: Server (install + migrate + tests)
+    name: Frappe ${{ matrix.frappe-branch }} (install + migrate + tests)
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - frappe-branch: version-15
+            python-version: "3.10"
+            node-version: "18"
+          # Frappe version-16 pins requires-python >=3.14,<3.15 and node >=24.
+          - frappe-branch: version-16
+            python-version: "3.14"
+            node-version: "24"
 
     services:
       mariadb:
@@ -38,12 +50,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: ${{ matrix.node-version }}
 
       - name: Install system dependencies
         run: |
@@ -53,10 +65,10 @@ jobs:
       - name: Install frappe-bench
         run: pip install frappe-bench
 
-      - name: Init bench + Frappe (stable)
+      - name: Init bench + Frappe
         run: |
           bench init --skip-redis-config-generation --skip-assets \
-            --frappe-branch version-15 --python "$(which python)" ~/frappe-bench
+            --frappe-branch ${{ matrix.frappe-branch }} --python "$(which python)" ~/frappe-bench
 
       - name: Point bench at the CI services
         working-directory: /home/runner/frappe-bench
