@@ -266,6 +266,72 @@ class TestWatermark(SyncTestCase):
 		self.assertEqual(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"), "KEEP-ME")
 
 
+class TestEntrypoints(SyncTestCase):
+	"""The public entry points, including the lock path (v15 and v16 both ship filelock)."""
+
+	def _enable_integration(self, enabled):
+		frappe.db.set_single_value("Microsoft Settings", "enabled", enabled)
+		frappe.clear_document_cache("Microsoft Settings", "Microsoft Settings")
+		self.addCleanup(frappe.clear_document_cache, "Microsoft Settings", "Microsoft Settings")
+
+	def test_sync_calendar_runs_the_whole_round_trip(self):
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-RT")), patch.object(
+			frappe.db, "commit"
+		):
+			result = sync.sync_calendar(CALENDAR)
+
+		self.assertTrue(result["ok"])
+		self.assertEqual(result["pulled"], 1)
+		self.assertIsNotNone(self._event_for("ms-1"))
+
+	def test_sync_calendar_skips_a_calendar_that_is_already_syncing(self):
+		"""A run slower than the 15-minute cron must not be overlapped by the next one."""
+		from frappe.utils.file_lock import LockTimeoutError
+
+		class Blocked:
+			def __enter__(self):
+				raise LockTimeoutError("already locked")
+
+			def __exit__(self, *args):
+				return False
+
+		with patch.object(sync, "_calendar_lock", return_value=Blocked()), patch.object(
+			graph, "graph_delta"
+		) as mocked:
+			result = sync.sync_calendar(CALENDAR)
+
+		self.assertFalse(result["ok"])
+		self.assertIn("already running", result["message"])
+		mocked.assert_not_called()
+
+	def test_sync_calendar_refuses_an_unauthorized_calendar(self):
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "authorized", 0)
+
+		with patch.object(graph, "graph_delta") as mocked:
+			result = sync.sync_calendar(CALENDAR)
+
+		self.assertFalse(result["ok"])
+		mocked.assert_not_called()
+
+	def test_sync_all_is_a_noop_while_the_integration_is_disabled(self):
+		self._enable_integration(0)
+
+		with patch.object(graph, "graph_delta") as mocked:
+			sync.sync_all()
+
+		mocked.assert_not_called()
+
+	def test_sync_all_covers_enabled_authorized_calendars(self):
+		self._enable_integration(1)
+
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-ALL")), patch.object(
+			frappe.db, "commit"
+		):
+			results = sync.sync_all()
+
+		self.assertTrue(any(r.get("pulled") == 1 for r in results or []))
+
+
 class TestPush(SyncTestCase):
 	def test_new_local_event_is_created_in_graph(self):
 		event = self._local_event()

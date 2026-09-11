@@ -27,7 +27,8 @@ packages = []
 
 [tool.ruff]
 line-length = 110
-target-version = "py314"
+# Lowest Python we support (Frappe v15). Keeps the codebase v15-safe.
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [

@@ -20,15 +20,31 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
 ## Requirements
 
 - A Frappe **v15 or v16** bench ([install guide](https://frappeframework.com/docs/user/en/installation)).
-- Python ≥ 3.10. The only extra dependency is **`msal`** (declared in `pyproject.toml`, installed
+- Python ≥ 3.10 (whatever your Frappe version requires: v15 runs on 3.10+, v16 needs 3.14).
+  The only extra dependency is **`msal`** (declared in `pyproject.toml`, installed
   automatically by `bench get-app`).
 - An **Azure AD (Microsoft Entra) app registration** — free; see [`docs/azure-setup.md`](docs/azure-setup.md).
+
+## Compatibility
+
+| Frappe / ERPNext | Branch | CI |
+| --- | --- | --- |
+| version-16 | `version-16` (or `main`) | every push and PR |
+| version-15 | `version-15` (or `main`) | every push and PR |
+
+One codebase supports both. `main` is the source of truth; `version-15` and `version-16` track
+it so the usual `bench get-app --branch <version>` works. Nothing here is version-gated, and
+every change is proven against **both** versions in CI (install, migrate, and the full test
+suite on each) before it lands.
 
 ## Install (existing bench)
 
 ```bash
 cd /path/to/your/bench
-bench get-app https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365
+
+# either branch works; pick the one matching your bench
+bench get-app https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365 --branch version-16
+
 bench --site your-site.localhost install-app frappe_microsoft365
 bench --site your-site.localhost migrate
 ```
