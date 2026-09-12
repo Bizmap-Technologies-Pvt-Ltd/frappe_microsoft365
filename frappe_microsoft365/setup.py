@@ -104,7 +104,7 @@ def create_event_custom_fields():
 				"read_only_depends_on": "eval:doc.custom_teams_join_url",
 				"description": (
 					"Creates the event in Outlook as a Teams meeting. Locked once it exists: "
-					"Microsoft cannot take a meeting off an event, so delete and recreate instead."
+					"Microsoft cannot undo it."
 				),
 			},
 			{
