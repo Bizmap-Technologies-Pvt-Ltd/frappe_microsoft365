@@ -260,6 +260,31 @@ class TestMissingCustomFields(BaseTestCase):
 	def test_nothing_reported_when_all_present(self):
 		self.assertEqual(doctor.check_event_custom_fields([]), [])
 
+	def test_the_event_id_column_fits_a_real_graph_id(self):
+		"""Regression: Graph ids are ~152 chars and Frappe's Data default is varchar(140)."""
+		import frappe
+
+		graph_id = "A" * 152
+		event = frappe.get_doc(
+			{
+				"doctype": "Event",
+				"subject": "_microsoft365 id width probe",
+				"starts_on": "2026-09-20 10:00:00",
+				"event_type": "Private",
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(
+			frappe.delete_doc, "Event", event.name, force=True, ignore_permissions=True
+		)
+
+		frappe.db.set_value(
+			"Event", event.name, "custom_microsoft_event_id", graph_id, update_modified=False
+		)
+
+		self.assertEqual(
+			frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), graph_id
+		)
+
 	def test_this_site_has_them(self):
 		"""The app is installed here, so the fields must exist."""
 		import frappe

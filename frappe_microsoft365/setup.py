@@ -66,6 +66,15 @@ def create_event_custom_fields():
 				"insert_after": "custom_microsoft_calendar_column",
 				"read_only": 1,
 				"no_copy": 1,
+				# Graph event ids run to ~150 characters, and occurrence ids from
+				# calendarView/delta are longer still. Frappe's Data default is varchar(140),
+				# which silently truncates nothing and instead fails the write with
+				# "Data too long for column". 500 stays inside InnoDB's index limit for
+				# utf8mb4, so the lookup below can still be indexed.
+				"length": 500,
+				# Every pulled event looks itself up by this column; without an index that is
+				# a full scan of tabEvent per event.
+				"search_index": 1,
 			},
 			{
 				"fieldname": "custom_pulled_from_microsoft",
