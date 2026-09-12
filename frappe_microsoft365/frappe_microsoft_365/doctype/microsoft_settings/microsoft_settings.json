@@ -27,27 +27,139 @@
   "authorized_scopes"
  ],
  "fields": [
-  {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled", "default": "0"},
-  {"fieldname": "setup_help", "fieldtype": "HTML", "label": "Setup Help", "options": "<div class='text-muted' style='font-size:12px;line-height:1.6'><b>Azure AD app registration</b><br>1. Entra portal &rarr; App registrations &rarr; New registration.<br>2. Add a <b>Web</b> redirect URI = the Redirect URI shown below.<br>3. Certificates &amp; secrets &rarr; new client secret &rarr; paste it here.<br>4. API permissions (Microsoft Graph, Delegated): grant exactly the scopes listed under <b>Delegated Scopes</b> below, plus <code>offline_access openid profile</code> &rarr; Grant admin consent.<br>5. Copy Application (client) ID and Directory (tenant) ID here.</div>"},
-  {"fieldname": "capabilities_section", "fieldtype": "Section Break", "label": "Capabilities", "description": "Pick only what you want. Each is independent, and the Azure permissions asked for at sign-in follow from what is ticked here."},
-  {"fieldname": "use_calendar", "fieldtype": "Check", "label": "Outlook calendar", "default": "1", "description": "Two-way Event sync, and the Add Teams meeting tickbox on an Event. Needs Calendars.ReadWrite only: Microsoft creates the Teams link as part of the event."},
-  {"fieldname": "use_teams", "fieldtype": "Check", "label": "Standalone Teams meetings", "default": "0", "description": "Meetings created on their own rather than on a calendar event, and resolving a join URL back to a meeting. Needs OnlineMeetings.ReadWrite. Leave off if you only want the Teams tickbox on an Event."},
-  {"fieldname": "use_transcripts", "fieldtype": "Check", "label": "Meeting transcripts and recordings", "default": "0", "depends_on": "use_teams", "description": "Reading Teams transcripts (VTT) and recordings. Needs OnlineMeetingTranscript.Read.All, which tenants often refuse; a join URL has to be resolved first, hence standalone meetings above."},
-  {"fieldname": "column_break_caps", "fieldtype": "Column Break"},
-  {"fieldname": "use_mail", "fieldtype": "Check", "label": "Outlook mail", "default": "0", "description": "Mail is handled by Frappe Email Account. This app only sets up and checks the connection."},
-  {"fieldname": "mail_flow", "fieldtype": "Select", "label": "Mail Sign-in Method", "options": "Delegated\nApplication", "default": "Delegated", "depends_on": "use_mail", "description": "Delegated: a person signs in. Application: no sign-in, needed for shared mailboxes."},
-  {"fieldname": "use_sso", "fieldtype": "Check", "label": "Sign in with Microsoft", "default": "0", "description": "Adds Microsoft as a login option via Frappe Social Login."},
-  {"fieldname": "capabilities_help", "fieldtype": "HTML", "label": "Capabilities Help", "options": "<div class='text-muted' style='font-size:12px'>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified.</div>"},
-  {"fieldname": "app_section", "fieldtype": "Section Break", "label": "Azure AD Application"},
-  {"fieldname": "tenant_id", "fieldtype": "Data", "label": "Tenant ID", "description": "Directory (tenant) ID, or 'common' / 'organizations' for multi-tenant.", "mandatory_depends_on": "eval:doc.enabled"},
-  {"fieldname": "client_id", "fieldtype": "Data", "label": "Client ID", "description": "Application (client) ID.", "mandatory_depends_on": "eval:doc.enabled"},
-  {"fieldname": "client_secret", "fieldtype": "Password", "label": "Client Secret", "mandatory_depends_on": "eval:doc.enabled"},
-  {"fieldname": "column_break_app", "fieldtype": "Column Break"},
-  {"fieldname": "redirect_uri", "fieldtype": "Data", "label": "Redirect URI", "description": "Register this exact URI in Azure. Leave blank to use the site default (shown after first save)."},
-  {"fieldname": "scopes_section", "fieldtype": "Section Break", "label": "Delegated Scopes", "description": "Grant exactly these in Azure. You should not need to edit anything here."},
-  {"fieldname": "effective_scopes_display", "fieldtype": "HTML", "label": "Scopes That Will Be Requested"},
-  {"fieldname": "default_scopes", "fieldtype": "Small Text", "label": "Override Delegated Scopes", "description": "Advanced. Leave empty: scopes are derived from the capabilities above. Fill this in only when your tenant consents to a hand-picked list and sign-in must ask for exactly that, nothing more. Space- or comma-separated; offline_access/openid/profile are always added and must not be listed."},
-  {"fieldname": "authorized_scopes", "fieldtype": "Small Text", "label": "Scopes Last Authorised", "read_only": 1, "no_copy": 1, "description": "Recorded automatically when someone last authorised a Microsoft Calendar. A token only carries the permissions consented when it was issued, so the doctor compares this with the list above and tells you when connections need re-authorising."}
+  {
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled",
+   "default": "0"
+  },
+  {
+   "fieldname": "setup_help",
+   "fieldtype": "HTML",
+   "label": "Setup Help",
+   "options": "<div class='text-muted' style='font-size:12px;line-height:1.6'><b>Azure app registration</b><br>Entra portal &rarr; App registrations &rarr; New registration &rarr; add a <b>Web</b> redirect URI matching the one below &rarr; create a client secret &rarr; grant the permissions listed under <b>Delegated Scopes</b> and give admin consent. Then copy the client and tenant IDs here.</div>"
+  },
+  {
+   "fieldname": "capabilities_section",
+   "fieldtype": "Section Break",
+   "label": "Capabilities",
+   "description": "Pick what you want. The Azure permissions follow from what you tick."
+  },
+  {
+   "fieldname": "use_calendar",
+   "fieldtype": "Check",
+   "label": "Outlook calendar",
+   "default": "1",
+   "description": "Two-way Event sync, including the Teams meeting tickbox on an Event."
+  },
+  {
+   "fieldname": "use_teams",
+   "fieldtype": "Check",
+   "label": "Standalone Teams meetings",
+   "default": "0",
+   "description": "Meetings not attached to a calendar event. Not needed for the tickbox above."
+  },
+  {
+   "fieldname": "use_transcripts",
+   "fieldtype": "Check",
+   "label": "Meeting transcripts and recordings",
+   "default": "0",
+   "depends_on": "use_teams",
+   "description": "Read transcripts and recordings of past meetings. Usually needs admin consent."
+  },
+  {
+   "fieldname": "column_break_caps",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "use_mail",
+   "fieldtype": "Check",
+   "label": "Outlook mail",
+   "default": "0",
+   "description": "Sets up and checks the connection. Frappe's Email Account still sends the mail."
+  },
+  {
+   "fieldname": "mail_flow",
+   "fieldtype": "Select",
+   "label": "Mail Sign-in Method",
+   "options": "Delegated\nApplication",
+   "default": "Delegated",
+   "depends_on": "use_mail",
+   "description": "Delegated: a person signs in. Application: no sign-in, for shared mailboxes."
+  },
+  {
+   "fieldname": "use_sso",
+   "fieldtype": "Check",
+   "label": "Sign in with Microsoft",
+   "default": "0",
+   "description": "Adds a Microsoft button to the login page."
+  },
+  {
+   "fieldname": "capabilities_help",
+   "fieldtype": "HTML",
+   "label": "Capabilities Help",
+   "options": "<div class='text-muted' style='font-size:12px'>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified.</div>"
+  },
+  {
+   "fieldname": "app_section",
+   "fieldtype": "Section Break",
+   "label": "Azure AD Application"
+  },
+  {
+   "fieldname": "tenant_id",
+   "fieldtype": "Data",
+   "label": "Tenant ID",
+   "description": "Directory (tenant) ID, or 'common' for multi-tenant.",
+   "mandatory_depends_on": "eval:doc.enabled"
+  },
+  {
+   "fieldname": "client_id",
+   "fieldtype": "Data",
+   "label": "Client ID",
+   "description": "Application (client) ID.",
+   "mandatory_depends_on": "eval:doc.enabled"
+  },
+  {
+   "fieldname": "client_secret",
+   "fieldtype": "Password",
+   "label": "Client Secret",
+   "mandatory_depends_on": "eval:doc.enabled"
+  },
+  {
+   "fieldname": "column_break_app",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "redirect_uri",
+   "fieldtype": "Data",
+   "label": "Redirect URI",
+   "description": "Register this exact URI in Azure. Blank uses the site default."
+  },
+  {
+   "fieldname": "scopes_section",
+   "fieldtype": "Section Break",
+   "label": "Delegated Scopes",
+   "description": "Grant exactly these in Azure. You should not need to edit anything here."
+  },
+  {
+   "fieldname": "effective_scopes_display",
+   "fieldtype": "HTML",
+   "label": "Scopes That Will Be Requested"
+  },
+  {
+   "fieldname": "default_scopes",
+   "fieldtype": "Small Text",
+   "label": "Override Delegated Scopes",
+   "description": "Advanced. Leave empty so scopes follow the capabilities above."
+  },
+  {
+   "fieldname": "authorized_scopes",
+   "fieldtype": "Small Text",
+   "label": "Scopes Last Authorised",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "What the last sign-in asked for. A token only carries the permissions it was issued with."
+  }
  ],
  "issingle": 1,
  "links": [],
@@ -56,7 +168,12 @@
  "name": "Microsoft Settings",
  "owner": "Administrator",
  "permissions": [
-  {"create": 1, "read": 1, "write": 1, "role": "System Manager"}
+  {
+   "create": 1,
+   "read": 1,
+   "write": 1,
+   "role": "System Manager"
+  }
  ],
  "sort_field": "modified",
  "sort_order": "DESC",

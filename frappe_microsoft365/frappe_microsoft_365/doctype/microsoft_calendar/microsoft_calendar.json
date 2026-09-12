@@ -31,29 +31,157 @@
   "delta_window_end"
  ],
  "fields": [
-  {"fieldname": "enabled", "fieldtype": "Check", "label": "Enabled", "default": "1", "in_list_view": 1},
-  {"fieldname": "account_name", "fieldtype": "Data", "label": "Account Name", "reqd": 1, "unique": 1, "in_list_view": 1, "description": "A label for this connection, e.g. 'My Outlook'."},
-  {"fieldname": "user", "fieldtype": "Link", "label": "User", "options": "User", "in_list_view": 1, "in_standard_filter": 1},
-  {"fieldname": "column_break_1", "fieldtype": "Column Break"},
-  {"fieldname": "microsoft_user_email", "fieldtype": "Data", "label": "Microsoft Account", "read_only": 1, "in_list_view": 1},
-  {"fieldname": "authorized", "fieldtype": "Check", "label": "Authorized", "read_only": 1, "in_list_view": 1},
-  {"fieldname": "auth_section", "fieldtype": "Section Break", "label": "Authorization"},
-  {"fieldname": "oauth_state", "fieldtype": "Data", "label": "OAuth State", "read_only": 1, "hidden": 1},
-  {"fieldname": "oauth_state_expiry", "fieldtype": "Datetime", "label": "OAuth State Expiry", "read_only": 1, "hidden": 1},
-  {"fieldname": "access_token", "fieldtype": "Password", "label": "Access Token", "hidden": 1, "read_only": 1, "no_copy": 1},
-  {"fieldname": "refresh_token", "fieldtype": "Password", "label": "Refresh Token", "hidden": 1, "read_only": 1, "no_copy": 1},
-  {"fieldname": "token_expiry", "fieldtype": "Datetime", "label": "Token Expiry", "read_only": 1},
-  {"fieldname": "calendar_section", "fieldtype": "Section Break", "label": "Calendar"},
-  {"fieldname": "ms_calendar_id", "fieldtype": "Data", "label": "Microsoft Calendar ID", "read_only": 1},
-  {"fieldname": "ms_calendar_name", "fieldtype": "Data", "label": "Microsoft Calendar Name", "read_only": 1},
-  {"fieldname": "sync_section", "fieldtype": "Section Break", "label": "Sync"},
-  {"fieldname": "pull_from_microsoft_calendar", "fieldtype": "Check", "label": "Pull events from Microsoft", "default": "1"},
-  {"fieldname": "push_to_microsoft_calendar", "fieldtype": "Check", "label": "Push Frappe events to Microsoft", "default": "0", "description": "Off by default: this writes into the real Outlook calendar of this account, and deleting a Frappe Event then deletes the Microsoft one. Ticking it asks you to confirm."},
-  {"fieldname": "column_break_sync", "fieldtype": "Column Break"},
-  {"fieldname": "last_sync", "fieldtype": "Datetime", "label": "Last Sync", "read_only": 1},
-  {"fieldname": "last_error", "fieldtype": "Small Text", "label": "Last Sync Error", "read_only": 1, "depends_on": "last_error"},
-  {"fieldname": "delta_link", "fieldtype": "Small Text", "label": "Delta Link", "read_only": 1, "hidden": 1, "no_copy": 1},
-  {"fieldname": "delta_window_end", "fieldtype": "Datetime", "label": "Delta Window End", "read_only": 1, "hidden": 1, "no_copy": 1}
+  {
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled",
+   "default": "1",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "account_name",
+   "fieldtype": "Data",
+   "label": "Account Name",
+   "reqd": 1,
+   "unique": 1,
+   "in_list_view": 1,
+   "description": "A label for this connection, e.g. 'My Outlook'."
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "label": "User",
+   "options": "User",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "microsoft_user_email",
+   "fieldtype": "Data",
+   "label": "Microsoft Account",
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "authorized",
+   "fieldtype": "Check",
+   "label": "Authorized",
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "auth_section",
+   "fieldtype": "Section Break",
+   "label": "Authorization"
+  },
+  {
+   "fieldname": "oauth_state",
+   "fieldtype": "Data",
+   "label": "OAuth State",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "oauth_state_expiry",
+   "fieldtype": "Datetime",
+   "label": "OAuth State Expiry",
+   "read_only": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "access_token",
+   "fieldtype": "Password",
+   "label": "Access Token",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "refresh_token",
+   "fieldtype": "Password",
+   "label": "Refresh Token",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "token_expiry",
+   "fieldtype": "Datetime",
+   "label": "Token Expiry",
+   "read_only": 1
+  },
+  {
+   "fieldname": "calendar_section",
+   "fieldtype": "Section Break",
+   "label": "Calendar"
+  },
+  {
+   "fieldname": "ms_calendar_id",
+   "fieldtype": "Data",
+   "label": "Microsoft Calendar ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "ms_calendar_name",
+   "fieldtype": "Data",
+   "label": "Microsoft Calendar Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sync_section",
+   "fieldtype": "Section Break",
+   "label": "Sync"
+  },
+  {
+   "fieldname": "pull_from_microsoft_calendar",
+   "fieldtype": "Check",
+   "label": "Pull events from Microsoft",
+   "default": "1"
+  },
+  {
+   "fieldname": "push_to_microsoft_calendar",
+   "fieldtype": "Check",
+   "label": "Push Frappe events to Microsoft",
+   "default": "0",
+   "description": "Writes into the real Outlook calendar. Deleting a Frappe Event deletes the Microsoft one."
+  },
+  {
+   "fieldname": "column_break_sync",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_sync",
+   "fieldtype": "Datetime",
+   "label": "Last Sync",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_error",
+   "fieldtype": "Small Text",
+   "label": "Last Sync Error",
+   "read_only": 1,
+   "depends_on": "last_error"
+  },
+  {
+   "fieldname": "delta_link",
+   "fieldtype": "Small Text",
+   "label": "Delta Link",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "delta_window_end",
+   "fieldtype": "Datetime",
+   "label": "Delta Window End",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1
+  }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
@@ -63,8 +191,20 @@
  "naming_rule": "By fieldname",
  "owner": "Administrator",
  "permissions": [
-  {"create": 1, "delete": 1, "read": 1, "write": 1, "role": "System Manager"},
-  {"create": 1, "delete": 1, "read": 1, "write": 1, "role": "Desk User"}
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "write": 1,
+   "role": "System Manager"
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "write": 1,
+   "role": "Desk User"
+  }
  ],
  "sort_field": "modified",
  "sort_order": "DESC",

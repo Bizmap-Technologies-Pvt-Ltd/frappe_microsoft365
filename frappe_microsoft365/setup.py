@@ -103,10 +103,8 @@ def create_event_custom_fields():
 				# than leave a tickbox that quietly does nothing.
 				"read_only_depends_on": "eval:doc.custom_teams_join_url",
 				"description": (
-					"Creates the event in Outlook as a Teams meeting with a join link, the same as "
-					"ticking Teams meeting in Outlook. Locked once the meeting exists, because "
-					"Microsoft cannot remove a meeting from an event: to undo it, delete this "
-					"event and create it again."
+					"Creates the event in Outlook as a Teams meeting. Locked once it exists: "
+					"Microsoft cannot take a meeting off an event, so delete and recreate instead."
 				),
 			},
 			{
@@ -120,7 +118,7 @@ def create_event_custom_fields():
 				# Join URLs run past the 140-char default. Nothing queries this column, so it
 				# needs width but no index.
 				"length": 1000,
-				"description": "Filled in by Microsoft once the meeting exists. Use the Join Meeting button above.",
+				"description": "Use the Join Meeting button above.",
 							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
@@ -132,7 +130,7 @@ def create_event_custom_fields():
 				"no_copy": 1,
 				# Small Text rather than Data: webLink can be very long and, unlike the event
 				# id, is never looked up, so there is no index to preserve.
-				"description": "Opens this event in Outlook on the web. Also available as a button above.",
+				"description": "Also available as a button above.",
 							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
