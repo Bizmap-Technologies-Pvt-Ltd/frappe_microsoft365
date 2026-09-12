@@ -5,7 +5,7 @@
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
-![Tests](https://img.shields.io/badge/tests-183-2b3a8c)
+![Tests](https://img.shields.io/badge/tests-191-2b3a8c)
 
 </div>
 
@@ -265,6 +265,11 @@ failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
   after connections were authorised (their tokens predate the change and have to be renewed),
   and the shared-mailbox identity conflict described below.
 - **Explain an Error** turns a message from the Error Log into a cause and a next step.
+- **Wrong-box mistakes are caught as you type them.** Azure shows a secret's **Value** next to
+  its **Secret ID**, and only the Value works; pasting the ID is the commonest setup mistake
+  there is, and Microsoft only says so at sign-in, as `AADSTS7000215`. A secret that is a GUID
+  is refused on save, because a secret value never is one. The same shape checks cover the
+  client id, the tenant id and the redirect URI.
 - **Exchange Setup Script** generates the `New-ServicePrincipal` / `Add-MailboxPermission`
   commands for app-only mailbox access, looking the service principal up by AppId rather
   than asking you to copy an Object ID — Microsoft's own documentation warns that copying

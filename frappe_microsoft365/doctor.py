@@ -28,6 +28,9 @@ from frappe.utils.password import get_decrypted_password
 
 from frappe_microsoft365 import microsoft_graph as graph
 
+# microsoft_graph does not import this module, so this direction is safe.
+from frappe_microsoft365.microsoft_graph import CALLBACK_METHOD
+
 # --- documented constants -------------------------------------------------------------
 
 #: Delegated (a user signs in) scopes, per Microsoft's protocol table.
@@ -246,6 +249,89 @@ def check_authorized_scopes(requested, authorized, connections):
 			),
 		)
 	]
+
+
+#: Azure identifiers are GUIDs. A secret VALUE never is, which is what makes the mix-up
+#: detectable: the Secret ID sitting next to it in the same table is.
+GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+#: Frappe shows a stored Password field as a mask rather than the value.
+MASKED = re.compile(r"^\*+$")
+
+
+def looks_like_guid(value):
+	return bool(GUID.match((value or "").strip()))
+
+
+def check_credentials(settings):
+	"""Catch the Azure values people actually paste into the wrong box.
+
+	Azure's Certificates & secrets table puts the secret **Value** next to its **Secret ID**,
+	and only the Value works. Copying the wrong one is the single most common setup mistake,
+	and Microsoft answers it with AADSTS7000215 long after the fact. The two are trivially
+	distinguishable: a Secret ID is a GUID, a secret value never is.
+	"""
+	out = []
+	secret = (settings.get("client_secret") or "").strip()
+
+	if secret and not MASKED.match(secret) and looks_like_guid(secret):
+		out.append(
+			finding(
+				"settings.secret_is_the_id",
+				FAIL,
+				_("The Client Secret looks like the Secret ID"),
+				_("A GUID was entered, and a secret value is never a GUID."),
+				_(
+					"In Azure, Certificates & secrets shows Value next to Secret ID. Copy the "
+					"Value column. It is only visible immediately after you create the secret, "
+					"so if you have navigated away, create a new one."
+				),
+				MS_OAUTH_DOC,
+			)
+		)
+
+	client_id = (settings.get("client_id") or "").strip()
+	if client_id and not looks_like_guid(client_id):
+		out.append(
+			finding(
+				"settings.client_id_shape",
+				WARN,
+				_("The Client ID is not a GUID"),
+				_("Azure's Application (client) ID always is."),
+				_("Copy Application (client) ID from the app registration Overview page."),
+			)
+		)
+
+	tenant = (settings.get("tenant_id") or "").strip()
+	if (
+		tenant
+		and not looks_like_guid(tenant)
+		and tenant.lower() not in ("common", "organizations", "consumers")
+		and "." not in tenant
+	):
+		out.append(
+			finding(
+				"settings.tenant_id_shape",
+				WARN,
+				_("The Tenant ID is neither a GUID nor a domain"),
+				_("Found: {0}").format(tenant),
+				_("Use Directory (tenant) ID from the Overview page, or your tenant's domain."),
+			)
+		)
+
+	redirect = (settings.get("redirect_uri") or "").strip()
+	if redirect and CALLBACK_METHOD.rsplit(".", 1)[-1] not in redirect:
+		out.append(
+			finding(
+				"settings.redirect_target",
+				WARN,
+				_("The Redirect URI does not point at this app's callback"),
+				_("Found: {0}").format(redirect),
+				_("It should end with /api/method/{0}").format(CALLBACK_METHOD),
+			)
+		)
+
+	return out
 
 
 # --- Connected App --------------------------------------------------------------------
@@ -820,6 +906,7 @@ def _settings_config():
 		"tenant_id": settings.tenant_id,
 		"client_id": settings.client_id,
 		"has_client_secret": bool(secret),
+		"client_secret": secret,
 		"redirect_uri": settings.redirect_uri,
 		"use_calendar": settings.use_calendar,
 		# .get() rather than attribute access: the doctor is what people run when a site is
@@ -879,7 +966,7 @@ def run_diagnostics():
 	frappe.only_for("System Manager")
 
 	settings = _settings_config()
-	findings = check_settings(settings)
+	findings = check_settings(settings) + check_credentials(settings)
 
 	if any(settings.get(field) for field, _scope in graph.CAPABILITY_SCOPES):
 		findings += check_scopes(settings)

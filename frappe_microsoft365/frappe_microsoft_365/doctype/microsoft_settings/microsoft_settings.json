@@ -122,8 +122,9 @@
   {
    "fieldname": "client_secret",
    "fieldtype": "Password",
-   "label": "Client Secret",
-   "mandatory_depends_on": "eval:doc.enabled"
+   "label": "Client Secret Value",
+   "mandatory_depends_on": "eval:doc.enabled",
+   "description": "The Value column in Azure, not the Secret ID next to it."
   },
   {
    "fieldname": "column_break_app",

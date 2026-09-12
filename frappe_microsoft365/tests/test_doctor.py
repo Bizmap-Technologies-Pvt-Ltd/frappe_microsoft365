@@ -105,6 +105,63 @@ class TestSettingsChecks(BaseTestCase):
 		self.assertIn("settings.enabled", ids(found, WARN))
 
 
+class TestCredentialShapes(BaseTestCase):
+	"""The Secret ID sits next to the secret Value in Azure and only the Value works.
+
+	This is the mistake that actually happened, and Microsoft only reports it at sign-in as
+	AADSTS7000215, long after the person has moved on.
+	"""
+
+	def test_a_guid_in_the_secret_field_is_the_secret_id(self):
+		found = doctor.check_credentials(
+			good_settings(client_secret="a1b2c3d4-1234-5678-9abc-def012345678")
+		)
+
+		self.assertIn("settings.secret_is_the_id", ids(found, FAIL))
+		self.assertIn("Value", found[0]["fix"])
+
+	def test_a_real_secret_value_passes(self):
+		found = doctor.check_credentials(good_settings(client_secret="8kQ~Xs9aBc.dEf-2Gh3IjK4lMn5OpQ6rSt"))
+
+		self.assertNotIn("settings.secret_is_the_id", ids(found))
+
+	def test_a_masked_stored_secret_is_not_judged(self):
+		"""Frappe shows a saved Password field as asterisks; that is not a wrong value."""
+		found = doctor.check_credentials(good_settings(client_secret="**********"))
+
+		self.assertNotIn("settings.secret_is_the_id", ids(found))
+
+	def test_a_client_id_that_is_not_a_guid_is_flagged(self):
+		found = doctor.check_credentials(good_settings(client_id="my-app"))
+
+		self.assertIn("settings.client_id_shape", ids(found, WARN))
+
+	def test_a_tenant_domain_is_accepted(self):
+		for tenant in ("contoso.onmicrosoft.com", "common", TENANT):
+			with self.subTest(tenant=tenant):
+				found = doctor.check_credentials(good_settings(tenant_id=tenant))
+				self.assertNotIn("settings.tenant_id_shape", ids(found))
+
+	def test_a_nonsense_tenant_is_flagged(self):
+		found = doctor.check_credentials(good_settings(tenant_id="bizmap"))
+
+		self.assertIn("settings.tenant_id_shape", ids(found, WARN))
+
+	def test_a_redirect_uri_pointing_elsewhere_is_flagged(self):
+		found = doctor.check_credentials(good_settings(redirect_uri="https://site.example.com/"))
+
+		self.assertIn("settings.redirect_target", ids(found, WARN))
+
+	def test_healthy_credentials_produce_nothing(self):
+		settings = good_settings(
+			client_secret="8kQ~Xs9aBc.dEf",
+			client_id="038b9c8e-2699-4858-b5f1-4f7a3d4077c4",
+			redirect_uri="https://site.example.com/api/method/" + doctor.CALLBACK_METHOD,
+		)
+
+		self.assertEqual(doctor.check_credentials(settings), [])
+
+
 class TestConnectedAppChecks(BaseTestCase):
 	def test_healthy_delegated_app_has_no_problems(self):
 		found = doctor.check_connected_app(good_delegated_app(), good_settings())

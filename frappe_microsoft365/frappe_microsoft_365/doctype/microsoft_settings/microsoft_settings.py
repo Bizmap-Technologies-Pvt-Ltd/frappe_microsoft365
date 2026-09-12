@@ -33,6 +33,32 @@ class MicrosoftSettings(Document):
 					_("{0} are required to enable the integration.").format(", ".join(missing))
 				)
 
+		self._reject_the_secret_id()
+
+	def _reject_the_secret_id(self):
+		"""Azure shows a secret's Value and its Secret ID together, and only the Value works.
+
+		Pasting the wrong one is the commonest setup mistake there is, and Microsoft only says
+		so at sign-in, with AADSTS7000215, by which point the person has moved on. The two are
+		trivially distinguishable, so say it here instead.
+		"""
+		from frappe_microsoft365.doctor import MASKED, looks_like_guid
+
+		secret = (self.client_secret or "").strip()
+		if not secret or MASKED.match(secret):
+			return
+
+		if looks_like_guid(secret):
+			frappe.throw(
+				_(
+					"That looks like the Secret ID, not the secret value. In Azure, "
+					"Certificates & secrets shows <b>Value</b> next to <b>Secret ID</b>: copy "
+					"the Value. It is shown only once, so create a new secret if you have "
+					"navigated away."
+				),
+				title=_("Wrong column"),
+			)
+
 
 @frappe.whitelist()
 def get_effective_redirect_uri():
