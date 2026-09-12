@@ -10,24 +10,42 @@
 </div>
 
 Generic **Microsoft 365 integration for any Frappe / ERPNext site** — the Microsoft counterpart to
-Frappe's built-in Google Calendar integration. Configure the Azure app registration once in
-**Microsoft Settings**, let each user authorize a **Microsoft Calendar**, and the rest of the
-platform gets real Outlook calendar sync, Teams meetings and transcripts through a small, reusable API.
+Frappe's built-in Google Calendar integration. Register one Azure application, tick the
+capabilities you actually want in **Microsoft Settings**, and let each user authorize their own
+**Microsoft Calendar**.
+
+You get Outlook calendar sync in both directions, Teams meetings created from a Frappe Event,
+invitations you can reply to without leaving Frappe, and meeting transcripts — plus a
+diagnostics tool for the part everyone loses time on, which is getting the connection to work
+in the first place.
 
 ## Features
 
-- **Outlook calendar two-way sync** — Microsoft events ↔ Frappe `Event` (delta pull on a
-  schedule, push on save/delete via doc events). Per-calendar `pull`/`push` toggles.
-  Handles recurring series, deletions, paging and throttling; see *How the sync behaves*.
-- **Attendees and RSVP** — organizer, attendee list with everyone's reply, and your own response
-  on the Frappe `Event`; **Accept / Tentative / Decline** buttons on invitations you received.
-  Frappe's event participants are pushed back as Outlook attendees.
-- **Teams meeting creation** — create a calendar-associated Teams online meeting and get back the
-  join URL / event id / online-meeting id (calendar association is the precondition for transcripts).
-- **Transcripts & recordings** — list and fetch Teams meeting transcripts (VTT) and recordings for
-  meetings that are calendar-associated and not expired.
+- **Outlook calendar, two ways** — Microsoft events ↔ Frappe `Event`. Delta pull on a schedule,
+  push on save and delete. Recurring series arrive as individual occurrences without
+  duplicating, deletions propagate, and a failed pull never silently skips a window.
+  See *How the sync behaves*.
+- **Teams meetings from a Frappe Event** — an **Add Teams meeting** tickbox, the same idea as
+  Outlook's own. The join link comes back onto the Event, and a meeting organised in Outlook
+  keeps its link when it syncs in, so people can join from either side. No extra Azure
+  permission.
+- **Attendees and RSVP** — organiser, the attendee list with everyone's reply, and your own
+  response status on the Event, plus **Accept / Tentative / Decline** buttons on invitations you
+  received. Frappe's event participants go out as Outlook attendees.
+- **Transcripts and recordings** — list and fetch Teams meeting transcripts (VTT) and recordings
+  for meetings that are calendar-associated and not expired.
+- **Take only the parts you want** — calendar, Teams meetings, transcripts, mail and sign-in are
+  independent. The Azure scopes are **derived from what you tick** and shown before you
+  authorise, so the permissions you grant in Azure and the ones the app requests cannot drift
+  apart. Setting up mail or sign-in creates what each needs and never modifies anything that
+  already exists.
+- **A doctor for when it breaks** — connecting Frappe to Microsoft 365 takes fifteen-odd steps
+  and almost every mistake surfaces as `AUTHENTICATE failed` or `535 5.7.3`. **Run Diagnostics**
+  reads your configuration and names the failing step; **Explain an Error** decodes a message
+  from the Error Log into a cause and a fix.
 - **Secure by design** — MSAL auth-code flow, token refresh, CSRF state validation; secrets and
-  tokens are stored as `Password` fields and never logged or returned to clients.
+  tokens are stored as `Password` fields and never logged or returned to clients. The two
+  actions with consequences outside Frappe warn and confirm first.
 
 <details open>
 <summary><b>View Screenshots</b></summary>
