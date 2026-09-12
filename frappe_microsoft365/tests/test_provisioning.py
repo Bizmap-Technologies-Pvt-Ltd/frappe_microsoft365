@@ -23,7 +23,6 @@ def configure_settings(**values):
 	doc.update(values)
 	doc.save(ignore_permissions=True)
 	frappe.clear_document_cache("Microsoft Settings", "Microsoft Settings")
-	frappe.db.commit()
 
 
 def reset_settings():
@@ -41,12 +40,11 @@ def reset_settings():
 
 
 def purge_mail_app():
-	"""apply() commits, so its records outlive the test transaction. Clear every match."""
+	"""Clear every match, in case an earlier run left one behind."""
 	for name in frappe.get_all(
 		"Connected App", filters={"provider_name": provisioning.MAIL_APP_NAME}, pluck="name"
 	):
 		frappe.delete_doc("Connected App", name, force=True, ignore_permissions=True)
-	frappe.db.commit()
 
 
 def settings(**overrides):

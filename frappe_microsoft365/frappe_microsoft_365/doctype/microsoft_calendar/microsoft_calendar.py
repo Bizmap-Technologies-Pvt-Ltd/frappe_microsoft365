@@ -33,7 +33,7 @@ def _check_owner(doc):
 
 # --- OAuth round-trip ----------------------------------------------------------------
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def authorize_access(calendar_name, reauthorize=0):
 	"""Return the Microsoft sign-in URL for this calendar; the form redirects the user to it."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
@@ -48,7 +48,6 @@ def authorize_access(calendar_name, reauthorize=0):
 		},
 		update_modified=False,
 	)
-	frappe.db.commit()
 	return {"url": graph.build_authorize_url(state)}
 
 
@@ -69,7 +68,8 @@ def callback(code=None, state=None, error=None, error_description=None, **kwargs
 
 	if not doc.oauth_state_expiry or get_datetime(doc.oauth_state_expiry) < now_datetime():
 		frappe.db.set_value("Microsoft Calendar", name, "oauth_state", "", update_modified=False)
-		frappe.db.commit()
+		# GET requests are never auto-committed, and the throw below would roll this back.
+		frappe.db.commit()  # nosemgrep
 		frappe.throw(_("This authorization link has expired. Please click Authorize again."))
 
 	result = graph.exchange_code(code)
@@ -77,7 +77,8 @@ def callback(code=None, state=None, error=None, error_description=None, **kwargs
 	frappe.db.set_value(
 		"Microsoft Calendar", name, {"authorized": 1, "oauth_state": "", "oauth_state_expiry": None}
 	)
-	frappe.db.commit()
+	# OAuth callback is a GET; without this the tokens we just stored would be discarded.
+	frappe.db.commit()  # nosemgrep
 
 	# best-effort: fill account email + default calendar
 	try:
@@ -106,7 +107,8 @@ def _fill_account_details(calendar_name):
 			updates["ms_calendar_name"] = default.get("name")
 	if updates:
 		frappe.db.set_value("Microsoft Calendar", calendar_name, updates)
-		frappe.db.commit()
+		# Still inside the GET callback request, which Frappe does not auto-commit.
+		frappe.db.commit()  # nosemgrep
 
 
 @frappe.whitelist()
@@ -118,7 +120,7 @@ def test_connection(calendar_name):
 	return {"ok": True, "account": me.get("mail") or me.get("userPrincipalName"), "display_name": me.get("displayName")}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def disconnect(calendar_name):
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -127,7 +129,6 @@ def disconnect(calendar_name):
 		"oauth_state": "", "oauth_state_expiry": None,
 		"delta_link": "", "delta_window_end": None, "last_error": "",
 	})
-	frappe.db.commit()
 	return {"disconnected": True}
 
 

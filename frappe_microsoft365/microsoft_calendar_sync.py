@@ -253,7 +253,9 @@ def _sync_locked(doc):
 	if pull_ok:
 		updates["last_sync"] = now_datetime()
 	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
-	frappe.db.commit()
+	# sync_all loops over every calendar in one job: committing here keeps this calendar's
+	# watermark even if a later calendar raises, so its window is not re-fetched forever.
+	frappe.db.commit()  # nosemgrep
 
 	return {
 		"ok": not messages,
@@ -468,7 +470,9 @@ def _push(doc):
 			except Exception:
 				frappe.log_error(title=f"MS event patch failed: {name}")
 
-	frappe.db.commit()
+	# The ids of events already created in Graph must survive a later failure in this job;
+	# losing them would create duplicates in Outlook on the next run.
+	frappe.db.commit()  # nosemgrep
 	return count
 
 

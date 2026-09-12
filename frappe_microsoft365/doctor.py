@@ -313,19 +313,19 @@ def check_email_account(account):
 
 	if account.get("auth_method") != "OAuth":
 		return [
-			finding(
-				"email_account.auth_method",
-				SKIP,
-				_("{0} uses Basic authentication").format(name),
-				_(
-					"Microsoft disables Basic auth for SMTP by default at the end of December "
-					"2026, and it is unavailable for tenants created after that."
-				),
-				_("Move this account to OAuth before then."),
-				MS_OAUTH_DOC,
-				name,
-			)
-		]
+				finding(
+					"email_account.auth_method",
+					SKIP,
+					_("{0} uses Basic authentication").format(name),
+					_(
+						"Microsoft disables Basic auth for SMTP by default at the end of December "
+						"2026, and it is unavailable for tenants created after that."
+					),
+					_("Move this account to OAuth before then."),
+					MS_OAUTH_DOC,
+					name,
+				)
+			]
 
 	app_only = bool(account.get("backend_app_flow"))
 
@@ -492,8 +492,14 @@ def check_social_login_key(key, settings=None):
 
 # --- error decoder --------------------------------------------------------------------
 
-#: Ordered because some strings are substrings of others; first match wins.
-ERROR_PATTERNS = [
+def error_patterns():
+	"""Ordered because some strings are substrings of others; first match wins.
+
+	Built per call rather than held in a module-level constant: the messages go through
+	frappe._(), which resolves against the CURRENT site and language. A global would freeze
+	whichever site imported the module first and hand its translations to every other site.
+	"""
+	return [
 	(
 		r"AADSTS50011",
 		_("Redirect URI mismatch"),
@@ -574,7 +580,7 @@ ERROR_PATTERNS = [
 def explain_error(text):
 	"""Translate a Microsoft/IMAP/SMTP error into a cause and a next step."""
 	text = text or ""
-	for pattern, title, detail in ERROR_PATTERNS:
+	for pattern, title, detail in error_patterns():
 		if re.search(pattern, text, re.IGNORECASE):
 			return {"matched": True, "title": title, "detail": detail, "doc": ENTRA_ERROR_DOC}
 	return {

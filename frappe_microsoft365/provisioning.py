@@ -307,7 +307,7 @@ def _create_social_login_key(settings):
 	return doc.name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def apply():
 	"""Create whatever the plan says is missing. Never edits or deletes anything."""
 	frappe.only_for("System Manager")
@@ -324,9 +324,6 @@ def apply():
 			created.append({"capability": "mail", "name": _create_connected_app(settings)})
 		elif step["capability"] == "sso":
 			created.append({"capability": "sso", "name": _create_social_login_key(settings)})
-
-	if created:
-		frappe.db.commit()
 
 	# Re-plan so the caller sees the settled state, and run the doctor over it.
 	return {"created": created, "plan": plan(), "diagnostics": doctor.run_diagnostics()}
