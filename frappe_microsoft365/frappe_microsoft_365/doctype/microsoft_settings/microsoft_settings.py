@@ -1,6 +1,7 @@
 """Microsoft Settings — single config page for the Azure AD app (keys + scopes)."""
 
 import frappe
+from frappe import _
 from frappe.model.document import Document
 
 
@@ -16,7 +17,7 @@ class MicrosoftSettings(Document):
 					indicator="blue", alert=True,
 				)
 		if self.enabled and not (self.tenant_id and self.client_id):
-			frappe.throw("Tenant ID and Client ID are required to enable the integration.")
+			frappe.throw(_("Tenant ID and Client ID are required to enable the integration."))
 
 
 @frappe.whitelist()

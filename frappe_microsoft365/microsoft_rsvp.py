@@ -31,7 +31,7 @@ RESPONSE_ACTIONS = {
 # Frappe auto-commits on POST/PUT/DELETE/PATCH but never on GET, so over a GET the local
 # update below would be silently discarded.
 @frappe.whitelist(methods=["POST"])
-def respond_to_event(event, response, comment=None, send_response=1):
+def respond_to_event(event: str, response: str, comment: str | None = None, send_response: int = 1):
 	"""Accept, decline or tentatively accept the Microsoft event behind a Frappe Event.
 
 	``event`` is the Frappe Event name, ``response`` one of accept / decline / tentative.

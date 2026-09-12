@@ -558,7 +558,7 @@ def _push(doc):
 		try:
 			event = frappe.get_doc("Event", name)
 			created = _create_graph_event(doc.name, event)
-			if _store_graph_response(name, created):
+			if _store_graph_response(name, created, doc.name):
 				count += 1
 		except Exception:
 			frappe.log_error(title=f"MS event push failed: {name}")
@@ -584,7 +584,7 @@ def _push(doc):
 					doc.name,
 					json=_event_to_graph_body(event),
 				)
-				_store_graph_response(name, patched or {})
+				_store_graph_response(name, patched or {}, doc.name)
 				count += 1
 			except Exception:
 				frappe.log_error(title=f"MS event patch failed: {name}")
@@ -711,8 +711,18 @@ def _event_to_graph_body(event):
 	return body
 
 
-def _store_graph_response(event_name, created):
-	"""Save the bits Graph fills in itself: the event id, join link and Outlook link."""
+def _store_graph_response(event_name, created, calendar_name=None):
+	"""Save the bits Graph fills in itself: the event id, join link and Outlook link.
+
+	The id is the link between the two sides, and recording it is not optional. If it does not
+	persist, the next run sees an Event with no id and creates the meeting AGAIN — which is
+	how three copies of one meeting ended up in a real calendar when this column was too
+	narrow to hold a Graph id.
+
+	So the write is verified, and when it fails the event we just created is removed from the
+	calendar again rather than left as an orphan for the next run to duplicate. Passing
+	``calendar_name`` enables that rollback; without it the failure is only reported.
+	"""
 	values = {}
 	if created.get("id"):
 		values["custom_microsoft_event_id"] = created["id"]
@@ -722,9 +732,51 @@ def _store_graph_response(event_name, created):
 		values["custom_add_teams_meeting"] = 1
 	if created.get("webLink"):
 		values["custom_microsoft_web_link"] = created["webLink"]
-	if values:
+
+	if not values:
+		return False
+
+	ms_id = values.get("custom_microsoft_event_id")
+	try:
 		frappe.db.set_value("Event", event_name, values, update_modified=False)
-	return bool(values.get("custom_microsoft_event_id"))
+	except Exception:
+		frappe.log_error(title=f"MS event link could not be stored: {event_name}")
+		_undo_orphaned_graph_event(calendar_name, ms_id, event_name)
+		return False
+
+	if not ms_id:
+		return False
+
+	# Read it back. A write can be accepted and still not round-trip (truncation, sanitising),
+	# and a half-stored link is indistinguishable from no link on the next run.
+	if frappe.db.get_value("Event", event_name, "custom_microsoft_event_id") != ms_id:
+		frappe.log_error(
+			title=f"MS event link did not round-trip: {event_name}",
+			message=f"Graph returned id of {len(ms_id)} characters; reading it back gave something else.",
+		)
+		_undo_orphaned_graph_event(calendar_name, ms_id, event_name)
+		return False
+
+	return True
+
+
+def _undo_orphaned_graph_event(calendar_name, ms_id, event_name):
+	"""Remove an event we created but could not link, so the next run cannot duplicate it."""
+	if not calendar_name or not ms_id:
+		frappe.log_error(
+			title=f"MS event orphaned in the calendar: {event_name}",
+			message=(
+				f"Created in Microsoft as {ms_id} but not linked in Frappe, and no calendar was "
+				"available to undo it. Delete it in Outlook by hand, or the next sync will "
+				"create another copy."
+			),
+		)
+		return
+
+	try:
+		graph.graph_request("DELETE", f"/me/events/{ms_id}", calendar_name)
+	except Exception:
+		frappe.log_error(title=f"MS orphaned event could not be removed: {event_name}")
 
 
 def _create_graph_event(calendar_name, event):
@@ -758,9 +810,9 @@ def event_on_update(doc, method=None):
 				cal.name,
 				json=_event_to_graph_body(doc),
 			)
-			_store_graph_response(doc.name, patched or {})
+			_store_graph_response(doc.name, patched or {}, cal.name)
 		else:
-			_store_graph_response(doc.name, _create_graph_event(cal.name, doc))
+			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
 
@@ -785,7 +837,7 @@ def event_on_trash(doc, method=None):
 # --- read-only fetch for external consumers (e.g. Bizmap CRM) ------------------------
 
 @frappe.whitelist()
-def fetch_events(calendar_name, start_datetime=None, end_datetime=None):
+def fetch_events(calendar_name: str, start_datetime: str | None = None, end_datetime: str | None = None):
 	"""Return events from Graph (calendarView) as a clean list. Owner-checked, fully paged."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)

@@ -39,10 +39,7 @@ frappe.ui.form.on("Microsoft Calendar", {
 
 		frappe.confirm(
 			__(
-				"This writes into the real Outlook calendar of <b>{0}</b>.<br><br>" +
-					"Frappe Events marked for sync will be created as Microsoft events, edits are sent " +
-					"across, and <b>deleting a Frappe Event deletes the Microsoft one</b>.<br><br>" +
-					"Leave it off if you only want to read Outlook into Frappe.",
+				"This writes into the real Outlook calendar of <b>{0}</b>. Frappe Events marked for sync will be created as Microsoft events, edits are sent across, and deleting a Frappe Event deletes the Microsoft one. Leave it off if you only want to read Outlook into Frappe.",
 				[frm.doc.microsoft_user_email || frm.doc.user || __("this account")]
 			),
 			() => {

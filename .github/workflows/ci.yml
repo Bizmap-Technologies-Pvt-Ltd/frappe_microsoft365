@@ -27,14 +27,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Scoped to the correctness rules, which are what Frappe Cloud's publish check gates
-      # on. The security and translation rule sets flag known gaps (argument type hints on
-      # whitelisted methods, a few untranslated strings) that are tracked separately and do
-      # not block publishing.
+      # The whole rule set, not just the correctness rules Frappe Cloud gates on. The app is
+      # clean against all of them, so the bar stays there: argument type hints and translated
+      # strings are easy to keep and unpleasant to retrofit.
       - name: Run semgrep
         run: |
           pip install semgrep
-          semgrep --config /tmp/semgrep-rules/rules/frappe_correctness.yml \
+          semgrep --config /tmp/semgrep-rules/rules \
             --metrics=off --error frappe_microsoft365
 
   tests:

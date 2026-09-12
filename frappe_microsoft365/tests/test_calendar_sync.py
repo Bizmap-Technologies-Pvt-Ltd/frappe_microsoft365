@@ -666,6 +666,94 @@ class TestAttendeesPush(SyncTestCase):
 		self.assertIsNone(sync._participant_email({}))
 
 
+class TestAuthCallback(BaseTestCase):
+	"""A browser lands on the callback, so nothing may escape as a traceback."""
+
+	def _callback(self, **kwargs):
+		from frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar import (
+			microsoft_calendar as mc,
+		)
+
+		with patch.object(frappe, "respond_as_web_page") as page, patch.object(frappe, "log_error"):
+			mc.callback(**kwargs)
+		return page
+
+	def test_an_unknown_state_renders_a_page_instead_of_raising(self):
+		page = self._callback(code="x", state="not-a-real-state")
+
+		page.assert_called_once()
+		self.assertIn("sign-in failed", page.call_args[0][0].lower())
+
+	def test_microsofts_own_error_is_shown_to_the_person(self):
+		page = self._callback(
+			error="invalid_client",
+			error_description="AADSTS7000215: Invalid client secret provided.",
+		)
+
+		page.assert_called_once()
+		body = page.call_args[0][1]
+		self.assertIn("AADSTS7000215", body)
+		# the doctor's explanation rides along, so the page says what to do about it
+		self.assertIn("secret", body.lower())
+
+
+class TestDuplicateGuard(SyncTestCase):
+	"""Regression: a push that cannot record the id duplicates the meeting on every run.
+
+	This is what put three copies of one meeting in a real calendar: the event was created
+	in Outlook, the id came back too long for the column, and the next run saw an unlinked
+	Event and created another.
+	"""
+
+	def test_a_link_that_cannot_be_written_removes_the_event_again(self):
+		event = self._local_event()
+		created = {"id": "ms-orphan", "webLink": "https://outlook.office365.com/x"}
+
+		with patch.object(
+			frappe.db, "set_value", side_effect=Exception("Data too long for column")
+		), patch.object(graph, "graph_request") as mocked:
+			stored = sync._store_graph_response(event.name, created, CALENDAR)
+
+		self.assertFalse(stored)
+		mocked.assert_called_once()
+		self.assertEqual(mocked.call_args[0][0], "DELETE")
+		self.assertIn("ms-orphan", mocked.call_args[0][1])
+
+	def test_a_link_that_does_not_round_trip_removes_the_event_again(self):
+		"""A write can be accepted and still not come back the same (truncation, sanitising)."""
+		event = self._local_event()
+
+		with patch.object(frappe.db, "set_value"), patch.object(
+			frappe.db, "get_value", return_value="something-else"
+		), patch.object(graph, "graph_request") as mocked:
+			stored = sync._store_graph_response(event.name, {"id": "ms-truncated"}, CALENDAR)
+
+		self.assertFalse(stored)
+		self.assertEqual(mocked.call_args[0][0], "DELETE")
+
+	def test_a_good_link_is_kept_and_nothing_is_deleted(self):
+		event = self._local_event()
+
+		with patch.object(graph, "graph_request") as mocked:
+			stored = sync._store_graph_response(event.name, {"id": "ms-fine"}, CALENDAR)
+
+		self.assertTrue(stored)
+		mocked.assert_not_called()
+		event.reload()
+		self.assertEqual(event.custom_microsoft_event_id, "ms-fine")
+
+	def test_without_a_calendar_it_reports_rather_than_guessing(self):
+		event = self._local_event()
+
+		with patch.object(
+			frappe.db, "set_value", side_effect=Exception("boom")
+		), patch.object(graph, "graph_request") as mocked:
+			stored = sync._store_graph_response(event.name, {"id": "ms-x"})
+
+		self.assertFalse(stored)
+		mocked.assert_not_called()
+
+
 class TestTimezones(BaseTestCase):
 	def test_windows_timezone_name_is_mapped_not_assumed_utc(self):
 		"""Regression: ZoneInfo cannot parse Windows ids; the old fallback shifted meetings."""

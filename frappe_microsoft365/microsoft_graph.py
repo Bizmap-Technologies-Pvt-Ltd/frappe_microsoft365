@@ -11,6 +11,7 @@ import time
 
 import frappe
 import requests
+from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
 
@@ -78,14 +79,14 @@ def get_settings():
 	"""Settings for LIVE operations — requires the integration to be enabled."""
 	s = _settings_doc()
 	if not s.enabled:
-		frappe.throw("Microsoft 365 integration is disabled. Enable it in Microsoft Settings.", MsGraphError)
+		frappe.throw(_("Microsoft 365 integration is disabled. Enable it in Microsoft Settings."), MsGraphError)
 	return s
 
 
 def _client_secret():
 	val = get_decrypted_password("Microsoft Settings", "Microsoft Settings", "client_secret", raise_exception=False)
 	if not val:
-		frappe.throw("Microsoft Settings: client secret is not set.", MsGraphError)
+		frappe.throw(_("Microsoft Settings: client secret is not set."), MsGraphError)
 	return val
 
 
@@ -142,7 +143,7 @@ def get_scopes(settings=None):
 
 
 @frappe.whitelist()
-def preview_scopes(capabilities=None, override=None):
+def preview_scopes(capabilities: dict | str | None = None, override: str | None = None):
 	"""What sign-in would request for the capabilities currently on screen. Reads nothing else.
 
 	The Settings form shows this rather than asking an admin to work it out, and it is computed
@@ -309,7 +310,7 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 
 	if resp.status_code == 429:
 		frappe.throw(
-			"Microsoft Graph rate limit hit (429). The next scheduled sync will retry.", MsGraphError
+			_("Microsoft Graph rate limit hit (429). The next scheduled sync will retry."), MsGraphError
 		)
 
 	if resp.status_code == 410:
@@ -359,7 +360,7 @@ def graph_paged(path, calendar, headers=None, max_pages=MAX_PAGES):
 	"""
 	items = []
 	next_path = path
-	for _ in range(max_pages):
+	for _page in range(max_pages):
 		resp = graph_request("GET", next_path, calendar, headers=headers)
 		items.extend(resp.get("value") or [])
 		next_path = resp.get("@odata.nextLink")
@@ -378,7 +379,7 @@ def graph_delta(path, calendar, headers=None, max_pages=MAX_PAGES):
 	items = []
 	next_path = path
 	delta_link = None
-	for _ in range(max_pages):
+	for _page in range(max_pages):
 		resp = graph_request("GET", next_path, calendar, headers=headers)
 		items.extend(resp.get("value") or [])
 		delta_link = resp.get("@odata.deltaLink")

@@ -948,7 +948,7 @@ def run_diagnostics():
 
 
 @frappe.whitelist()
-def run_for_email_account(email_account):
+def run_for_email_account(email_account: str):
 	"""Check one mail account, plus the Connected App it depends on. Read-only."""
 	frappe.only_for("System Manager")
 
@@ -973,14 +973,14 @@ def run_for_email_account(email_account):
 
 
 @frappe.whitelist()
-def explain(error_text):
+def explain(error_text: str | None = None):
 	"""Whitelisted wrapper so the error decoder can be used from the Desk."""
 	frappe.only_for("System Manager")
 	return explain_error(error_text)
 
 
 @frappe.whitelist()
-def app_only_powershell(mailboxes=None, send_as=0):
+def app_only_powershell(mailboxes: str | list | None = None, send_as: int = 0):
 	"""Generate the Exchange Online setup script for app-only mailbox access."""
 	frappe.only_for("System Manager")
 	if isinstance(mailboxes, str):

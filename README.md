@@ -5,7 +5,7 @@
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
-![Tests](https://img.shields.io/badge/tests-171-2b3a8c)
+![Tests](https://img.shields.io/badge/tests-177-2b3a8c)
 
 </div>
 

@@ -34,13 +34,13 @@ def _attendees_array(attendees):
 
 @frappe.whitelist()
 def create_meeting(
-	calendar_name,
-	subject,
-	start_datetime,
-	end_datetime,
-	attendees=None,
-	body=None,
-	create_calendar_event=True,
+	calendar_name: str,
+	subject: str,
+	start_datetime: str,
+	end_datetime: str | None = None,
+	attendees: str | list | None = None,
+	body: str | None = None,
+	create_calendar_event: int = 1,
 ):
 	"""Create a Teams online meeting. Owner-checked.
 
@@ -119,7 +119,7 @@ def _resolve_online_meeting_id(calendar_name, join_url):
 
 
 @frappe.whitelist()
-def resolve_online_meeting_id(calendar_name, join_url):
+def resolve_online_meeting_id(calendar_name: str, join_url: str):
 	"""Whitelisted wrapper around the join-URL -> onlineMeeting id mapping. Owner-checked."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)

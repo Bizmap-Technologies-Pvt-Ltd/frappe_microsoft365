@@ -48,7 +48,7 @@
   {"fieldname": "ms_calendar_name", "fieldtype": "Data", "label": "Microsoft Calendar Name", "read_only": 1},
   {"fieldname": "sync_section", "fieldtype": "Section Break", "label": "Sync"},
   {"fieldname": "pull_from_microsoft_calendar", "fieldtype": "Check", "label": "Pull events from Microsoft", "default": "1"},
-  {"fieldname": "push_to_microsoft_calendar", "fieldtype": "Check", "label": "Push Frappe events to Microsoft", "default": "1"},
+  {"fieldname": "push_to_microsoft_calendar", "fieldtype": "Check", "label": "Push Frappe events to Microsoft", "default": "0", "description": "Off by default: this writes into the real Outlook calendar of this account, and deleting a Frappe Event then deletes the Microsoft one. Ticking it asks you to confirm."},
   {"fieldname": "column_break_sync", "fieldtype": "Column Break"},
   {"fieldname": "last_sync", "fieldtype": "Datetime", "label": "Last Sync", "read_only": 1},
   {"fieldname": "last_error", "fieldtype": "Small Text", "label": "Last Sync Error", "read_only": 1, "depends_on": "last_error"},

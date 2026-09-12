@@ -7,8 +7,9 @@ Handles the OAuth authorize/callback round-trip (MSAL) and exposes the account f
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_to_date, get_datetime, now_datetime
+from frappe.utils import add_to_date, get_datetime, get_url_to_form, now_datetime
 
+from frappe_microsoft365 import doctor
 from frappe_microsoft365 import microsoft_graph as graph
 
 #: An authorize link that is never followed should not stay usable forever.
@@ -34,7 +35,7 @@ def _check_owner(doc):
 # --- OAuth round-trip ----------------------------------------------------------------
 
 @frappe.whitelist(methods=["POST"])
-def authorize_access(calendar_name, reauthorize=0):
+def authorize_access(calendar_name: str, reauthorize: int = 0):
 	"""Return the Microsoft sign-in URL for this calendar; the form redirects the user to it."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -52,42 +53,97 @@ def authorize_access(calendar_name, reauthorize=0):
 
 
 @frappe.whitelist()
-def callback(code=None, state=None, error=None, error_description=None, **kwargs):
-	"""OAuth redirect target. Exchanges the code for tokens and stores them on the matching doc."""
-	if error:
-		frappe.local.response["type"] = "redirect"
-		frappe.local.response["location"] = f"/app/microsoft-calendar?error={frappe.utils.quoted(error)}"
+def callback(
+	code: str | None = None,
+	state: str | None = None,
+	error: str | None = None,
+	error_description: str | None = None,
+	**kwargs,
+):
+	"""OAuth redirect target. Exchanges the code for tokens and stores them on the matching doc.
+
+	A browser lands here, so nothing may escape as a traceback. Microsoft's own failures are
+	readable (AADSTS7000215 says in words that the client secret is wrong); dumping a Python
+	stack on top of that hides the one useful sentence on the page.
+	"""
+	name = None
+	try:
+		if error:
+			raise MicrosoftAuthError(error_description or error)
+
+		name = frappe.db.get_value("Microsoft Calendar", {"oauth_state": state}) if state else None
+		if not name:
+			raise MicrosoftAuthError(
+				_("This sign-in link is not valid any more. Click Authorize again to start a fresh one.")
+			)
+
+		doc = frappe.get_doc("Microsoft Calendar", name)
+		_check_owner(doc)
+
+		if not doc.oauth_state_expiry or get_datetime(doc.oauth_state_expiry) < now_datetime():
+			frappe.db.set_value("Microsoft Calendar", name, "oauth_state", "", update_modified=False)
+			# GET requests are never auto-committed, and the raise below would roll this back.
+			frappe.db.commit()  # nosemgrep
+			raise MicrosoftAuthError(
+				_("This sign-in link has expired. Click Authorize again.")
+			)
+
+		result = graph.exchange_code(code)
+		graph._store_tokens(name, result)  # stores access/refresh/expiry + email from claims
+		frappe.db.set_value(
+			"Microsoft Calendar", name, {"authorized": 1, "oauth_state": "", "oauth_state_expiry": None}
+		)
+		# OAuth callback is a GET; without this the tokens we just stored would be discarded.
+		frappe.db.commit()  # nosemgrep
+
+		# best-effort: fill account email + default calendar
+		try:
+			_fill_account_details(name)
+		except Exception:
+			frappe.log_error(title="MS Calendar post-auth detail fetch failed")
+
+	except Exception as e:
+		_render_auth_failure(name, e)
 		return
 
-	name = frappe.db.get_value("Microsoft Calendar", {"oauth_state": state}) if state else None
-	if not name:
-		frappe.throw(_("Invalid or expired authorization state. Please try authorizing again."))
-
-	doc = frappe.get_doc("Microsoft Calendar", name)
-	_check_owner(doc)
-
-	if not doc.oauth_state_expiry or get_datetime(doc.oauth_state_expiry) < now_datetime():
-		frappe.db.set_value("Microsoft Calendar", name, "oauth_state", "", update_modified=False)
-		# GET requests are never auto-committed, and the throw below would roll this back.
-		frappe.db.commit()  # nosemgrep
-		frappe.throw(_("This authorization link has expired. Please click Authorize again."))
-
-	result = graph.exchange_code(code)
-	graph._store_tokens(name, result)  # stores access/refresh/expiry + email from claims
-	frappe.db.set_value(
-		"Microsoft Calendar", name, {"authorized": 1, "oauth_state": "", "oauth_state_expiry": None}
-	)
-	# OAuth callback is a GET; without this the tokens we just stored would be discarded.
-	frappe.db.commit()  # nosemgrep
-
-	# best-effort: fill account email + default calendar
-	try:
-		_fill_account_details(name)
-	except Exception:
-		frappe.log_error(title="MS Calendar post-auth detail fetch failed")
-
 	frappe.local.response["type"] = "redirect"
-	frappe.local.response["location"] = f"/app/microsoft-calendar/{name}"
+	frappe.local.response["location"] = get_url_to_form("Microsoft Calendar", name)
+
+
+class MicrosoftAuthError(frappe.ValidationError):
+	"""A sign-in failure worth showing the person in the browser, not logging and hiding."""
+
+
+def _render_auth_failure(calendar_name, exception):
+	"""Show a readable page instead of a traceback, and record the reason on the connection."""
+	message = str(exception) or _("Microsoft sign-in failed.")
+	frappe.log_error(title=f"MS Calendar authorization failed: {calendar_name or 'unknown'}")
+
+	hint = doctor.explain_error(message)
+	detail = hint["detail"] if hint.get("matched") else ""
+
+	if calendar_name:
+		# Surfaced on the form as well, so the reason survives closing this page.
+		frappe.db.set_value(
+			"Microsoft Calendar", calendar_name, "last_error", message[:500], update_modified=False
+		)
+		# The callback is a GET, which Frappe never auto-commits, and this reason has to
+		# outlive the request so the form can show it.
+		frappe.db.commit()  # nosemgrep
+
+	body = f"<p>{frappe.utils.escape_html(message)}</p>"
+	if detail:
+		body += f"<p class='text-muted'>{frappe.utils.escape_html(detail)}</p>"
+
+	frappe.respond_as_web_page(
+		_("Microsoft sign-in failed"),
+		body,
+		indicator_color="red",
+		primary_action=get_url_to_form("Microsoft Calendar", calendar_name)
+		if calendar_name
+		else "/app/microsoft-calendar",
+		primary_label=_("Back to the connection"),
+	)
 
 
 def _fill_account_details(calendar_name):
@@ -112,7 +168,7 @@ def _fill_account_details(calendar_name):
 
 
 @frappe.whitelist()
-def test_connection(calendar_name):
+def test_connection(calendar_name: str):
 	"""Verify the stored token works by calling /me. Returns the account, never the token."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -121,7 +177,7 @@ def test_connection(calendar_name):
 
 
 @frappe.whitelist(methods=["POST"])
-def disconnect(calendar_name):
+def disconnect(calendar_name: str):
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 	frappe.db.set_value("Microsoft Calendar", calendar_name, {
@@ -133,7 +189,7 @@ def disconnect(calendar_name):
 
 
 @frappe.whitelist()
-def sync(calendar_name=None):
+def sync(calendar_name: str | None = None):
 	"""Two-way sync entrypoint (M2). Owner-checked."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)

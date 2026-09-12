@@ -39,7 +39,7 @@ def _wrap_403(e, hint):
 # --- transcripts ---------------------------------------------------------------------
 
 @frappe.whitelist()
-def list_transcripts(calendar_name, online_meeting_id):
+def list_transcripts(calendar_name: str, online_meeting_id: str):
 	"""List transcripts for an online meeting. Owner-checked."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -60,7 +60,7 @@ def list_transcripts(calendar_name, online_meeting_id):
 
 
 @frappe.whitelist()
-def get_transcript_content(calendar_name, online_meeting_id, transcript_id, fmt="text/vtt"):
+def get_transcript_content(calendar_name: str, online_meeting_id: str, transcript_id: str, fmt: str = "text/vtt"):
 	"""Return the raw transcript content (VTT by default). Owner-checked."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -78,7 +78,7 @@ def get_transcript_content(calendar_name, online_meeting_id, transcript_id, fmt=
 
 
 @frappe.whitelist()
-def get_transcripts_for_join_url(calendar_name, join_url):
+def get_transcripts_for_join_url(calendar_name: str, join_url: str):
 	"""Resolve a join URL -> online meeting, then list transcripts + fetch the latest VTT.
 
 	Returns {online_meeting_id, transcripts:[...], latest_vtt}. Owner-checked.
@@ -113,7 +113,7 @@ def get_transcripts_for_join_url(calendar_name, join_url):
 # --- recordings ----------------------------------------------------------------------
 
 @frappe.whitelist()
-def list_recordings(calendar_name, online_meeting_id):
+def list_recordings(calendar_name: str, online_meeting_id: str):
 	"""List recordings for an online meeting. Owner-checked. See licensing note."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -134,7 +134,7 @@ def list_recordings(calendar_name, online_meeting_id):
 
 
 @frappe.whitelist()
-def get_recording_content(calendar_name, online_meeting_id, recording_id):
+def get_recording_content(calendar_name: str, online_meeting_id: str, recording_id: str):
 	"""Return the raw recording bytes' download via Graph. Owner-checked. See licensing note."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
