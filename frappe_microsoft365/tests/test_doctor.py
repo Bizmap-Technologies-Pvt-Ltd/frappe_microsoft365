@@ -106,8 +106,10 @@ class TestSettingsChecks(BaseTestCase):
 
 
 class TestConnectedAppChecks(BaseTestCase):
-	def test_healthy_delegated_app_produces_nothing(self):
-		self.assertEqual(doctor.check_connected_app(good_delegated_app(), good_settings()), [])
+	def test_healthy_delegated_app_has_no_problems(self):
+		found = doctor.check_connected_app(good_delegated_app(), good_settings())
+
+		self.assertEqual([f for f in found if f["status"] in (FAIL, WARN)], [])
 
 	def test_missing_offline_access_is_caught(self):
 		"""The documented cause of 'it works for a few hours then stops'."""
@@ -138,7 +140,9 @@ class TestConnectedAppChecks(BaseTestCase):
 	def test_app_only_with_correct_scope_is_clean(self):
 		app = good_delegated_app(scopes=[APP_ONLY_SCOPE])
 
-		self.assertEqual(doctor.check_connected_app(app, good_settings(), app_only=True), [])
+		found = doctor.check_connected_app(app, good_settings(), app_only=True)
+
+		self.assertEqual([f for f in found if f["status"] in (FAIL, WARN)], [])
 
 	def test_app_only_extra_scopes_warn(self):
 		app = good_delegated_app(scopes=[APP_ONLY_SCOPE, OFFLINE_ACCESS])
@@ -166,12 +170,20 @@ class TestConnectedAppChecks(BaseTestCase):
 
 		self.assertIn("connected_app.tenant_token", ids(found, FAIL))
 
-	def test_redirect_uri_drift_is_warned(self):
-		app = good_delegated_app(redirect_uri="https://other.example.com/cb")
+	def test_the_second_redirect_uri_is_surfaced_for_azure_registration(self):
+		"""Frappe computes this endpoint from the record name; Azure needs it registered too."""
+		app = good_delegated_app(redirect_uri="https://site.example.com/api/method/...callback/abc")
 
 		found = doctor.check_connected_app(app, good_settings())
 
-		self.assertIn("connected_app.redirect_uri", ids(found, WARN))
+		notice = next(f for f in found if f["check"] == "connected_app.redirect_uri_registration")
+		self.assertEqual(notice["status"], SKIP)
+		self.assertIn("callback/abc", notice["detail"])
+
+	def test_missing_redirect_uri_is_a_failure(self):
+		found = doctor.check_connected_app(good_delegated_app(redirect_uri=""), good_settings())
+
+		self.assertIn("connected_app.redirect_uri", ids(found, FAIL))
 
 
 class TestEmailAccountChecks(BaseTestCase):

@@ -269,18 +269,32 @@ def check_connected_app(app, settings=None, app_only=False):
 				)
 			)
 
-	settings_redirect = (settings.get("redirect_uri") or "").strip()
+	# Frappe COMPUTES this field in Connected App.validate() and it contains the record
+	# name, so it is a different endpoint from this app's own callback and cannot be known
+	# before the record exists. Azure therefore needs BOTH URIs registered — a trap that
+	# surfaces later as AADSTS50011 and is documented nowhere.
 	app_redirect = (app.get("redirect_uri") or "").strip()
-	if settings_redirect and app_redirect and settings_redirect != app_redirect:
+	if not app_redirect:
 		out.append(
 			finding(
 				"connected_app.redirect_uri",
-				WARN,
-				_("Redirect URI differs from Microsoft Settings"),
-				_("{0} vs {1}").format(app_redirect, settings_redirect),
+				FAIL,
+				_("Connected App has no redirect URI"),
+				_("Frappe normally fills this in on save."),
+				_("Re-save the Connected App."),
+				target=name,
+			)
+		)
+	else:
+		out.append(
+			finding(
+				"connected_app.redirect_uri_registration",
+				SKIP,
+				_("Register this redirect URI in Azure"),
+				_("Mail sign-in returns to {0}").format(app_redirect),
 				_(
-					"Both must be registered in Azure exactly as written, or sign-in fails with "
-					"AADSTS50011."
+					"It is a different endpoint from this app's own callback, so Azure needs both "
+					"registered under Web redirect URIs. A missing one fails with AADSTS50011."
 				),
 				ENTRA_ERROR_DOC,
 				name,
@@ -407,6 +421,71 @@ def check_email_account(account):
 				target=name,
 			)
 		)
+
+	return out
+
+
+def check_social_login_key(key, settings=None):
+	"""``key``: dict of enable_social_login, client_id, authorize_url, access_token_url."""
+	out = []
+	settings = settings or {}
+	name = key.get("name") or "Office 365"
+	tenant = (settings.get("tenant_id") or "").strip()
+
+	if not key.get("enable_social_login"):
+		out.append(
+			finding(
+				"sso.enabled",
+				WARN,
+				_("Microsoft sign-in is configured but switched off"),
+				"",
+				_("Tick Enable Social Login on the Social Login Key."),
+				target=name,
+			)
+		)
+
+	client_id = (settings.get("client_id") or "").strip()
+	if client_id and (key.get("client_id") or "").strip() != client_id:
+		out.append(
+			finding(
+				"sso.client_id",
+				FAIL,
+				_("Sign-in uses a different Client ID"),
+				_("Microsoft Settings has {0}.").format(client_id),
+				_("Point both at the same Azure app registration, or sign-in will fail."),
+				target=name,
+			)
+		)
+
+	for field, label in (("authorize_url", _("authorize")), ("access_token_url", _("token"))):
+		uri = (key.get(field) or "").strip()
+		if not uri:
+			continue
+
+		# Frappe's built-in Office 365 provider ships /common/ + v1.0 endpoints, which
+		# cannot work with a single-tenant app registration.
+		if "/common/" in uri and tenant and tenant.lower() not in ("common", "organizations"):
+			out.append(
+				finding(
+					f"sso.tenant_{field}",
+					FAIL,
+					_("Sign-in {0} URL points at /common/").format(label),
+					_("Your app is registered in tenant {0}, not the shared endpoint.").format(tenant),
+					_("Use https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(tenant),
+					target=name,
+				)
+			)
+		if "/oauth2/v2.0/" not in uri:
+			out.append(
+				finding(
+					f"sso.version_{field}",
+					FAIL,
+					_("Sign-in {0} URL uses the v1.0 endpoint").format(label),
+					_("Currently {0}").format(uri),
+					_("Use the v2.0 endpoint instead."),
+					target=name,
+				)
+			)
 
 	return out
 
@@ -571,6 +650,10 @@ def _settings_config():
 		"client_id": settings.client_id,
 		"has_client_secret": bool(secret),
 		"redirect_uri": settings.redirect_uri,
+		"use_calendar": settings.use_calendar,
+		"use_mail": settings.use_mail,
+		"use_sso": settings.use_sso,
+		"mail_flow": settings.mail_flow or "Delegated",
 	}
 
 
@@ -621,7 +704,10 @@ def run_diagnostics():
 	settings = _settings_config()
 	findings = check_settings(settings)
 
-	accounts = _email_account_configs()
+	wants_mail = bool(settings.get("use_mail"))
+	wants_sso = bool(settings.get("use_sso"))
+
+	accounts = _email_account_configs() if wants_mail else []
 	oauth_accounts = [a for a in accounts if a.get("auth_method") == "OAuth"]
 
 	checked_apps = set()
@@ -636,7 +722,28 @@ def run_diagnostics():
 	for account in accounts:
 		findings += check_email_account(account)
 
-	if not oauth_accounts:
+	if wants_sso:
+		sso_name = frappe.db.exists("Social Login Key", {"social_login_provider": "Office 365"})
+		if sso_name:
+			key = frappe.db.get_value(
+				"Social Login Key",
+				sso_name,
+				["name", "enable_social_login", "client_id", "authorize_url", "access_token_url"],
+				as_dict=True,
+			)
+			findings += check_social_login_key(key, settings)
+		else:
+			findings.append(
+				finding(
+					"sso.missing",
+					FAIL,
+					_("Microsoft sign-in is selected but not set up"),
+					"",
+					_("Use Set Up on Microsoft Settings to create the Social Login Key."),
+				)
+			)
+
+	if wants_mail and not oauth_accounts:
 		findings.append(
 			finding(
 				"email_account.none",
@@ -655,6 +762,31 @@ def run_diagnostics():
 
 	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
 	return {"findings": findings, "counts": counts, "checked_connected_apps": sorted(checked_apps)}
+
+
+@frappe.whitelist()
+def run_for_email_account(email_account):
+	"""Check one mail account, plus the Connected App it depends on. Read-only."""
+	frappe.only_for("System Manager")
+
+	settings = _settings_config()
+	account = frappe.db.get_value("Email Account", email_account, EMAIL_ACCOUNT_FIELDS, as_dict=True)
+	if not account:
+		frappe.throw(_("Email Account {0} not found").format(email_account))
+	account["imap_folder"] = frappe.db.count("IMAP Folder", {"parent": email_account})
+
+	findings = check_email_account(account)
+	app_name = account.get("connected_app")
+	if app_name and frappe.db.exists("Connected App", app_name):
+		findings += check_connected_app(
+			_connected_app_config(app_name), settings, app_only=bool(account.get("backend_app_flow"))
+		)
+
+	if not findings:
+		findings = [finding("account.ok", PASS, _("No configuration problems found for {0}").format(email_account))]
+
+	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
+	return {"findings": findings, "counts": counts}
 
 
 @frappe.whitelist()

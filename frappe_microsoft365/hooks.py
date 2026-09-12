@@ -56,7 +56,8 @@ scheduler_events = {
 
 # include js, css files in header of desk.html
 # app_include_css = "/assets/frappe_microsoft365/css/frappe_microsoft365.css"
-# app_include_js = "/assets/frappe_microsoft365/js/frappe_microsoft365.js"
+# The doctor's shared renderer. Read-only UI; this app never changes how mail is sent.
+app_include_js = ["/assets/frappe_microsoft365/js/microsoft_doctor.js"]
 
 # include js, css files in header of web template
 # web_include_css = "/assets/frappe_microsoft365/css/frappe_microsoft365.css"
@@ -73,7 +74,8 @@ scheduler_events = {
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+# A per-account "Check Microsoft Setup" button, on the form where the failure appears.
+doctype_js = {"Email Account": "public/js/email_account.js"}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}

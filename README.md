@@ -121,6 +121,36 @@ Worth knowing before you trust it with a real calendar:
 Access to `Microsoft Calendar` is granted to **System Manager** and **Desk User** (the same
 pattern Frappe's Google Calendar uses), and each user only sees their own connection.
 
+## Set up only what you want
+
+Calendar, mail and sign-in are **independent**. Tick the ones you want in Microsoft Settings
+and leave the rest alone — nothing is created for a capability you did not ask for, and none
+of them depend on each other. Use the calendar without mail, mail without sign-in, sign-in on
+its own; all valid.
+
+**Set Up** shows a plan first: what will be created, what already exists, which Azure
+permissions each capability needs, and only then offers to apply it.
+
+| Capability | What gets created | Azure permissions |
+| --- | --- | --- |
+| Outlook calendar and Teams | Nothing — this app talks to Graph directly | Graph delegated: `Calendars.ReadWrite`, `OnlineMeetings.ReadWrite`, `OnlineMeetingTranscript.Read.All`, `User.Read`, `offline_access` |
+| Outlook mail | A `Connected App` for Frappe's Email Account | Exchange delegated: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` — or the `.default` app-only scope for shared mailboxes |
+| Sign in with Microsoft | A `Social Login Key` | Graph delegated: `openid`, `email`, `profile` |
+
+**It never overwrites anything.** If a record already exists it is left exactly as it is and
+reported, with any drift from Microsoft Settings spelled out, so a setup someone tuned by hand
+survives untouched. Running Set Up twice does nothing the second time.
+
+Two details it gets right that are easy to miss by hand:
+
+- Frappe's built-in Office 365 sign-in provider defaults to the `/common/` authority and the
+  **v1.0** endpoints, neither of which works with a single-tenant app registration. Provisioning
+  writes tenant-specific v2.0 endpoints instead.
+- The `Connected App` redirect URI is computed by Frappe from the record name, so it is a
+  *different* endpoint from this app's callback and cannot be known before the record exists.
+  Azure needs **both** registered; the doctor prints the exact URI to add. A missing one shows
+  up later as `AADSTS50011`.
+
 ## Connection doctor
 
 Connecting Frappe to Microsoft 365 has roughly fifteen steps across Azure, Exchange and

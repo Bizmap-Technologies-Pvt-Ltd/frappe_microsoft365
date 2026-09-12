@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — modular setup
+
+### Added
+
+- **Capability selection** in Microsoft Settings: calendar, mail and sign-in are independent
+  and individually optional. The doctor only checks what you selected, so it never nags about
+  mail or sign-in you never wanted.
+- **Set Up** builds what each selected capability needs from the single Azure registration
+  already configured — a `Connected App` for mail, a `Social Login Key` for sign-in — with a
+  plan shown first. It only ever creates missing records: anything that exists is reported
+  with its drift and left untouched, and a second run does nothing.
+- Sign-in is provisioned with tenant-specific **v2.0** endpoints, because Frappe's built-in
+  Office 365 provider defaults to `/common/` and v1.0, which a single-tenant app rejects.
+- New doctor rules for the `Social Login Key` (`/common/` authority, v1.0 endpoints, client-id
+  mismatch, sign-in switched off) and a notice giving the exact second redirect URI Azure needs.
+- **Check Microsoft Setup** button on `Email Account`, so one account can be diagnosed from
+  the form where the failure appears.
+
+Still read-only with respect to mail: no Graph mail, no replacement for `Email Account`, no
+changes to the email queue.
+
 ## Unreleased — connection doctor
 
 ### Added
