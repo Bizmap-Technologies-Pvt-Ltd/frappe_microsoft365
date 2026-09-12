@@ -1,0 +1,678 @@
+"""Microsoft connection doctor.
+
+Connecting Frappe to Microsoft 365 fails in a dozen ways that all surface as the same
+unhelpful string — ``AUTHENTICATE failed``, ``535 5.7.3``, ``invalid_grant`` — with no
+indication which of the fifteen setup steps was wrong. This module inspects the
+configuration and says what is actually wrong, in the admin's language.
+
+It only ever READS configuration. It does not touch mail sending or receiving, the Email
+Account doctype's behaviour, or the email queue: Frappe's own IMAP/SMTP + OAuth path stays
+exactly as it is, and several mailboxes keep working the way they always did.
+
+Every rule below is derived from a documented requirement, cited inline:
+
+* Microsoft, "Authenticate an IMAP, POP or SMTP connection using OAuth"
+  https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
+* Microsoft Entra authentication error codes
+  https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+
+The check functions take plain dicts rather than Documents so they stay pure and fully
+testable offline. ``run_diagnostics`` is the thin layer that loads real records into them.
+"""
+
+import re
+
+import frappe
+from frappe import _
+from frappe.utils.password import get_decrypted_password
+
+# --- documented constants -------------------------------------------------------------
+
+#: Delegated (a user signs in) scopes, per Microsoft's protocol table.
+DELEGATED_SCOPES = {
+	"imap": "https://outlook.office.com/IMAP.AccessAsUser.All",
+	"pop": "https://outlook.office.com/POP.AccessAsUser.All",
+	"smtp": "https://outlook.office.com/SMTP.Send",
+}
+
+#: App-only (client credentials) token scope. Microsoft: "You must use
+#: https://outlook.office365.com/.default in the scope property in the body payload".
+APP_ONLY_SCOPE = "https://outlook.office365.com/.default"
+
+#: Admin consent for POP/IMAP application permissions uses a DIFFERENT scope than SMTP.
+ADMIN_CONSENT_SCOPE_POP_IMAP = "https://ps.outlook.com/.default"
+ADMIN_CONSENT_SCOPE_SMTP = "https://outlook.office365.com/.default"
+
+OFFLINE_ACCESS = "offline_access"
+
+EXCHANGE_IMAP_HOST = "outlook.office365.com"
+EXCHANGE_SMTP_HOST = "smtp.office365.com"
+
+MS_OAUTH_DOC = (
+	"https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/"
+	"how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth"
+)
+ENTRA_ERROR_DOC = "https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes"
+
+PASS, WARN, FAIL, SKIP = "pass", "warn", "fail", "skip"
+
+
+def finding(check, status, title, detail="", fix="", doc="", target=None):
+	"""One diagnostic result. Kept as a plain dict so it crosses the API boundary cleanly."""
+	return {
+		"check": check,
+		"status": status,
+		"title": title,
+		"detail": detail,
+		"fix": fix,
+		"doc": doc,
+		"target": target,
+	}
+
+
+def _norm_scopes(scopes):
+	return [s.strip() for s in (scopes or []) if s and s.strip()]
+
+
+def _tenant_of(uri):
+	"""Pull the tenant segment out of a login.microsoftonline.com URI, if present."""
+	match = re.search(r"login\.microsoftonline\.com/([^/]+)/", uri or "")
+	return match.group(1) if match else None
+
+
+# --- Microsoft Settings ---------------------------------------------------------------
+
+def check_settings(settings):
+	"""``settings``: dict of enabled, tenant_id, client_id, has_client_secret, redirect_uri."""
+	out = []
+	tenant = (settings.get("tenant_id") or "").strip()
+
+	if not settings.get("enabled"):
+		out.append(
+			finding(
+				"settings.enabled",
+				WARN,
+				_("Microsoft 365 integration is disabled"),
+				_("Live operations will refuse to run while this is off."),
+				_("Tick Enabled in Microsoft Settings once the rest of the setup checks out."),
+			)
+		)
+
+	missing = [
+		label
+		for label, present in (
+			("Tenant ID", tenant),
+			("Client ID", (settings.get("client_id") or "").strip()),
+			("Client Secret", settings.get("has_client_secret")),
+		)
+		if not present
+	]
+	if missing:
+		out.append(
+			finding(
+				"settings.credentials",
+				FAIL,
+				_("Azure application details are incomplete"),
+				_("Missing: {0}.").format(", ".join(missing)),
+				_("Copy them from the Azure app registration into Microsoft Settings."),
+			)
+		)
+
+	# Client credentials (app-only) cannot use the multi-tenant /common authority.
+	if tenant.lower() in ("common", "organizations", "consumers"):
+		out.append(
+			finding(
+				"settings.tenant_id",
+				WARN,
+				_("Tenant is set to '{0}'").format(tenant),
+				_(
+					"App-only (client credentials) access requires a specific tenant id. "
+					"'{0}' works for interactive sign-in only."
+				).format(tenant),
+				_("Use the Directory (tenant) ID from the Azure app registration Overview page."),
+				MS_OAUTH_DOC,
+			)
+		)
+
+	redirect = (settings.get("redirect_uri") or "").strip()
+	if redirect and not (redirect.startswith("https://") or "localhost" in redirect):
+		out.append(
+			finding(
+				"settings.redirect_uri",
+				FAIL,
+				_("Redirect URI is not HTTPS"),
+				_("Azure rejects plain HTTP redirect URIs except on localhost."),
+				_("Serve the site over HTTPS, or test on http://...localhost."),
+			)
+		)
+
+	return out
+
+
+# --- Connected App --------------------------------------------------------------------
+
+def check_connected_app(app, settings=None, app_only=False):
+	"""``app``: dict of name, client_id, redirect_uri, authorization_uri, token_uri, scopes."""
+	out = []
+	settings = settings or {}
+	name = app.get("name")
+	scopes = _norm_scopes(app.get("scopes"))
+
+	if not scopes:
+		out.append(
+			finding(
+				"connected_app.scopes",
+				FAIL,
+				_("Connected App has no scopes"),
+				_("Without scopes Microsoft issues a token that mail protocols will reject."),
+				_("Add {0}.").format(APP_ONLY_SCOPE if app_only else ", ".join(DELEGATED_SCOPES.values())),
+				MS_OAUTH_DOC,
+				name,
+			)
+		)
+
+	if app_only:
+		# Microsoft: app-only tokens must be requested at the .default scope.
+		if scopes and APP_ONLY_SCOPE not in scopes:
+			out.append(
+				finding(
+					"connected_app.scopes_app_only",
+					FAIL,
+					_("App-only flow is using delegated scopes"),
+					_("Found: {0}").format(", ".join(scopes)),
+					_("Replace them with the single scope {0}.").format(APP_ONLY_SCOPE),
+					MS_OAUTH_DOC,
+					name,
+				)
+			)
+		elif scopes and len(scopes) > 1:
+			out.append(
+				finding(
+					"connected_app.scopes_app_only_extra",
+					WARN,
+					_("Extra scopes alongside .default"),
+					_("Client credentials ignores everything except the .default scope."),
+					_("Leave only {0}.").format(APP_ONLY_SCOPE),
+					MS_OAUTH_DOC,
+					name,
+				)
+			)
+	elif scopes:
+		delegated = set(DELEGATED_SCOPES.values())
+		if not (set(scopes) & delegated):
+			out.append(
+				finding(
+					"connected_app.scopes_delegated",
+					FAIL,
+					_("No Outlook protocol scopes found"),
+					_("Found: {0}").format(", ".join(scopes)),
+					_(
+						"Delegated mail needs the full resource URLs, e.g. {0} for IMAP and {1} "
+						"for sending."
+					).format(DELEGATED_SCOPES["imap"], DELEGATED_SCOPES["smtp"]),
+					MS_OAUTH_DOC,
+					name,
+				)
+			)
+		if OFFLINE_ACCESS not in scopes:
+			# Without offline_access there is no refresh token, so the connection dies
+			# after the first access token expires — the "loses access after a few hours"
+			# symptom reported repeatedly on the forum.
+			out.append(
+				finding(
+					"connected_app.offline_access",
+					FAIL,
+					_("offline_access scope is missing"),
+					_(
+						"Microsoft only returns a refresh token when offline_access is requested. "
+						"Without it the account works for about an hour and then needs "
+						"re-authorising, repeatedly."
+					),
+					_("Add the scope {0} to the Connected App.").format(OFFLINE_ACCESS),
+					MS_OAUTH_DOC,
+					name,
+				)
+			)
+
+	token_uri = (app.get("token_uri") or "").strip()
+	auth_uri = (app.get("authorization_uri") or "").strip()
+
+	if token_uri and "/oauth2/v2.0/" not in token_uri:
+		out.append(
+			finding(
+				"connected_app.endpoint_version",
+				FAIL,
+				_("Connected App points at the v1.0 token endpoint"),
+				_("Token URI: {0}").format(token_uri),
+				_("Use the v2.0 endpoints: .../oauth2/v2.0/token and .../oauth2/v2.0/authorize."),
+				MS_OAUTH_DOC,
+				name,
+			)
+		)
+
+	tenant = (settings.get("tenant_id") or "").strip()
+	for label, uri in (("authorization", auth_uri), ("token", token_uri)):
+		uri_tenant = _tenant_of(uri)
+		if tenant and uri_tenant and uri_tenant.lower() != tenant.lower():
+			out.append(
+				finding(
+					f"connected_app.tenant_{label}",
+					FAIL,
+					_("Connected App {0} URI points at a different tenant").format(label),
+					_("Microsoft Settings says {0}, the {1} URI says {2}.").format(
+						tenant, label, uri_tenant
+					),
+					_("Point both URIs at https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(
+						tenant
+					),
+					target=name,
+				)
+			)
+
+	settings_redirect = (settings.get("redirect_uri") or "").strip()
+	app_redirect = (app.get("redirect_uri") or "").strip()
+	if settings_redirect and app_redirect and settings_redirect != app_redirect:
+		out.append(
+			finding(
+				"connected_app.redirect_uri",
+				WARN,
+				_("Redirect URI differs from Microsoft Settings"),
+				_("{0} vs {1}").format(app_redirect, settings_redirect),
+				_(
+					"Both must be registered in Azure exactly as written, or sign-in fails with "
+					"AADSTS50011."
+				),
+				ENTRA_ERROR_DOC,
+				name,
+			)
+		)
+
+	return out
+
+
+# --- Email Account --------------------------------------------------------------------
+
+def check_email_account(account):
+	"""``account``: dict of the Email Account fields the OAuth path depends on."""
+	out = []
+	name = account.get("name") or account.get("email_id")
+
+	if account.get("auth_method") != "OAuth":
+		return [
+			finding(
+				"email_account.auth_method",
+				SKIP,
+				_("{0} uses Basic authentication").format(name),
+				_(
+					"Microsoft disables Basic auth for SMTP by default at the end of December "
+					"2026, and it is unavailable for tenants created after that."
+				),
+				_("Move this account to OAuth before then."),
+				MS_OAUTH_DOC,
+				name,
+			)
+		]
+
+	app_only = bool(account.get("backend_app_flow"))
+
+	if not account.get("connected_app"):
+		out.append(
+			finding(
+				"email_account.connected_app",
+				FAIL,
+				_("{0} is set to OAuth but has no Connected App").format(name),
+				"",
+				_("Link the Connected App that holds the Azure credentials."),
+				target=name,
+			)
+		)
+
+	if not app_only and not account.get("connected_user"):
+		out.append(
+			finding(
+				"email_account.connected_user",
+				FAIL,
+				_("{0} has no Connected User").format(name),
+				_("Delegated OAuth stores the token against a Frappe user; without one there is "
+				  "no token to authenticate with."),
+				_("Set Connected User, then click Authorize API Access while logged in as them."),
+				target=name,
+			)
+		)
+
+	# The shared-mailbox identity conflict. Microsoft: for shared mailbox access over
+	# IMAP the XOAUTH2 user= field must be the SHARED mailbox address, while SMTP must
+	# authenticate as the signing-in user. Frappe sends `login_id or email_id` for both,
+	# so one field cannot satisfy both protocols on the same account.
+	if (
+		not app_only
+		and account.get("enable_incoming")
+		and account.get("enable_outgoing")
+		and account.get("login_id_is_different")
+		and (account.get("login_id") or "").strip()
+		and (account.get("login_id") or "").strip().lower() != (account.get("email_id") or "").strip().lower()
+	):
+		out.append(
+			finding(
+				"email_account.shared_mailbox_identity",
+				WARN,
+				_("{0} sends one identity to both IMAP and SMTP").format(name),
+				_(
+					"For a shared mailbox Microsoft wants the mailbox address in the IMAP "
+					"XOAUTH2 string but the signing-in user for SMTP. Frappe sends Login Id to "
+					"both, so incoming and outgoing cannot both be right on this account."
+				),
+				_(
+					"Either split it into two Email Accounts (one incoming, one outgoing), or "
+					"switch to the app-only flow, where no user identity is involved."
+				),
+				MS_OAUTH_DOC,
+				name,
+			)
+		)
+
+	if account.get("enable_incoming") and account.get("use_imap") and not account.get("imap_folder"):
+		out.append(
+			finding(
+				"email_account.imap_folder",
+				FAIL,
+				_("{0} has no IMAP folder configured").format(name),
+				"",
+				_("Add at least one folder (usually INBOX)."),
+				target=name,
+			)
+		)
+
+	if account.get("use_ssl") and account.get("use_starttls"):
+		out.append(
+			finding(
+				"email_account.tls",
+				WARN,
+				_("{0} has both SSL and STARTTLS enabled").format(name),
+				_("These are alternatives; enabling both is a common cause of 'TLS required'."),
+				_("Use SSL for IMAP on 993, or STARTTLS for SMTP on 587 — not both."),
+				target=name,
+			)
+		)
+
+	server = (account.get("email_server") or "").strip().lower()
+	if account.get("enable_incoming") and server and EXCHANGE_IMAP_HOST not in server:
+		out.append(
+			finding(
+				"email_account.imap_host",
+				WARN,
+				_("{0} incoming server is {1}").format(name, server),
+				_("Microsoft 365 mailboxes use {0}.").format(EXCHANGE_IMAP_HOST),
+				_("Set the incoming server to {0}.").format(EXCHANGE_IMAP_HOST),
+				target=name,
+			)
+		)
+
+	return out
+
+
+# --- error decoder --------------------------------------------------------------------
+
+#: Ordered because some strings are substrings of others; first match wins.
+ERROR_PATTERNS = [
+	(
+		r"AADSTS50011",
+		_("Redirect URI mismatch"),
+		_(
+			"The redirect URI in the Connected App does not exactly match one registered on the "
+			"Azure app — scheme, host, port and path all have to match."
+		),
+	),
+	(
+		r"AADSTS65001|consent",
+		_("Admin consent has not been granted"),
+		_(
+			"An administrator must grant consent for the requested permissions. For POP/IMAP "
+			"application permissions the consent URL uses scope "
+			"https://ps.outlook.com/.default; for SMTP it uses "
+			"https://outlook.office365.com/.default."
+		),
+	),
+	(
+		r"AADSTS7000215|invalid_client",
+		_("Client secret is wrong or expired"),
+		_("Azure client secrets expire. Create a new one and paste it into Microsoft Settings."),
+	),
+	(
+		r"AADSTS700016|application with identifier",
+		_("The application is not present in this tenant"),
+		_("Check the tenant id, or have an admin consent the app into the tenant first."),
+	),
+	(
+		r"invalid_grant",
+		_("The refresh token is no longer valid"),
+		_(
+			"It expires after long inactivity, or when consent or the password changes. "
+			"Re-authorise the account. If this recurs within hours, offline_access is probably "
+			"missing from the Connected App scopes."
+		),
+	),
+	(
+		r"535 5\.7\.3|535 5\.7\.139|SMTPAuthenticationError",
+		_("SMTP rejected the token"),
+		_(
+			"Usually SMTP AUTH is disabled for that mailbox in Exchange, or the identity in the "
+			"XOAUTH2 string is not the user the token was issued for. For app-only sending, the "
+			"service principal also needs SendAs via Add-RecipientPermission."
+		),
+	),
+	(
+		r"451 4\.7\.0",
+		_("Exchange applied a temporary block"),
+		_(
+			"Usually throttling or a tenant-level restriction rather than a wrong credential. "
+			"Retry, and confirm SMTP AUTH is enabled for the mailbox."
+		),
+	),
+	(
+		r"AUTHENTICATE failed|A01 NO",
+		_("IMAP rejected the token"),
+		_(
+			"The token was issued but the mailbox refused it. Check that IMAP.AccessAsUser.All "
+			"(delegated) or IMAP.AccessAsApp (app-only) is granted and consented, that the "
+			"service principal is registered in Exchange, and that the mailbox itself was granted "
+			"to it with Add-MailboxPermission."
+		),
+	),
+	(
+		r"TLS required|STARTTLS",
+		_("TLS negotiation failed"),
+		_("Check the SSL and STARTTLS flags — one or the other, not both."),
+	),
+	(
+		r"Please Authorize OAuth",
+		_("No token is stored for this account yet"),
+		_("Open the Email Account and click Authorize API Access, signed in as the Connected User."),
+	),
+]
+
+
+def explain_error(text):
+	"""Translate a Microsoft/IMAP/SMTP error into a cause and a next step."""
+	text = text or ""
+	for pattern, title, detail in ERROR_PATTERNS:
+		if re.search(pattern, text, re.IGNORECASE):
+			return {"matched": True, "title": title, "detail": detail, "doc": ENTRA_ERROR_DOC}
+	return {
+		"matched": False,
+		"title": _("Unrecognised error"),
+		"detail": _("No known Microsoft cause matches this message."),
+		"doc": ENTRA_ERROR_DOC,
+	}
+
+
+# --- Exchange PowerShell for app-only access ------------------------------------------
+
+def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None, send_as=False):
+	"""The Exchange Online commands that app-only mailbox access requires.
+
+	Microsoft's biggest documented trap: New-ServicePrincipal wants the Object ID from the
+	ENTERPRISE APPLICATION blade, not the one shown on the App Registration page. Using the
+	wrong one fails at authentication time with no useful message, so the generated script
+	looks it up by AppId instead of asking anyone to copy it.
+	"""
+	mailboxes = mailboxes or []
+	lines = [
+		"# Run in Exchange Online PowerShell as a tenant admin.",
+		"Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser",
+		"Import-Module ExchangeOnlineManagement",
+		"Connect-ExchangeOnline",
+		"",
+		"# Look the service principal up by AppId so the correct (Enterprise Application)",
+		"# Object ID is used — copying the App Registration one causes silent auth failures.",
+		f'$appId = "{client_id or "<CLIENT_ID>"}"',
+	]
+
+	if enterprise_object_id:
+		lines.append(f'$objectId = "{enterprise_object_id}"')
+	else:
+		lines += [
+			"$sp = Get-MgServicePrincipal -Filter \"appId eq '$appId'\"   # or Get-AzureADServicePrincipal",
+			"$objectId = $sp.Id",
+		]
+
+	lines += [
+		"",
+		"New-ServicePrincipal -AppId $appId -ObjectId $objectId -DisplayName \"Frappe mail access\"",
+		"$exoSp = Get-ServicePrincipal -Identity \"Frappe mail access\"",
+		"",
+		"# Grant only the mailboxes this app should ever read. Access is scoped per mailbox,",
+		"# so the app cannot reach anything not listed here.",
+	]
+
+	for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+		lines.append(
+			f'Add-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity -AccessRights FullAccess'
+		)
+		if send_as:
+			lines.append(
+				f'Add-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+				f"-AccessRights SendAs -Confirm:$false"
+			)
+
+	return "\n".join(lines)
+
+
+# --- collectors -----------------------------------------------------------------------
+
+def _settings_config():
+	settings = frappe.get_cached_doc("Microsoft Settings")
+	secret = get_decrypted_password(
+		"Microsoft Settings", "Microsoft Settings", "client_secret", raise_exception=False
+	)
+	return {
+		"enabled": settings.enabled,
+		"tenant_id": settings.tenant_id,
+		"client_id": settings.client_id,
+		"has_client_secret": bool(secret),
+		"redirect_uri": settings.redirect_uri,
+	}
+
+
+def _connected_app_config(name):
+	doc = frappe.get_doc("Connected App", name)
+	return {
+		"name": doc.name,
+		"client_id": doc.client_id,
+		"redirect_uri": doc.redirect_uri,
+		"authorization_uri": doc.authorization_uri,
+		"token_uri": doc.token_uri,
+		"scopes": [row.scope for row in (doc.scopes or [])],
+	}
+
+
+EMAIL_ACCOUNT_FIELDS = [
+	"name",
+	"email_id",
+	"auth_method",
+	"connected_app",
+	"connected_user",
+	"backend_app_flow",
+	"login_id",
+	"login_id_is_different",
+	"enable_incoming",
+	"enable_outgoing",
+	"use_imap",
+	"use_ssl",
+	"use_starttls",
+	"email_server",
+	"smtp_server",
+	"service",
+]
+
+
+def _email_account_configs():
+	accounts = frappe.get_all("Email Account", fields=EMAIL_ACCOUNT_FIELDS)
+	for account in accounts:
+		account["imap_folder"] = frappe.db.count("IMAP Folder", {"parent": account["name"]})
+	return accounts
+
+
+@frappe.whitelist()
+def run_diagnostics():
+	"""Inspect the Microsoft 365 mail/identity configuration. Read-only. System Manager only."""
+	frappe.only_for("System Manager")
+
+	settings = _settings_config()
+	findings = check_settings(settings)
+
+	accounts = _email_account_configs()
+	oauth_accounts = [a for a in accounts if a.get("auth_method") == "OAuth"]
+
+	checked_apps = set()
+	for account in oauth_accounts:
+		app_name = account.get("connected_app")
+		if app_name and app_name not in checked_apps and frappe.db.exists("Connected App", app_name):
+			checked_apps.add(app_name)
+			findings += check_connected_app(
+				_connected_app_config(app_name), settings, app_only=bool(account.get("backend_app_flow"))
+			)
+
+	for account in accounts:
+		findings += check_email_account(account)
+
+	if not oauth_accounts:
+		findings.append(
+			finding(
+				"email_account.none",
+				WARN,
+				_("No Email Account is using OAuth"),
+				_("{0} mail account(s) found, none on OAuth.").format(len(accounts)),
+				_("Microsoft disables Basic auth for SMTP by default from the end of December 2026."),
+				MS_OAUTH_DOC,
+			)
+		)
+
+	if not any(f["status"] in (FAIL, WARN) for f in findings):
+		findings.append(
+			finding("all.ok", PASS, _("No configuration problems found"), "", "", "")
+		)
+
+	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
+	return {"findings": findings, "counts": counts, "checked_connected_apps": sorted(checked_apps)}
+
+
+@frappe.whitelist()
+def explain(error_text):
+	"""Whitelisted wrapper so the error decoder can be used from the Desk."""
+	frappe.only_for("System Manager")
+	return explain_error(error_text)
+
+
+@frappe.whitelist()
+def app_only_powershell(mailboxes=None, send_as=0):
+	"""Generate the Exchange Online setup script for app-only mailbox access."""
+	frappe.only_for("System Manager")
+	if isinstance(mailboxes, str):
+		mailboxes = [m.strip() for m in mailboxes.replace(",", "\n").split("\n") if m.strip()]
+	settings = _settings_config()
+	return {
+		"script": powershell_for_app_only(
+			settings.get("client_id"), mailboxes=mailboxes, send_as=frappe.utils.cint(send_as)
+		)
+	}

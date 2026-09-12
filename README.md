@@ -121,6 +121,41 @@ Worth knowing before you trust it with a real calendar:
 Access to `Microsoft Calendar` is granted to **System Manager** and **Desk User** (the same
 pattern Frappe's Google Calendar uses), and each user only sees their own connection.
 
+## Connection doctor
+
+Connecting Frappe to Microsoft 365 has roughly fifteen steps across Azure, Exchange and
+Frappe, and almost every mistake surfaces as the same unhelpful string — `AUTHENTICATE
+failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
+
+**Microsoft Settings → Troubleshoot** gives you three tools:
+
+- **Run Diagnostics** inspects Microsoft Settings, the Connected App and every Email Account
+  and reports what is actually wrong. It catches the failures people hit most: delegated
+  scopes on an app-only flow (or the reverse), a missing `offline_access` scope — the reason
+  a connection works for an hour then needs re-authorising forever — v1.0 endpoints, tenant
+  mismatches between settings and endpoints, redirect-URI drift, IMAP without a folder, and
+  the shared-mailbox identity conflict described below.
+- **Explain an Error** turns a message from the Error Log into a cause and a next step.
+- **Exchange Setup Script** generates the `New-ServicePrincipal` / `Add-MailboxPermission`
+  commands for app-only mailbox access, looking the service principal up by AppId rather
+  than asking you to copy an Object ID — Microsoft's own documentation warns that copying
+  the one from the App Registration page (instead of the Enterprise Application page) causes
+  authentication to fail with no useful error.
+
+**The shared-mailbox identity conflict.** Microsoft requires the *shared mailbox address* in
+the IMAP XOAUTH2 string but the *signing-in user* for SMTP. Frappe sends `login_id or
+email_id` to both, so a single account cannot get incoming and outgoing right at the same
+time — which is why "SMTP works but IMAP doesn't" recurs on the forum. The doctor flags the
+configuration and suggests the two ways out: split incoming and outgoing into separate Email
+Accounts, or use the app-only flow, where no user identity is involved.
+
+### What this does NOT do
+
+It does not send or receive mail, replace `Email Account`, or touch the email queue. Frappe's
+own IMAP/SMTP + OAuth path is unchanged, several mail accounts keep working exactly as they
+did, and uninstalling this app leaves your mail setup working. The doctor only reads
+configuration and generates text.
+
 ## How it's consumed (for app developers)
 
 Other apps depend on this app and call its utilities (they never re-implement Graph):

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — connection doctor
+
+### Added
+
+- **Microsoft connection doctor** (`Microsoft Settings` → Troubleshoot): inspects Microsoft
+  Settings, the Connected App and every Email Account and reports what is wrong, instead of
+  leaving admins with `AUTHENTICATE failed`. Rules cover scope/flow mismatches, the missing
+  `offline_access` scope (the cause of "it works for an hour then stops"), v1.0 endpoints,
+  tenant and redirect-URI drift, IMAP folders, TLS flag combinations, and the shared-mailbox
+  identity conflict where Microsoft wants different identities for IMAP and SMTP.
+- **Error explainer** mapping Microsoft/IMAP/SMTP failures (AADSTS codes, `535 5.7.3`,
+  `451 4.7.0`, `invalid_grant`, `AUTHENTICATE failed`, TLS) to a cause and a next step.
+- **Exchange setup script generator** for app-only mailbox access, which looks the service
+  principal up by AppId rather than asking for an Object ID — Microsoft documents that using
+  the App Registration one instead of the Enterprise Application one fails silently.
+- 34 tests, all offline: every rule runs against plain config dicts, no tenant or network.
+
+The doctor is read-only. It does not send or receive mail, replace `Email Account`, or touch
+the email queue; Frappe's own IMAP/SMTP + OAuth path is untouched.
+
 ## Unreleased — sync correctness
 
 The calendar sync engine was reworked around Graph delta queries. If you are upgrading an
