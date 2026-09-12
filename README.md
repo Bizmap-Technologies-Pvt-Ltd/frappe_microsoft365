@@ -38,6 +38,20 @@ every change is proven against **both** versions in CI (install, migrate, and th
 suite on each) before it lands. [`docs/compatibility.md`](docs/compatibility.md) records the
 API-by-API evidence, including the one place where version-specific code exists.
 
+## Frappe Cloud
+
+The app declares its supported Frappe range in `pyproject.toml`, which is what Frappe Cloud
+reads when you add it to a bench:
+
+```toml
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0-dev,<17.0.0"
+```
+
+Without that section Frappe Cloud refuses the app with *"Could not find a compatible Frappe
+version in pyproject.toml"*. The lower bound is anchored at `-dev` because pre-release builds
+report versions like `15.0.0-dev`, which sort **below** `15.0.0` under semver.
+
 ## Install (existing bench)
 
 ```bash
