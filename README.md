@@ -52,7 +52,10 @@ in the first place.
 
 <br />
 
-**Pick only the capabilities you want — the Azure scopes follow from what is ticked**
+**Join a meeting, reply to an invitation, and see who else has — from the Event itself**
+![Event with a Teams meeting](.github/screenshots/06-event-teams-meeting.png)
+
+**Tick only the capabilities you want; the Azure permissions follow from what you tick**
 ![Microsoft Settings](.github/screenshots/01-microsoft-settings.png)
 
 **Set Up shows a plan first, and never modifies anything that already exists**
@@ -278,8 +281,8 @@ Accounts, or use the app-only flow, where no user identity is involved.
 ### Teams meetings from a Frappe Event
 
 An Event carries an **Add Teams meeting** tickbox, the same idea as Outlook's own toggle.
-Tick it, save, and the event is created in Outlook as a Teams meeting; the **Join Meeting**
-link comes back and appears on the Frappe Event, alongside **Open in Outlook**.
+Tick it, save, and the event is created in Outlook as a Teams meeting. A **Join Meeting**
+button then appears at the top of the Event, with **Open in Outlook** beside it.
 
 It works in both directions: a Teams meeting organised in Outlook keeps its join link when it
 syncs into Frappe, so people can join from either side.
@@ -331,16 +334,23 @@ than right ones. Open the event in Outlook for those.
 
 ### Sensitive actions are called out before they happen
 
-Two things in the app have consequences outside Frappe, and both say so on screen first:
+Three things have consequences outside Frappe, and none of them happen quietly:
 
+- **Writing into a real calendar is opt-in.** `Push Frappe events to Microsoft` is **off by
+  default**; pull is the safe direction. Turning push on asks you to confirm, and says plainly
+  that deleting a Frappe Event will delete the Microsoft one.
 - **The Exchange setup script** grants the application standing access to the mailboxes you
-  list, readable with nobody signed in. The dialog explains that in full and will not generate
-  the script until you confirm, the app never runs it (you paste it into Exchange Online
-  yourself), and **the generated script ends with the commands that undo it**, commented out
-  so nothing reverses by accident.
-- **Turning on "Push Frappe events to Microsoft"** writes into a real Outlook calendar, and
-  deleting a Frappe Event then deletes the Microsoft one. Ticking it asks for confirmation and
-  reverts if you decline.
+  list, readable with nobody signed in. The dialog explains that and will not generate the
+  script until you confirm; the app never runs it, and **the script ends with the commands
+  that undo it**, commented out so nothing reverses by accident.
+- **A time range Microsoft would reject is caught on save**, not after the fact. Frappe does
+  not enforce that an Event ends after it starts and pre-fills both times from the current
+  moment, so an event saved without touching them can end before it begins. You are told while
+  you can still fix it. Data arriving *from* Outlook is never second-guessed this way.
+
+Sync also refuses to be half-configured: ticking **Sync with Microsoft Calendar** requires
+choosing a connection, and enabling the integration requires the Azure credentials, so nothing
+saves in a state that silently does nothing.
 
 ### What this does NOT do
 
