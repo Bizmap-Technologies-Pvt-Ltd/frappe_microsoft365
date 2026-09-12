@@ -224,6 +224,24 @@ time — which is why "SMTP works but IMAP doesn't" recurs on the forum. The doc
 configuration and suggests the two ways out: split incoming and outgoing into separate Email
 Accounts, or use the app-only flow, where no user identity is involved.
 
+### Teams meetings from a Frappe Event
+
+An Event carries an **Add Teams meeting** tickbox, the same idea as Outlook's own toggle.
+Tick it, save, and the event is created in Outlook as a Teams meeting; the **Join Meeting**
+link comes back and appears on the Frappe Event, alongside **Open in Outlook**.
+
+It works in both directions: a Teams meeting organised in Outlook keeps its join link when it
+syncs into Frappe, so people can join from either side.
+
+No extra Azure permission is needed. Microsoft creates the meeting as part of the event, so
+`Calendars.ReadWrite` covers it. `OnlineMeetings.ReadWrite` is only required for standalone
+meetings and transcripts.
+
+**One limitation, stated on the field itself:** Microsoft does not support turning an existing
+online meeting back into a plain event. Ticking the box on works; unticking it later does
+nothing. To remove a meeting, delete the event and create it again. The app only ever sends
+`isOnlineMeeting: true` rather than pretending the reverse works.
+
 ### Sensitive actions are called out before they happen
 
 Two things in the app have consequences outside Frappe, and both say so on screen first:

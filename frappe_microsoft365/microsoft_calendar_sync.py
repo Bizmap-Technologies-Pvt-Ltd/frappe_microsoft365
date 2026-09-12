@@ -346,6 +346,14 @@ def _target_values(doc, ev, locally_originated):
 	if location is not None:
 		values["location"] = location
 
+	# A meeting organised in Outlook keeps its join link when it lands in Frappe.
+	join_url = (ev.get("onlineMeeting") or {}).get("joinUrl")
+	if join_url:
+		values["custom_teams_join_url"] = join_url
+		values["custom_add_teams_meeting"] = 1
+	if ev.get("webLink"):
+		values["custom_microsoft_web_link"] = ev["webLink"]
+
 	# bodyPreview is a truncated plain-text preview. Writing it onto an Event that
 	# originated in Frappe would destroy the real description, so mirrors only.
 	if not locally_originated:
@@ -437,10 +445,7 @@ def _push(doc):
 		try:
 			event = frappe.get_doc("Event", name)
 			created = _create_graph_event(doc.name, event)
-			if created.get("id"):
-				frappe.db.set_value(
-					"Event", name, "custom_microsoft_event_id", created["id"], update_modified=False
-				)
+			if _store_graph_response(name, created):
 				count += 1
 		except Exception:
 			frappe.log_error(title=f"MS event push failed: {name}")
@@ -460,12 +465,13 @@ def _push(doc):
 		for name in edited:
 			try:
 				event = frappe.get_doc("Event", name)
-				graph.graph_request(
+				patched = graph.graph_request(
 					"PATCH",
 					f"/me/events/{event.custom_microsoft_event_id}",
 					doc.name,
 					json=_event_to_graph_body(event),
 				)
+				_store_graph_response(name, patched or {})
 				count += 1
 			except Exception:
 				frappe.log_error(title=f"MS event patch failed: {name}")
@@ -487,7 +493,30 @@ def _event_to_graph_body(event):
 		body["isAllDay"] = True
 	if getattr(event, "location", None):
 		body["location"] = {"displayName": event.location}
+
+	# Only ever sent as True. Microsoft does not support turning an existing online meeting
+	# back into a plain event, so sending False would silently do nothing and imply otherwise.
+	if getattr(event, "custom_add_teams_meeting", 0):
+		body["isOnlineMeeting"] = True
+		body["onlineMeetingProvider"] = "teamsForBusiness"
+
 	return body
+
+
+def _store_graph_response(event_name, created):
+	"""Save the bits Graph fills in itself: the event id, join link and Outlook link."""
+	values = {}
+	if created.get("id"):
+		values["custom_microsoft_event_id"] = created["id"]
+	join_url = (created.get("onlineMeeting") or {}).get("joinUrl")
+	if join_url:
+		values["custom_teams_join_url"] = join_url
+		values["custom_add_teams_meeting"] = 1
+	if created.get("webLink"):
+		values["custom_microsoft_web_link"] = created["webLink"]
+	if values:
+		frappe.db.set_value("Event", event_name, values, update_modified=False)
+	return bool(values.get("custom_microsoft_event_id"))
 
 
 def _create_graph_event(calendar_name, event):
@@ -515,19 +544,15 @@ def event_on_update(doc, method=None):
 			return
 
 		if doc.custom_microsoft_event_id:
-			graph.graph_request(
+			patched = graph.graph_request(
 				"PATCH",
 				f"/me/events/{doc.custom_microsoft_event_id}",
 				cal.name,
 				json=_event_to_graph_body(doc),
 			)
+			_store_graph_response(doc.name, patched or {})
 		else:
-			created = _create_graph_event(cal.name, doc)
-			if created.get("id"):
-				frappe.db.set_value(
-					"Event", doc.name, "custom_microsoft_event_id", created["id"],
-					update_modified=False,
-				)
+			_store_graph_response(doc.name, _create_graph_event(cal.name, doc))
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
 

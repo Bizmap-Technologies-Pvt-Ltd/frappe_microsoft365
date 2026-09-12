@@ -378,6 +378,61 @@ class TestPush(SyncTestCase):
 		self.assertIn("dateTime", body["start"])
 
 
+class TestTeamsMeetings(SyncTestCase):
+	"""A Frappe Event can ask Outlook for a Teams meeting, the same as Outlook's own toggle."""
+
+	def test_plain_event_is_not_an_online_meeting(self):
+		body = sync._event_to_graph_body(self._local_event())
+
+		self.assertNotIn("isOnlineMeeting", body)
+
+	def test_ticking_the_box_asks_graph_for_a_teams_meeting(self):
+		event = self._local_event(custom_add_teams_meeting=1)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertTrue(body["isOnlineMeeting"])
+		self.assertEqual(body["onlineMeetingProvider"], "teamsForBusiness")
+
+	def test_join_link_and_outlook_link_are_stored_after_creation(self):
+		event = self._local_event(custom_add_teams_meeting=1)
+		created = {
+			"id": "ms-teams-1",
+			"webLink": "https://outlook.office365.com/owa/?itemid=abc",
+			"onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/abc"},
+		}
+
+		sync._store_graph_response(event.name, created)
+
+		event.reload()
+		self.assertEqual(event.custom_microsoft_event_id, "ms-teams-1")
+		self.assertEqual(event.custom_teams_join_url, "https://teams.microsoft.com/l/meetup-join/abc")
+		self.assertIn("outlook.office365.com", event.custom_microsoft_web_link)
+
+	def test_a_teams_meeting_pulled_from_outlook_keeps_its_join_link(self):
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-online",
+					onlineMeeting={"joinUrl": "https://teams.microsoft.com/l/meetup-join/xyz"},
+					webLink="https://outlook.office365.com/owa/?itemid=xyz",
+				)
+			]
+		)
+
+		event = self._event_for("ms-online")
+		self.assertEqual(event.custom_teams_join_url, "https://teams.microsoft.com/l/meetup-join/xyz")
+		self.assertEqual(event.custom_add_teams_meeting, 1)
+		self.assertIn("outlook.office365.com", event.custom_microsoft_web_link)
+
+	def test_an_ordinary_pulled_event_has_no_join_link(self):
+		self._pull_with([ms_event(event_id="ms-offline")])
+
+		event = self._event_for("ms-offline")
+		self.assertFalse(event.custom_teams_join_url)
+		self.assertFalse(event.custom_add_teams_meeting)
+
+
 class TestTimezones(BaseTestCase):
 	def test_windows_timezone_name_is_mapped_not_assumed_utc(self):
 		"""Regression: ZoneInfo cannot parse Windows ids; the old fallback shifted meetings."""

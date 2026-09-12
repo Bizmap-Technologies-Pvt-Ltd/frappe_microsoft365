@@ -89,6 +89,43 @@ def create_event_custom_fields():
 				"hidden": 1,
 				"no_copy": 1,
 			},
+			{
+				"fieldname": "custom_add_teams_meeting",
+				"fieldtype": "Check",
+				"label": "Add Teams meeting",
+				"insert_after": "custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"description": (
+					"Creates the event in Outlook as a Teams meeting with a join link, the same as "
+					"ticking Teams meeting in Outlook. Microsoft does not support removing the "
+					"meeting from an event afterwards, so unticking this later has no effect: "
+					"delete the event and create it again instead."
+				),
+			},
+			{
+				"fieldname": "custom_teams_join_url",
+				"fieldtype": "Data",
+				"options": "URL",
+				"label": "Join Meeting",
+				"insert_after": "custom_pulled_from_microsoft",
+				"read_only": 1,
+				"no_copy": 1,
+				# Join URLs run past the 140-char default. Nothing queries this column, so it
+				# needs width but no index.
+				"length": 1000,
+				"description": "Filled in by Microsoft once the meeting exists.",
+			},
+			{
+				"fieldname": "custom_microsoft_web_link",
+				"fieldtype": "Small Text",
+				"label": "Open in Outlook",
+				"insert_after": "custom_teams_join_url",
+				"read_only": 1,
+				"no_copy": 1,
+				# Small Text rather than Data: webLink can be very long and, unlike the event
+				# id, is never looked up, so there is no index to preserve.
+				"description": "Opens this event in Outlook on the web.",
+			},
 		]
 	}
 	create_custom_fields(custom_fields, ignore_validate=True)
