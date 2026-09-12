@@ -1,4 +1,13 @@
-# Frappe Microsoft 365
+<div align="center">
+	<img src=".github/logo.png" height="110" alt="Frappe Microsoft 365">
+	<h2>Frappe Microsoft 365</h2>
+	<p><b>Outlook calendar, Teams meetings and Microsoft setup that actually explains itself</b></p>
+
+![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
+![License](https://img.shields.io/badge/license-MIT-2b3a8c)
+![Tests](https://img.shields.io/badge/tests-101-2b3a8c)
+
+</div>
 
 Generic **Microsoft 365 integration for any Frappe / ERPNext site** — the Microsoft counterpart to
 Frappe's built-in Google Calendar integration. Configure the Azure app registration once in
@@ -16,6 +25,28 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
   meetings that are calendar-associated and not expired.
 - **Secure by design** — MSAL auth-code flow, token refresh, CSRF state validation; secrets and
   tokens are stored as `Password` fields and never logged or returned to clients.
+
+<details open>
+<summary><b>View Screenshots</b></summary>
+
+<br />
+
+**Pick only the capabilities you want — calendar, mail and sign-in are independent**
+![Microsoft Settings](.github/screenshots/01-microsoft-settings.png)
+
+**Set Up shows a plan first, and never modifies anything that already exists**
+![Set Up plan](.github/screenshots/02-setup-plan.png)
+
+**The connection doctor names the failing step instead of leaving you with `AUTHENTICATE failed`**
+![Connection doctor](.github/screenshots/03-connection-doctor.png)
+
+**Exchange setup script for shared mailboxes, with the service principal looked up by AppId**
+![Exchange setup script](.github/screenshots/04-exchange-setup-script.png)
+
+**A per-user connection, with its own pull and push toggles**
+![Microsoft Calendar](.github/screenshots/05-microsoft-calendar.png)
+
+</details>
 
 ## Requirements
 
