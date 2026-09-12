@@ -3,20 +3,88 @@
 // Set Up only ever CREATES records that are missing. Anything that already exists is
 // reported and left alone, so a working setup is never rewritten underneath you.
 
+// The scope tickboxes. Anything ticked here changes what sign-in asks Microsoft for, so the
+// derived list is re-rendered whenever one of them moves.
+const SCOPE_FIELDS = ["use_calendar", "use_teams", "use_transcripts"];
+const CAPABILITY_FIELDS = [...SCOPE_FIELDS, "use_mail", "use_sso"];
+
+const scope_handlers = {};
+[...SCOPE_FIELDS, "default_scopes"].forEach((field) => {
+	scope_handlers[field] = (frm) => render_scopes(frm);
+});
+
 frappe.ui.form.on("Microsoft Settings", {
+	...scope_handlers,
 	refresh(frm) {
 		frm.add_custom_button(__("Set Up"), () => show_plan(frm)).addClass("btn-primary");
 		frm.add_custom_button(__("Run Diagnostics"), () => run_diagnostics(), __("Troubleshoot"));
 		frm.add_custom_button(__("Explain an Error"), () => explain_error(), __("Troubleshoot"));
 		frm.add_custom_button(__("Exchange Setup Script"), () => powershell(), __("Troubleshoot"));
 
-		if (!frm.doc.use_calendar && !frm.doc.use_mail && !frm.doc.use_sso) {
+		render_scopes(frm);
+
+		if (!CAPABILITY_FIELDS.some((field) => frm.doc[field])) {
 			frm.dashboard.set_headline(
 				__("Pick at least one capability above, then click <b>Set Up</b>.")
 			);
 		}
 	},
 });
+
+// Show exactly what sign-in will request, so nobody has to reverse-engineer it from the
+// tickboxes — the guesswork that had admins editing the scope field by hand. Derived on the
+// server by the same function get_scopes uses, so the display cannot drift from reality.
+function render_scopes(frm) {
+	const field = frm.fields_dict.effective_scopes_display;
+	if (!field) return;
+
+	const capabilities = {};
+	SCOPE_FIELDS.forEach((name) => (capabilities[name] = frm.doc[name] ? 1 : 0));
+
+	frappe.call({
+		method: "frappe_microsoft365.microsoft_graph.preview_scopes",
+		args: {
+			capabilities: JSON.stringify(capabilities),
+			override: frm.doc.default_scopes || "",
+		},
+		callback: (r) => {
+			const result = r.message || {};
+			const esc = frappe.utils.escape_html;
+			const scopes = (result.scopes || []).join(" ");
+			const added = (result.always_added || []).join(" ");
+			const missing = result.missing_from_override || [];
+
+			const rows = [
+				`<div class="small text-muted">${__(
+					"Grant these Microsoft Graph <b>Delegated</b> permissions in Azure, then Grant admin consent."
+				)}</div>`,
+				`<div style="margin-top:6px"><code>${esc(scopes)} ${esc(added)}</code></div>`,
+				`<div class="small text-muted" style="margin-top:6px">${__(
+					"{0} are requested automatically and never need listing below.",
+					[`<code>${esc(added)}</code>`]
+				)}</div>`,
+			];
+			if (result.overridden) {
+				rows.push(
+					`<div class="small" style="margin-top:6px"><span class="indicator orange">${__(
+						"Overridden"
+					)}</span> ${__("The capabilities would ask for {0}.", [
+						`<code>${esc((result.derived || []).join(" "))}</code>`,
+					])}</div>`
+				);
+			}
+			if (missing.length) {
+				rows.push(
+					`<div class="alert alert-warning small" style="margin-top:8px">${__(
+						"The override leaves out {0}, which a ticked capability needs. That feature will fail with a 403.",
+						[`<code>${esc(missing.join(" "))}</code>`]
+					)}</div>`
+				);
+			}
+			field.$wrapper.html(rows.join(""));
+		},
+	});
+}
 
 const ACTION_STYLE = {
 	create: { colour: "blue", label: __("Will create") },
@@ -74,10 +142,21 @@ function show_plan(frm) {
 						.join("<br>")}</div>`
 				: "";
 
+			// The per-capability lists overlap, so also give the one line to paste into Azure.
+			const graph_selected = (plan.selected || []).some((id) =>
+				["calendar", "teams", "transcripts"].includes(id)
+			);
+			const scope_summary =
+				graph_selected && (plan.graph_scopes || []).length
+					? `<div class="small text-muted" style="margin-top:4px">${__(
+							"All Graph permissions to consent to, combined"
+					  )}: <code>${esc((plan.graph_scopes || []).join(" "))}</code></div>`
+					: "";
+
 			const dialog = new frappe.ui.Dialog({
 				title: __("Set Up Microsoft 365"),
 				size: "large",
-				fields: [{ fieldtype: "HTML", options: blockers + body }],
+				fields: [{ fieldtype: "HTML", options: blockers + body + scope_summary }],
 				primary_action_label: will_create.length
 					? __("Create {0} item(s)", [will_create.length])
 					: __("Close"),

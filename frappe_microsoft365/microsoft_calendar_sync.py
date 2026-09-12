@@ -22,6 +22,16 @@ overwrites the description of such an event, because Graph only hands back a tru
 plain-text ``bodyPreview``. Events that originated in Microsoft are mirrors and are fully
 overwritten by the pull.
 
+Attendees
+---------
+The pull also brings back the invitation itself: who organised the event, who was invited
+and what each of them replied, plus our own ``responseStatus``. Those land on three
+read-only Event fields so an Outlook invitation is legible from Frappe; replying to one is
+``microsoft_rsvp``. The push sends Frappe's ``event_participants`` back as Graph attendees.
+
+Third-party meeting links (Zoom, Google Meet) are *not* extracted: Microsoft only populates
+``onlineMeeting`` for its own providers, and everything else sits as free text in the body.
+
 All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors).
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.
 """
@@ -40,7 +50,11 @@ from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequi
 
 EVENT_SELECT = (
 	"id,subject,bodyPreview,start,end,location,isAllDay,isCancelled,"
-	"onlineMeeting,webLink,type,lastModifiedDateTime"
+	"onlineMeeting,webLink,type,lastModifiedDateTime,"
+	# Graph returns only the properties asked for, so the invitation side of an event —
+	# who was invited, who organised it and what we replied — has to be selected explicitly
+	# or it never reaches Frappe at all.
+	"attendees,organizer,isOrganizer,responseStatus,responseRequested"
 )
 
 #: How much of the calendar the delta window covers. Graph fixes the window when the delta
@@ -327,6 +341,97 @@ def _is_removed(ev):
 	return bool(ev.get("@removed")) or bool(ev.get("isCancelled"))
 
 
+# --- attendees (Graph -> Frappe) -----------------------------------------------------
+
+#: Graph's documented responseStatus.response values, which are also the options of the
+#: custom_microsoft_my_response Select. Anything outside this set would fail Frappe's
+#: Select validation and take the whole event's sync down with it over a display field,
+#: so an unrecognised value is dropped instead of stored.
+RESPONSE_STATUSES = (
+	"none",
+	"organizer",
+	"tentativelyAccepted",
+	"accepted",
+	"declined",
+	"notResponded",
+)
+
+
+def _response_labels():
+	"""Graph ``responseStatus`` values in plain words.
+
+	Built inside a function, never at module level: ``frappe._()`` evaluated at import time
+	resolves once, in whatever language the worker booted with, and would then freeze that
+	language into every site's summaries.
+	"""
+	return {
+		"none": _("no response"),
+		"organizer": _("organizer"),
+		"notResponded": _("not responded"),
+		"tentativelyAccepted": _("tentative"),
+		"accepted": _("accepted"),
+		"declined": _("declined"),
+	}
+
+
+def _attendee_line(attendee, labels):
+	"""One Graph attendee as a single readable line, or None if it carries no address."""
+	email_address = attendee.get("emailAddress") or {}
+	address = (email_address.get("address") or "").strip()
+	name = (email_address.get("name") or "").strip()
+
+	# Angle brackets would be the conventional way to write this, but Frappe sanitises HTML
+	# on save and silently eats "<asha@x.com>" as an unknown tag, losing the address
+	# entirely. Parentheses survive.
+	#
+	# Outlook also fills `name` with the address itself for people outside the tenant, and
+	# printing "asha@x.com (asha@x.com)" helps nobody.
+	if name and address and name.lower() != address.lower():
+		who = f"{name} ({address})"
+	else:
+		who = address or name
+	if not who:
+		return None
+
+	# Rooms and equipment are invited exactly like people (type "resource"), and a decline
+	# from a room means something different from a decline from a person, so the type is
+	# worth showing whenever it is not the ordinary "required". It rides with the response
+	# rather than after the address, to avoid a second bracketed group.
+	kind = (attendee.get("type") or "").strip()
+	suffix = kind if kind and kind != "required" else ""
+
+	label = labels.get(((attendee.get("status") or {}).get("response") or "").strip())
+	trailer = ", ".join(part for part in (suffix, label) if part)
+	return f"{who} — {trailer}" if trailer else who
+
+
+def _attendee_summary(ev):
+	"""Everyone on the Microsoft invitation, one per line, with their reply."""
+	labels = _response_labels()
+	lines = []
+	for attendee in ev.get("attendees") or []:
+		line = _attendee_line(attendee, labels)
+		if line:
+			lines.append(line)
+	return "\n".join(lines)
+
+
+def _people_values(ev):
+	"""Organizer / attendees / our own response as Frappe Event field values.
+
+	Kept apart from the rest of the mapping so the caller can apply the origin rule: an
+	empty value here means "Graph did not carry this" just as readily as "nobody is
+	invited", and the payload does not distinguish the two.
+	"""
+	organizer = ((ev.get("organizer") or {}).get("emailAddress") or {}).get("address") or ""
+	my_response = ((ev.get("responseStatus") or {}).get("response") or "").strip()
+	return {
+		"custom_microsoft_organizer": organizer.strip(),
+		"custom_microsoft_attendees": _attendee_summary(ev),
+		"custom_microsoft_my_response": my_response if my_response in RESPONSE_STATUSES else "",
+	}
+
+
 def _target_values(doc, ev, locally_originated):
 	"""The Frappe Event field values a Microsoft event maps to."""
 	values = {
@@ -358,6 +463,14 @@ def _target_values(doc, ev, locally_originated):
 	# originated in Frappe would destroy the real description, so mirrors only.
 	if not locally_originated:
 		values["description"] = ev.get("bodyPreview") or ""
+
+	# The same origin rule covers the invitation fields. On a mirror, empty means empty and
+	# the field is cleared; on an Event that originated in Frappe, empty far more likely
+	# means Graph did not carry the property, and blanking would throw away what the user
+	# can plainly see in Outlook.
+	for field, value in _people_values(ev).items():
+		if value or not locally_originated:
+			values[field] = value
 
 	return values
 
@@ -482,6 +595,93 @@ def _push(doc):
 	return count
 
 
+def _email_fields(doctype):
+	"""Data fields on a doctype declared as an Email, in field order.
+
+	Resolved by fieldtype rather than from a hardcoded doctype list: an Event participant
+	is a Dynamic Link and can point at anything — Contact, Lead, Employee, something from
+	an app this one has never heard of — and a fixed list would quietly stop resolving the
+	moment somebody links a doctype that is not on it.
+	"""
+	try:
+		meta = frappe.get_meta(doctype)
+	except Exception:
+		return []
+	return [f.fieldname for f in meta.fields if f.fieldtype == "Data" and (f.options or "") == "Email"]
+
+
+def _participant_email(participant):
+	"""Resolve one Event Participants row to an email address, or None.
+
+	The row has its own ``email`` column, but Frappe only fills it in for links it can
+	resolve to a Contact, rows written by other apps routinely leave it blank, and older
+	Frappe does not populate it at all — so the referenced document is the fallback.
+	"""
+	email = (participant.get("email") or "").strip()
+	if email:
+		return email
+
+	doctype = participant.get("reference_doctype")
+	docname = participant.get("reference_docname")
+	if not doctype or not docname:
+		return None
+
+	# A Frappe User is named by its email address, so the link itself is the answer.
+	if doctype == "User":
+		return (frappe.db.get_value("User", docname, "email") or docname or "").strip() or None
+
+	fields = _email_fields(doctype)
+	if not fields:
+		return None
+	row = frappe.db.get_value(doctype, docname, fields, as_dict=True) or {}
+	for fieldname in fields:
+		value = (row.get(fieldname) or "").strip()
+		if value:
+			return value
+	return None
+
+
+def _participant_name(participant):
+	"""A display name for an attendee. Graph treats emailAddress.name as optional."""
+	doctype = participant.get("reference_doctype")
+	docname = participant.get("reference_docname")
+	if not doctype or not docname:
+		return None
+	if doctype == "User":
+		return frappe.db.get_value("User", docname, "full_name") or None
+	try:
+		title_field = frappe.get_meta(doctype).get_title_field()
+	except Exception:
+		return None
+	if not title_field or title_field == "name":
+		return docname
+	return frappe.db.get_value(doctype, docname, title_field) or docname
+
+
+def _graph_attendees(event):
+	"""Frappe's Event Participants as Graph attendees, skipping any that cannot be addressed."""
+	attendees = []
+	seen = set()
+	for participant in event.get("event_participants") or []:
+		email = _participant_email(participant)
+		if not email:
+			# Graph rejects an attendee with no address, and guessing one would send a real
+			# invitation to the wrong person. An unresolvable participant is left out.
+			continue
+		key = email.lower()
+		if key in seen:
+			# Two participant rows can point at different records with the same address
+			# (a Contact and the User behind it); Outlook would show the person twice.
+			continue
+		seen.add(key)
+		entry = {"emailAddress": {"address": email}, "type": "required"}
+		name = _participant_name(participant)
+		if name and name != email:
+			entry["emailAddress"]["name"] = name
+		attendees.append(entry)
+	return attendees
+
+
 def _event_to_graph_body(event):
 	body = {
 		"subject": event.subject or "(No subject)",
@@ -499,6 +699,14 @@ def _event_to_graph_body(event):
 	if getattr(event, "custom_add_teams_meeting", 0):
 		body["isOnlineMeeting"] = True
 		body["onlineMeetingProvider"] = "teamsForBusiness"
+
+	# Only sent when at least one participant resolved to an address. Graph reads an empty
+	# attendees array as "remove everyone", and "this Event has no participants in Frappe"
+	# is indistinguishable from "its attendees were added in Outlook", so sending [] would
+	# quietly uninvite people nobody asked to uninvite.
+	attendees = _graph_attendees(event)
+	if attendees:
+		body["attendees"] = attendees
 
 	return body
 

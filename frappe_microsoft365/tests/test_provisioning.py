@@ -11,6 +11,7 @@ import json
 import frappe
 
 from frappe_microsoft365 import doctor, provisioning
+from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE_ACCESS
 from frappe_microsoft365.tests.base import BaseTestCase
 
@@ -33,9 +34,13 @@ def reset_settings():
 		client_secret=None,
 		redirect_uri=None,
 		use_calendar=1,
+		use_teams=0,
+		use_transcripts=0,
 		use_mail=0,
 		use_sso=0,
 		mail_flow="Delegated",
+		default_scopes="",
+		authorized_scopes="",
 	)
 
 
@@ -55,9 +60,13 @@ def settings(**overrides):
 		"client_secret": "shhh",
 		"redirect_uri": "https://site.example.com/api/method/callback",
 		"use_calendar": 1,
+		"use_teams": 0,
+		"use_transcripts": 0,
 		"use_mail": 0,
 		"use_sso": 0,
 		"mail_flow": "Delegated",
+		"default_scopes": "",
+		"authorized_scopes": "",
 	}
 	values.update(overrides)
 	return values
@@ -148,6 +157,187 @@ class TestCapabilitySelection(BaseTestCase):
 				self.assertTrue(capability["creates"])
 				self.assertTrue(capability["azure"])
 				self.assertTrue(capability["azure_type"])
+
+
+class TestScopeDerivation(BaseTestCase):
+	"""Pure derivation, plain dicts: no site, no tenant, no network."""
+
+	def test_calendar_alone_does_not_ask_for_teams_permissions(self):
+		"""The bug this split exists for.
+
+		Creating an event with a Teams link is a calendar write (isOnlineMeeting on
+		POST /me/events), so wanting the calendar must never drag OnlineMeetings or transcript
+		consent along — admins were deleting them from the scope field by hand.
+		"""
+		scopes = graph.derive_scopes({"use_calendar": 1})
+
+		self.assertEqual(scopes, ["User.Read", "Calendars.ReadWrite"])
+
+	def test_nothing_ticked_still_identifies_the_account(self):
+		self.assertEqual(graph.derive_scopes({}), ["User.Read"])
+
+	def test_standalone_meetings_add_the_meeting_permission(self):
+		scopes = graph.derive_scopes({"use_calendar": 1, "use_teams": 1})
+
+		self.assertIn("OnlineMeetings.ReadWrite", scopes)
+		self.assertNotIn("OnlineMeetingTranscript.Read.All", scopes)
+
+	def test_transcripts_add_only_the_transcript_permission(self):
+		scopes = graph.derive_scopes({"use_teams": 1, "use_transcripts": 1})
+
+		self.assertEqual(
+			scopes, ["User.Read", "OnlineMeetings.ReadWrite", "OnlineMeetingTranscript.Read.All"]
+		)
+
+	def test_everything_ticked_is_the_full_list(self):
+		scopes = graph.derive_scopes({"use_calendar": 1, "use_teams": 1, "use_transcripts": 1})
+
+		self.assertEqual(
+			scopes,
+			[
+				"User.Read",
+				"Calendars.ReadWrite",
+				"OnlineMeetings.ReadWrite",
+				"OnlineMeetingTranscript.Read.All",
+			],
+		)
+
+	def test_reserved_scopes_are_never_derived(self):
+		"""build_authorize_url adds them; MSAL refuses them in the token calls."""
+		scopes = graph.derive_scopes({"use_calendar": 1, "use_teams": 1, "use_transcripts": 1})
+
+		self.assertEqual([s for s in scopes if s in graph.RESERVED_SCOPES], [])
+
+
+class TestScopeOverride(BaseTestCase):
+	def test_no_override_derives_from_the_capabilities(self):
+		self.assertEqual(
+			graph.get_scopes(settings(use_calendar=1)), ["User.Read", "Calendars.ReadWrite"]
+		)
+
+	def test_override_is_returned_verbatim(self):
+		"""A tenant that consented to a hand-picked list must be asked for exactly that."""
+		scopes = graph.get_scopes(settings(use_calendar=1, default_scopes="User.Read Mail.Read"))
+
+		self.assertEqual(scopes, ["User.Read", "Mail.Read"])
+
+	def test_override_is_not_widened_by_a_ticked_capability(self):
+		scopes = graph.get_scopes(
+			settings(use_calendar=1, use_teams=1, default_scopes="User.Read Calendars.ReadWrite")
+		)
+
+		self.assertNotIn("OnlineMeetings.ReadWrite", scopes)
+
+	def test_override_accepts_commas_and_line_breaks(self):
+		scopes = graph.get_scopes(settings(default_scopes="User.Read, Calendars.ReadWrite\nMail.Read"))
+
+		self.assertEqual(scopes, ["User.Read", "Calendars.ReadWrite", "Mail.Read"])
+
+	def test_blank_override_is_not_an_override(self):
+		scopes = graph.get_scopes(settings(use_calendar=1, default_scopes="   \n "))
+
+		self.assertEqual(scopes, ["User.Read", "Calendars.ReadWrite"])
+
+
+class TestCapabilityAzurePermissions(BaseTestCase):
+	"""The Set Up dialog renders capability["azure"], so it has to be what is really requested."""
+
+	def _capability(self, capability_id):
+		return next(c for c in provisioning.capabilities() if c["id"] == capability_id)
+
+	def test_each_graph_capability_lists_exactly_what_it_will_request(self):
+		for capability_id, field in provisioning.GRAPH_CAPABILITY_FIELDS.items():
+			with self.subTest(capability=capability_id):
+				listed = set(self._capability(capability_id)["azure"])
+
+				self.assertEqual(
+					listed - {OFFLINE_ACCESS}, set(graph.derive_scopes({field: 1}))
+				)
+				# Requested on every sign-in and consented like any other permission.
+				self.assertIn(OFFLINE_ACCESS, listed)
+
+	def test_the_combined_lists_match_the_derived_scopes(self):
+		everything = dict.fromkeys(provisioning.GRAPH_CAPABILITY_FIELDS.values(), 1)
+		listed = set()
+		for capability_id in provisioning.GRAPH_CAPABILITY_FIELDS:
+			listed |= set(self._capability(capability_id)["azure"])
+
+		self.assertEqual(listed - {OFFLINE_ACCESS}, set(graph.derive_scopes(everything)))
+
+	def test_graph_capabilities_do_not_advertise_openid_or_profile(self):
+		"""Those are sign-in scopes, requested automatically; only offline_access is consented."""
+		for capability_id in provisioning.GRAPH_CAPABILITY_FIELDS:
+			with self.subTest(capability=capability_id):
+				listed = set(self._capability(capability_id)["azure"])
+
+				self.assertEqual(listed & {"openid", "profile"}, set())
+
+
+class TestScopeChecks(BaseTestCase):
+	"""doctor.check_scopes / check_authorized_scopes — pure, plain dicts."""
+
+	def _ids(self, found):
+		return {f["check"] for f in found}
+
+	def test_derived_scopes_are_never_flagged(self):
+		self.assertEqual(doctor.check_scopes(settings(use_calendar=1, use_teams=1)), [])
+
+	def test_override_missing_a_needed_scope_names_it(self):
+		found = doctor.check_scopes(
+			settings(use_calendar=1, use_teams=1, default_scopes="User.Read Calendars.ReadWrite")
+		)
+
+		self.assertIn("scopes.override_incomplete", self._ids(found))
+		self.assertIn("OnlineMeetings.ReadWrite", " ".join(f["title"] for f in found))
+
+	def test_a_complete_override_is_silent(self):
+		found = doctor.check_scopes(
+			settings(use_calendar=1, default_scopes="User.Read Calendars.ReadWrite Mail.Read")
+		)
+
+		self.assertEqual(found, [])
+
+	def test_reserved_scopes_in_the_override_are_a_failure(self):
+		found = doctor.check_scopes(
+			settings(use_calendar=1, default_scopes="offline_access User.Read Calendars.ReadWrite")
+		)
+
+		self.assertIn("scopes.override_reserved", self._ids(found))
+
+
+class TestReauthorizationWarning(BaseTestCase):
+	CURRENT = ("User.Read", "Calendars.ReadWrite", "OnlineMeetings.ReadWrite")
+
+	def _ids(self, found):
+		return {f["check"] for f in found}
+
+	def test_unchanged_scopes_say_nothing(self):
+		found = doctor.check_authorized_scopes(self.CURRENT, list(self.CURRENT), connections=2)
+
+		self.assertEqual(found, [])
+
+	def test_a_widened_scope_list_asks_for_re_authorisation(self):
+		"""A token carries the permissions it was issued with; ticking a box does not widen it."""
+		found = doctor.check_authorized_scopes(
+			self.CURRENT, ["User.Read", "Calendars.ReadWrite"], connections=1
+		)
+
+		self.assertIn("scopes.changed_since_authorization", self._ids(found))
+		self.assertIn("OnlineMeetings.ReadWrite", found[0]["detail"])
+
+	def test_a_narrowed_scope_list_is_reported_too(self):
+		found = doctor.check_authorized_scopes(["User.Read"], list(self.CURRENT), connections=1)
+
+		self.assertIn("scopes.changed_since_authorization", self._ids(found))
+
+	def test_nothing_recorded_means_no_guess(self):
+		"""Connections that predate the recording get no invented verdict."""
+		self.assertEqual(doctor.check_authorized_scopes(self.CURRENT, [], connections=3), [])
+
+	def test_no_authorised_connection_means_nothing_to_re_authorise(self):
+		found = doctor.check_authorized_scopes(self.CURRENT, ["User.Read"], connections=0)
+
+		self.assertEqual(found, [])
 
 
 class TestPlan(BaseTestCase):

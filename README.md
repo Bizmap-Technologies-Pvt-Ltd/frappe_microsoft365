@@ -5,7 +5,7 @@
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
-![Tests](https://img.shields.io/badge/tests-101-2b3a8c)
+![Tests](https://img.shields.io/badge/tests-171-2b3a8c)
 
 </div>
 
@@ -19,6 +19,9 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
 - **Outlook calendar two-way sync** — Microsoft events ↔ Frappe `Event` (delta pull on a
   schedule, push on save/delete via doc events). Per-calendar `pull`/`push` toggles.
   Handles recurring series, deletions, paging and throttling; see *How the sync behaves*.
+- **Attendees and RSVP** — organizer, attendee list with everyone's reply, and your own response
+  on the Frappe `Event`; **Accept / Tentative / Decline** buttons on invitations you received.
+  Frappe's event participants are pushed back as Outlook attendees.
 - **Teams meeting creation** — create a calendar-associated Teams online meeting and get back the
   join URL / event id / online-meeting id (calendar association is the precondition for transcripts).
 - **Transcripts & recordings** — list and fetch Teams meeting transcripts (VTT) and recordings for
@@ -31,7 +34,7 @@ platform gets real Outlook calendar sync, Teams meetings and transcripts through
 
 <br />
 
-**Pick only the capabilities you want — calendar, mail and sign-in are independent**
+**Pick only the capabilities you want — the Azure scopes follow from what is ticked**
 ![Microsoft Settings](.github/screenshots/01-microsoft-settings.png)
 
 **Set Up shows a plan first, and never modifies anything that already exists**
@@ -124,10 +127,12 @@ http://m365.localhost:8000/api/method/frappe_microsoft365.frappe_microsoft_365.d
 
 ## Configure
 
-1. **Azure** → register an app, add the Redirect URI above (Web platform), create a client secret,
-   and grant these **Delegated** Microsoft Graph permissions, then *Grant admin consent*:
-   `offline_access openid profile User.Read Calendars.ReadWrite OnlineMeetings.ReadWrite OnlineMeetingTranscript.Read.All`
-2. **Frappe Desk → Microsoft Settings** → paste Tenant ID, Client ID, Client Secret, the Redirect URI →
+1. **Frappe Desk → Microsoft Settings** → tick the capabilities you want. The **Delegated Scopes**
+   section then shows the exact permission list to grant — for calendar only that is
+   `offline_access openid profile User.Read Calendars.ReadWrite`, and nothing more.
+2. **Azure** → register an app, add the Redirect URI above (Web platform), create a client secret,
+   and grant exactly those **Delegated** Microsoft Graph permissions, then *Grant admin consent*.
+   Back in **Microsoft Settings**, paste Tenant ID, Client ID, Client Secret, the Redirect URI →
    tick **Enabled** → Save.
 3. **Microsoft Calendar** → New → give it a name → Save → click **Authorize Microsoft Access** →
    sign in. The account email + default calendar fill in automatically. Use **Test Connection** /
@@ -168,19 +173,45 @@ pattern Frappe's Google Calendar uses), and each user only sees their own connec
 
 ## Set up only what you want
 
-Calendar, mail and sign-in are **independent**. Tick the ones you want in Microsoft Settings
-and leave the rest alone — nothing is created for a capability you did not ask for, and none
-of them depend on each other. Use the calendar without mail, mail without sign-in, sign-in on
-its own; all valid.
+Calendar, Teams meetings, transcripts, mail and sign-in are **independent**. Tick the ones you
+want in Microsoft Settings and leave the rest alone — nothing is created for a capability you
+did not ask for, and none of them depend on each other. Use the calendar without mail, mail
+without sign-in, sign-in on its own; all valid.
 
 **Set Up** shows a plan first: what will be created, what already exists, which Azure
 permissions each capability needs, and only then offers to apply it.
 
 | Capability | What gets created | Azure permissions |
 | --- | --- | --- |
-| Outlook calendar and Teams | Nothing — this app talks to Graph directly | Graph delegated: `Calendars.ReadWrite`, `OnlineMeetings.ReadWrite`, `OnlineMeetingTranscript.Read.All`, `User.Read`, `offline_access` |
+| Outlook calendar | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `Calendars.ReadWrite`, `offline_access` |
+| Standalone Teams meetings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetings.ReadWrite`, `offline_access` |
+| Meeting transcripts and recordings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetingTranscript.Read.All`, `offline_access` |
 | Outlook mail | A `Connected App` for Frappe's Email Account | Exchange delegated: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` — or the `.default` app-only scope for shared mailboxes |
 | Sign in with Microsoft | A `Social Login Key` | Graph delegated: `openid`, `email`, `profile` |
+
+### The scopes follow the tickboxes
+
+**You do not write a scope list.** Microsoft Settings derives the delegated scopes from the
+capabilities above and shows the exact result under **Delegated Scopes**, so what you grant in
+Azure and what sign-in asks for cannot drift apart.
+
+The split is what makes that work. **Outlook calendar** is `Calendars.ReadWrite` and nothing
+else — including the **Add Teams meeting** tickbox on an Event, because Microsoft mints the
+Teams link as part of the event rather than as a separate meeting. `OnlineMeetings.ReadWrite`
+is only for meetings created outside a calendar event and for resolving a join URL back to a
+meeting; `OnlineMeetingTranscript.Read.All` is only for transcripts. Both are permissions
+tenants routinely refuse, which is why wanting a calendar no longer asks for them.
+
+`offline_access`, `openid` and `profile` are added automatically at sign-in and never belong in
+a scope list of your own.
+
+**Override Delegated Scopes** is the escape hatch, empty by default: fill it in only when your
+tenant consents to a hand-picked list and sign-in has to ask for exactly that. An override is
+used verbatim, and the doctor warns if it omits something a ticked capability needs.
+
+Changing any of this affects new sign-ins only. Tokens carry the permissions that were
+consented when they were issued, so after a change the doctor tells you which connections need
+**Re-authorize** rather than letting the new feature fail with a bare 403.
 
 **It never overwrites anything.** If a record already exists it is left exactly as it is and
 reported, with any drift from Microsoft Settings spelled out, so a setup someone tuned by hand
@@ -208,8 +239,10 @@ failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
   and reports what is actually wrong. It catches the failures people hit most: delegated
   scopes on an app-only flow (or the reverse), a missing `offline_access` scope — the reason
   a connection works for an hour then needs re-authorising forever — v1.0 endpoints, tenant
-  mismatches between settings and endpoints, redirect-URI drift, IMAP without a folder, and
-  the shared-mailbox identity conflict described below.
+  mismatches between settings and endpoints, redirect-URI drift, IMAP without a folder, a
+  scope override that leaves out something a ticked capability needs, scopes that changed
+  after connections were authorised (their tokens predate the change and have to be renewed),
+  and the shared-mailbox identity conflict described below.
 - **Explain an Error** turns a message from the Error Log into a cause and a next step.
 - **Exchange Setup Script** generates the `New-ServicePrincipal` / `Add-MailboxPermission`
   commands for app-only mailbox access, looking the service principal up by AppId rather
@@ -234,13 +267,49 @@ It works in both directions: a Teams meeting organised in Outlook keeps its join
 syncs into Frappe, so people can join from either side.
 
 No extra Azure permission is needed. Microsoft creates the meeting as part of the event, so
-`Calendars.ReadWrite` covers it. `OnlineMeetings.ReadWrite` is only required for standalone
-meetings and transcripts.
+`Calendars.ReadWrite` covers it — the **Outlook calendar** capability on its own is enough.
+`OnlineMeetings.ReadWrite` is only required for standalone meetings and transcripts, which are
+separate tickboxes precisely so a calendar-only setup never has to ask for them.
 
 **One limitation, stated on the field itself:** Microsoft does not support turning an existing
 online meeting back into a plain event. Ticking the box on works; unticking it later does
 nothing. To remove a meeting, delete the event and create it again. The app only ever sends
 `isOnlineMeeting: true` rather than pretending the reverse works.
+
+### Attendees and RSVP
+
+An invitation that lands in someone's Outlook is usable from Frappe. Each synced Event
+carries three read-only fields, refreshed by every sync:
+
+- **Organizer** — the Microsoft account that created the event.
+- **Attendees** — one line per invitee: `Asha Rao <asha@example.com> — accepted`. Rooms and
+  equipment are labelled with their type, because a room declining is a different problem
+  from a person declining.
+- **My Response** — your own reply, stored exactly as Microsoft words it (`accepted`,
+  `declined`, `tentativelyAccepted`, `notResponded`, `organizer`, `none`).
+
+On an event you were invited to, the Event form grows **Accept**, **Tentative** and
+**Decline** buttons under a *Microsoft* menu. Each one offers an optional comment for the
+organizer and a tickbox to reply without emailing anyone — the same choice Outlook gives
+you. The reply goes straight to Microsoft and the Event updates immediately rather than
+waiting for the next scheduled sync. The buttons stay hidden on events you organized
+yourself, because there is nothing to reply to.
+
+No new Azure permission is needed: `/me/events/{id}/accept`, `/decline` and
+`/tentativelyAccept` all run on the delegated `Calendars.ReadWrite` the calendar sync
+already holds.
+
+Going the other way, an Event's **participants** are sent to Outlook as attendees when the
+event is pushed. A participant whose email cannot be resolved — no address on the row and
+none on the record it links to — is left out rather than sent as something Microsoft would
+reject. If nobody resolves, the attendee list is omitted from the request entirely: Graph
+reads an empty list as *remove everyone*, and that would silently uninvite people who were
+added in Outlook.
+
+**One limitation.** Zoom and Google Meet links are **not** extracted. Microsoft only fills
+in the structured `onlineMeeting` property for its own Teams meetings; a third-party link
+is loose text in the event body, and guessing at it would produce wrong links more often
+than right ones. Open the event in Outlook for those.
 
 ### Sensitive actions are called out before they happen
 
@@ -273,6 +342,7 @@ Other apps depend on this app and call its utilities (they never re-implement Gr
 | Create a Teams meeting | `frappe_microsoft365.microsoft_meetings.create_meeting(calendar_name, subject, start_datetime, end_datetime, attendees=None, body=None, create_calendar_event=True)` → `{event_id, web_link, join_url, online_meeting_id}` |
 | Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt}` |
 | Read calendar events | `frappe_microsoft365.microsoft_calendar_sync.fetch_events(calendar_name, start_datetime, end_datetime)` |
+| Reply to an invitation | `frappe_microsoft365.microsoft_rsvp.respond_to_event(event, response, comment=None, send_response=1)` — `response` is `accept`, `decline` or `tentative` |
 
 Example: **Bizmap OS** delegates its meeting/calendar features to these functions when this app is
 installed and Microsoft Settings is configured, and falls back to stubs otherwise.

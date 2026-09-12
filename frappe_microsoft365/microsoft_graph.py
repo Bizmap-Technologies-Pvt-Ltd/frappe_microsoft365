@@ -15,12 +15,37 @@ from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-DEFAULT_SCOPES = [
-	"User.Read",
-	"Calendars.ReadWrite",
-	"OnlineMeetings.ReadWrite",
-	"OnlineMeetingTranscript.Read.All",
-]
+
+#: Requested on every sign-in regardless of capabilities: /me is how the connection resolves
+#: which Microsoft account it is attached to.
+BASE_SCOPE = "User.Read"
+
+#: Capability field on Microsoft Settings -> the ONE delegated scope it needs. Ordered so the
+#: derived list reads the same way every time.
+#:
+#: The split matters because the permissions are not interchangeable, verified against the
+#: endpoints this app calls (docs/graph-api-reference.md):
+#:
+#: * Creating an event with isOnlineMeeting/teamsForBusiness on POST /me/events is a calendar
+#:   write — Microsoft mints the Teams link as part of the event — so the Teams tickbox on an
+#:   Event needs Calendars.ReadWrite and nothing else.
+#: * OnlineMeetings.ReadWrite is needed only for standalone meetings (POST /me/onlineMeetings)
+#:   and for resolving a join URL to a meeting id.
+#: * OnlineMeetingTranscript.Read.All is needed only for transcripts.
+#:
+#: Bundling them forced admins to hand-edit the scope field back down to what their tenant had
+#: actually consented to, which is the failure this split removes.
+CAPABILITY_SCOPES = (
+	("use_calendar", "Calendars.ReadWrite"),
+	("use_teams", "OnlineMeetings.ReadWrite"),
+	("use_transcripts", "OnlineMeetingTranscript.Read.All"),
+)
+
+#: Added by build_authorize_url, never derived and never valid in an override: MSAL treats
+#: these as reserved and refuses them in the `scopes` argument of the token calls, so an
+#: admin who lists them here would break sign-in rather than widen it.
+RESERVED_SCOPES = ("offline_access", "openid", "profile")
+
 CALLBACK_METHOD = (
 	"frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback"
 )
@@ -70,12 +95,71 @@ def get_authority(settings=None):
 	return f"https://login.microsoftonline.com/{tenant}"
 
 
+def parse_scopes(raw):
+	"""Split a space- or comma-separated scope string. Order kept, duplicates dropped."""
+	scopes = []
+	for scope in (raw or "").replace(",", " ").split():
+		scope = scope.strip()
+		if scope and scope not in scopes:
+			scopes.append(scope)
+	return scopes
+
+
+def derive_scopes(capabilities):
+	"""The delegated scopes implied by the ticked capabilities.
+
+	Pure: takes a plain dict (or any .get() mapping, including the Settings Document) so the
+	rule is testable without a site or a tenant.
+
+	Nothing reserved is returned. offline_access/openid/profile are added once, centrally, in
+	build_authorize_url; including them here would put them in the MSAL token calls too, which
+	reject them.
+
+	Asking for a permission nothing uses is not free — it shows up on the consent screen, and
+	plenty of tenants refuse OnlineMeetings or transcript consent outright — so a capability
+	that is not ticked contributes no scope at all.
+	"""
+	capabilities = capabilities or {}
+	scopes = [BASE_SCOPE]
+	for field, scope in CAPABILITY_SCOPES:
+		if capabilities.get(field) and scope not in scopes:
+			scopes.append(scope)
+	return scopes
+
+
 def get_scopes(settings=None):
+	"""The delegated scopes sign-in will ask Microsoft for.
+
+	An override wins verbatim: a tenant that consents to a hand-picked list has to be asked for
+	exactly that list, and second-guessing it would put the admin back to editing free text.
+	With no override the scopes follow the capability tickboxes, so the two can never disagree.
+	"""
 	settings = settings or _settings_doc()
-	raw = (settings.default_scopes or "").strip()
-	if raw:
-		return [s.strip() for s in raw.replace(",", " ").split() if s.strip()]
-	return list(DEFAULT_SCOPES)
+	override = parse_scopes(settings.get("default_scopes"))
+	if override:
+		return override
+	return derive_scopes(settings)
+
+
+@frappe.whitelist()
+def preview_scopes(capabilities=None, override=None):
+	"""What sign-in would request for the capabilities currently on screen. Reads nothing else.
+
+	The Settings form shows this rather than asking an admin to work it out, and it is computed
+	by the same functions get_scopes uses so the display cannot drift from what is requested.
+	"""
+	frappe.only_for("System Manager")
+	if isinstance(capabilities, str):
+		capabilities = frappe.parse_json(capabilities) or {}
+	derived = derive_scopes(capabilities)
+	overridden = parse_scopes(override)
+	return {
+		"scopes": overridden or derived,
+		"derived": derived,
+		"overridden": bool(overridden),
+		"always_added": list(RESERVED_SCOPES),
+		"missing_from_override": [s for s in derived if s not in overridden] if overridden else [],
+	}
 
 
 def get_redirect_uri(settings=None):
@@ -108,7 +192,7 @@ def build_authorize_url(state):
 		"response_type": "code",
 		"redirect_uri": get_redirect_uri(settings),
 		"response_mode": "query",
-		"scope": " ".join(["offline_access", "openid", "profile", *get_scopes(settings)]),
+		"scope": " ".join([*RESERVED_SCOPES, *get_scopes(settings)]),
 		"state": state,
 		"prompt": "select_account",
 	}
@@ -118,11 +202,31 @@ def build_authorize_url(state):
 def exchange_code(code):
 	"""Exchange an authorization code for tokens (confidential client, no PKCE)."""
 	settings = get_settings()
+	scopes = get_scopes(settings)
 	result = _msal_app(settings).acquire_token_by_authorization_code(
-		code, scopes=get_scopes(settings), redirect_uri=get_redirect_uri(settings)
+		code, scopes=scopes, redirect_uri=get_redirect_uri(settings)
 	)
 	_raise_on_token_error(result)
+	_record_authorized_scopes(scopes)
 	return result
+
+
+def _record_authorized_scopes(scopes):
+	"""Remember the scope list that was in force at the last successful authorisation.
+
+	A token carries the permissions consented when it was issued; ticking another capability
+	afterwards does not widen a token that already exists, and Graph answers the newly enabled
+	call with a bare 403. Recording this is what lets the doctor say "re-authorise" instead of
+	leaving that to be discovered in production.
+
+	What we requested is stored, not the `scope` Microsoft echoes back: that comes back as
+	fully-qualified resource URIs plus the reserved scopes, so it is not comparable with the
+	short names the settings hold.
+
+	Written straight to the Singles row so the OAuth callback — which runs as whoever signed
+	in, not necessarily a System Manager — is never blocked by permissions on Settings.
+	"""
+	frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", " ".join(scopes))
 
 
 def refresh_tokens(refresh_token):

@@ -76,7 +76,11 @@ app_include_js = ["/assets/frappe_microsoft365/js/microsoft_doctor.js"]
 
 # include js in doctype views
 # A per-account "Check Microsoft Setup" button, on the form where the failure appears.
-doctype_js = {"Email Account": "public/js/email_account.js"}
+# Event adds Accept / Decline / Tentative for an invitation that came in from Outlook.
+doctype_js = {
+	"Email Account": "public/js/email_account.js",
+	"Event": "public/js/event.js",
+}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}

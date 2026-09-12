@@ -26,6 +26,7 @@ from frappe import _
 from frappe.utils.password import get_decrypted_password
 
 from frappe_microsoft365 import doctor
+from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE_ACCESS
 
 #: The Connected App we create for mail. Named so it is obvious where it came from.
@@ -104,22 +105,64 @@ def social_login_key_values(settings):
 
 # --- capability registry --------------------------------------------------------------
 
+#: Capability id -> the Microsoft Settings field that turns it on. Only the Graph capabilities
+#: appear here; mail and sign-in are not Graph scopes at all.
+GRAPH_CAPABILITY_FIELDS = {
+	"calendar": "use_calendar",
+	"teams": "use_teams",
+	"transcripts": "use_transcripts",
+}
+
+
+def _graph_azure_permissions(field):
+	"""The Azure permissions to show for one Graph capability.
+
+	Taken from the same derivation get_scopes uses, so the Set Up dialog can never advertise a
+	permission the sign-in will not request — the mismatch that had admins granting Teams
+	permissions for a calendar-only setup. offline_access is appended because it is requested
+	on every sign-in and has to be consented like any other.
+	"""
+	return [*graph.derive_scopes({field: 1}), OFFLINE_ACCESS]
+
+
 def capabilities():
 	"""What each capability needs from Azure, and what this app will create for it."""
 	return [
 		{
 			"id": "calendar",
-			"label": _("Outlook calendar and Teams meetings"),
+			"label": _("Outlook calendar"),
 			"creates": _("Nothing — this app talks to Graph directly."),
-			"azure": [
-				"User.Read",
-				"Calendars.ReadWrite",
-				"OnlineMeetings.ReadWrite",
-				"OnlineMeetingTranscript.Read.All",
-				"offline_access",
-			],
+			"azure": _graph_azure_permissions("use_calendar"),
 			"azure_type": _("Microsoft Graph, Delegated"),
-			"note": _("Each user authorises their own Microsoft Calendar."),
+			"note": _(
+				"Covers the Add Teams meeting tickbox on an Event too: Microsoft creates the "
+				"Teams link as part of the event, so no meeting permission is involved. Each "
+				"user authorises their own Microsoft Calendar."
+			),
+		},
+		{
+			"id": "teams",
+			"label": _("Standalone Teams meetings"),
+			"creates": _("Nothing — this app talks to Graph directly."),
+			"azure": _graph_azure_permissions("use_teams"),
+			"azure_type": _("Microsoft Graph, Delegated"),
+			"note": _(
+				"Only for meetings created outside a calendar event, and for resolving a join "
+				"URL back to a meeting. Tenants commonly refuse this one; leave it off unless "
+				"something asks for it."
+			),
+		},
+		{
+			"id": "transcripts",
+			"label": _("Meeting transcripts and recordings"),
+			"creates": _("Nothing — this app talks to Graph directly."),
+			"azure": _graph_azure_permissions("use_transcripts"),
+			"azure_type": _("Microsoft Graph, Delegated"),
+			"note": _(
+				"Transcripts are reached through the meeting behind a join URL, so this builds on "
+				"standalone Teams meetings. The meeting must also be calendar-associated and not "
+				"expired, or Graph returns nothing."
+			),
 		},
 		{
 			"id": "mail",
@@ -152,14 +195,12 @@ def capabilities():
 
 
 def selected_capabilities(settings):
-	"""The capability ids ticked in Microsoft Settings."""
+	"""The capability ids ticked in Microsoft Settings, in the order capabilities() lists them."""
 	chosen = []
-	if settings.get("use_calendar"):
-		chosen.append("calendar")
-	if settings.get("use_mail"):
-		chosen.append("mail")
-	if settings.get("use_sso"):
-		chosen.append("sso")
+	for capability in capabilities():
+		field = GRAPH_CAPABILITY_FIELDS.get(capability["id"]) or f"use_{capability['id']}"
+		if settings.get(field):
+			chosen.append(capability["id"])
 	return chosen
 
 
@@ -187,6 +228,9 @@ def _settings():
 		"client_id": doc.client_id,
 		"redirect_uri": doc.redirect_uri or "",
 		"use_calendar": doc.use_calendar,
+		# .get() so a site that has not migrated the new capability fields yet still plans.
+		"use_teams": doc.get("use_teams"),
+		"use_transcripts": doc.get("use_transcripts"),
 		"use_mail": doc.use_mail,
 		"use_sso": doc.use_sso,
 		"mail_flow": doc.mail_flow or "Delegated",
@@ -260,19 +304,21 @@ def plan():
 			)
 			continue
 
-		if capability["id"] == "calendar":
+		if capability["id"] == "mail":
+			steps.append(_plan_mail(settings))
+		elif capability["id"] == "sso":
+			steps.append(_plan_sso(settings))
+		else:
+			# Graph capabilities create no Frappe records at all; the only work is granting the
+			# listed permissions in Azure, which nothing here can do on the admin's behalf.
 			steps.append(
 				_step(
-					"calendar",
+					capability["id"],
 					EXISTS,
 					"",
 					_("Nothing to create. Grant the Azure permissions listed, then add a Microsoft Calendar."),
 				)
 			)
-		elif capability["id"] == "mail":
-			steps.append(_plan_mail(settings))
-		elif capability["id"] == "sso":
-			steps.append(_plan_sso(settings))
 
 	blockers = []
 	if not (settings.get("tenant_id") or "").strip() or not (settings.get("client_id") or "").strip():
@@ -288,6 +334,9 @@ def plan():
 		"selected": chosen,
 		"blockers": blockers,
 		"mail_flow": settings.get("mail_flow"),
+		# The combined Graph list, so the dialog can show the exact set to consent to rather
+		# than leaving the admin to union the per-capability lists by eye.
+		"graph_scopes": [*graph.get_scopes(), *graph.RESERVED_SCOPES],
 	}
 
 

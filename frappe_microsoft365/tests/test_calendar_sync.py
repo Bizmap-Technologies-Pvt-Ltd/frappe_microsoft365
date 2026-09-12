@@ -32,6 +32,15 @@ def ms_event(event_id="ms-1", subject="Standup", preview="Graph preview", **over
 	return event
 
 
+def ms_attendee(name, address, response="none", kind="required"):
+	"""One entry of the Graph event's attendees[] collection."""
+	return {
+		"emailAddress": {"name": name, "address": address},
+		"type": kind,
+		"status": {"response": response, "time": "2026-09-14T10:00:00Z"},
+	}
+
+
 class SyncTestCase(BaseTestCase):
 	def setUp(self):
 		super().setUp()
@@ -431,6 +440,230 @@ class TestTeamsMeetings(SyncTestCase):
 		event = self._event_for("ms-offline")
 		self.assertFalse(event.custom_teams_join_url)
 		self.assertFalse(event.custom_add_teams_meeting)
+
+
+class TestAttendeesPull(SyncTestCase):
+	"""The invitation side of an Outlook event: who is on it, and what everyone replied."""
+
+	def test_event_select_asks_graph_for_the_invitation_fields(self):
+		"""Graph returns only the selected properties; a gap here means no attendees, ever."""
+		for field in ("attendees", "organizer", "isOrganizer", "responseStatus", "responseRequested"):
+			self.assertIn(field, sync.EVENT_SELECT)
+
+	def test_attendee_summary_is_one_readable_line_per_person(self):
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-invite",
+					attendees=[
+						ms_attendee("Asha Rao", "asha@example.com", response="accepted"),
+						ms_attendee("Ben Muir", "ben@example.com", response="declined"),
+						ms_attendee("Cara Lim", "cara@example.com", response="tentativelyAccepted"),
+					],
+				)
+			]
+		)
+
+		lines = self._event_for("ms-invite").custom_microsoft_attendees.split("\n")
+		self.assertEqual(lines[0], "Asha Rao (asha@example.com) — accepted")
+		self.assertEqual(lines[1], "Ben Muir (ben@example.com) — declined")
+		self.assertEqual(lines[2], "Cara Lim (cara@example.com) — tentative")
+
+	def test_an_address_used_as_the_name_is_not_printed_twice(self):
+		"""Outlook fills `name` with the address itself for people outside the tenant."""
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-external",
+					attendees=[ms_attendee("dev@partner.com", "dev@partner.com")],
+				)
+			]
+		)
+
+		self.assertEqual(
+			self._event_for("ms-external").custom_microsoft_attendees, "dev@partner.com — no response"
+		)
+
+	def test_a_room_is_labelled_with_its_attendee_type(self):
+		"""A room declining is a different problem from a person declining."""
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-room",
+					attendees=[
+						ms_attendee("Board room", "board@example.com", response="declined", kind="resource")
+					],
+				)
+			]
+		)
+
+		self.assertEqual(
+			self._event_for("ms-room").custom_microsoft_attendees,
+			"Board room (board@example.com) — resource, declined",
+		)
+
+	def test_organizer_is_mapped(self):
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-organized",
+					organizer={"emailAddress": {"name": "Dana Fox", "address": "dana@example.com"}},
+					isOrganizer=False,
+				)
+			]
+		)
+
+		self.assertEqual(self._event_for("ms-organized").custom_microsoft_organizer, "dana@example.com")
+
+	def test_my_response_is_stored_verbatim_as_graph_reports_it(self):
+		"""Stored raw so it can be compared with a Graph payload without a lookup table."""
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-mine",
+					responseStatus={"response": "notResponded", "time": "0001-01-01T00:00:00Z"},
+				)
+			]
+		)
+
+		self.assertEqual(self._event_for("ms-mine").custom_microsoft_my_response, "notResponded")
+
+	def test_an_event_with_nobody_invited_has_an_empty_summary(self):
+		self._pull_with([ms_event(event_id="ms-solo")])
+
+		self.assertFalse(self._event_for("ms-solo").custom_microsoft_attendees)
+
+	def test_a_mirror_is_cleared_when_outlook_empties_the_invitation(self):
+		self._pull_with(
+			[
+				ms_event(
+					event_id="ms-cleared",
+					attendees=[ms_attendee("Asha Rao", "asha@example.com", response="accepted")],
+				)
+			]
+		)
+		self.assertTrue(self._event_for("ms-cleared").custom_microsoft_attendees)
+
+		self._pull_with([ms_event(event_id="ms-cleared", attendees=[])])
+
+		self.assertFalse(self._event_for("ms-cleared").custom_microsoft_attendees)
+
+	def test_a_frappe_originated_event_is_not_blanked_by_a_pull(self):
+		"""A payload that says nothing about attendees is not a payload that says "nobody"."""
+		local = self._local_event(ms_id="ms-local-invite")
+		frappe.db.set_value(
+			"Event",
+			local.name,
+			{
+				"custom_microsoft_attendees": "Asha Rao (asha@example.com) — accepted",
+				"custom_microsoft_organizer": "dana@example.com",
+				"custom_microsoft_my_response": "organizer",
+			},
+			update_modified=False,
+		)
+
+		self._pull_with([ms_event(event_id="ms-local-invite", subject="Renamed in Outlook")])
+
+		local.reload()
+		self.assertEqual(local.custom_microsoft_attendees, "Asha Rao (asha@example.com) — accepted")
+		self.assertEqual(local.custom_microsoft_organizer, "dana@example.com")
+		self.assertEqual(local.custom_microsoft_my_response, "organizer")
+		# ...and the fields Outlook *did* carry still win.
+		self.assertEqual(local.subject, "Renamed in Outlook")
+
+
+class TestAttendeesPush(SyncTestCase):
+	"""Frappe's participants go out as Graph attendees, minus anyone we cannot address."""
+
+	def _contact(self, first_name, email=None):
+		# Contact is named after first_name, so a run that died before its cleanup would
+		# otherwise make every later run fail on a duplicate name instead of on the bug.
+		if frappe.db.exists("Contact", first_name):
+			frappe.delete_doc("Contact", first_name, force=True, ignore_permissions=True)
+		doc = frappe.get_doc({"doctype": "Contact", "first_name": first_name})
+		if email:
+			doc.append("email_ids", {"email_id": email, "is_primary": 1})
+		doc.insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Contact", doc.name, force=True, ignore_permissions=True)
+		return doc.name
+
+	def _event_with_participants(self, *participants):
+		event = self._local_event()
+		for participant in participants:
+			event.append("event_participants", participant)
+		event.save(ignore_permissions=True)
+		return event
+
+	def test_push_body_carries_resolved_participants(self):
+		contact = self._contact("_Test MS Asha", "asha@example.com")
+
+		event = self._event_with_participants(
+			{"reference_doctype": "Contact", "reference_docname": contact}
+		)
+		body = sync._event_to_graph_body(event)
+
+		self.assertEqual(len(body["attendees"]), 1)
+		self.assertEqual(body["attendees"][0]["emailAddress"]["address"], "asha@example.com")
+		self.assertEqual(body["attendees"][0]["type"], "required")
+
+	def test_a_participant_without_an_email_is_skipped_rather_than_faked(self):
+		"""Graph rejects an attendee with no address; a guessed one invites a stranger."""
+		reachable = self._contact("_Test MS Ben", "ben@example.com")
+		unreachable = self._contact("_Test MS Nomail")
+
+		event = self._event_with_participants(
+			{"reference_doctype": "Contact", "reference_docname": reachable},
+			{"reference_doctype": "Contact", "reference_docname": unreachable},
+		)
+		body = sync._event_to_graph_body(event)
+
+		self.assertEqual(
+			[a["emailAddress"]["address"] for a in body["attendees"]], ["ben@example.com"]
+		)
+
+	def test_the_attendees_key_is_omitted_when_nothing_resolves(self):
+		"""Graph reads an empty attendees array as "remove everyone"."""
+		unreachable = self._contact("_Test MS Nobody")
+
+		event = self._event_with_participants(
+			{"reference_doctype": "Contact", "reference_docname": unreachable}
+		)
+
+		self.assertNotIn("attendees", sync._event_to_graph_body(event))
+
+	def test_an_event_with_no_participants_sends_no_attendees_key(self):
+		self.assertNotIn("attendees", sync._event_to_graph_body(self._local_event()))
+
+	def test_the_same_address_is_only_invited_once(self):
+		"""A Contact and the User behind it are two rows and one person."""
+		contact = self._contact("_Test MS Dup", "dup@example.com")
+
+		event = self._event_with_participants(
+			{"reference_doctype": "Contact", "reference_docname": contact},
+			{
+				"reference_doctype": "User",
+				"reference_docname": "Administrator",
+				"email": "DUP@example.com",
+			},
+		)
+
+		self.assertEqual(len(sync._event_to_graph_body(event)["attendees"]), 1)
+
+	def test_a_row_that_carries_its_own_email_needs_no_lookup(self):
+		self.assertEqual(sync._participant_email({"email": " asha@example.com "}), "asha@example.com")
+
+	def test_a_user_participant_resolves_through_the_user_record(self):
+		expected = frappe.db.get_value("User", "Administrator", "email") or "Administrator"
+
+		self.assertEqual(
+			sync._participant_email(
+				{"reference_doctype": "User", "reference_docname": "Administrator"}
+			),
+			expected,
+		)
+
+	def test_a_participant_linked_to_nothing_resolves_to_nothing(self):
+		self.assertIsNone(sync._participant_email({}))
 
 
 class TestTimezones(BaseTestCase):

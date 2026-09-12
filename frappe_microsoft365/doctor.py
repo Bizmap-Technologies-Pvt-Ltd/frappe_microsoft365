@@ -26,6 +26,8 @@ import frappe
 from frappe import _
 from frappe.utils.password import get_decrypted_password
 
+from frappe_microsoft365 import microsoft_graph as graph
+
 # --- documented constants -------------------------------------------------------------
 
 #: Delegated (a user signs in) scopes, per Microsoft's protocol table.
@@ -147,6 +149,103 @@ def check_settings(settings):
 		)
 
 	return out
+
+
+# --- delegated scopes -----------------------------------------------------------------
+
+def check_scopes(settings):
+	"""Is the Graph scope list going to ask for what the ticked capabilities need?
+
+	``settings``: dict of the capability ticks plus ``default_scopes`` — the override field,
+	which keeps its original fieldname so no site loses the value it already had.
+
+	Scopes are derived from the capabilities, so the only way to end up asking for the wrong
+	thing is the override, which exists for tenants that consent to a hand-picked list. An
+	override that is missing something stays silent until the feature is used and Graph answers
+	403, so it is worth saying out loud here.
+	"""
+	out = []
+	override = graph.parse_scopes(settings.get("default_scopes"))
+	if not override:
+		return out
+
+	reserved = [s for s in override if s in graph.RESERVED_SCOPES]
+	if reserved:
+		# MSAL rejects the reserved scopes in its `scopes` argument, so listing them here does
+		# not widen consent — it breaks the token calls outright.
+		out.append(
+			finding(
+				"scopes.override_reserved",
+				FAIL,
+				_("The scope override lists a reserved scope"),
+				_("Found: {0}").format(", ".join(reserved)),
+				_(
+					"Remove them. {0} are requested automatically at sign-in and are refused when "
+					"passed explicitly."
+				).format(", ".join(graph.RESERVED_SCOPES)),
+			)
+		)
+
+	missing = [s for s in graph.derive_scopes(settings) if s not in override]
+	if missing:
+		out.append(
+			finding(
+				"scopes.override_incomplete",
+				WARN,
+				_("The scope override is missing {0}").format(", ".join(missing)),
+				_(
+					"The capabilities ticked in Microsoft Settings need {0}, but the override asks "
+					"only for {1}. Whatever is missing fails with a 403 the first time it is used."
+				).format(", ".join(graph.derive_scopes(settings)), ", ".join(override)),
+				_(
+					"Add the missing scope to the override, or clear the override entirely and let "
+					"the capabilities decide."
+				),
+			)
+		)
+
+	return out
+
+
+def check_authorized_scopes(requested, authorized, connections):
+	"""Have the scopes changed since the existing connections signed in?
+
+	``requested`` is what sign-in asks for now, ``authorized`` what it asked for at the last
+	successful authorisation, ``connections`` how many Microsoft Calendars are authorised.
+
+	A token carries the permissions consented when it was issued. Ticking another capability
+	does not widen a token that already exists, so the new feature fails with a 403 that names
+	nothing until every connection has been re-authorised.
+
+	If nothing was recorded — every connection predates this check — say nothing rather than
+	invent a comparison.
+	"""
+	if not authorized or not connections:
+		return []
+
+	added = sorted(set(requested) - set(authorized))
+	removed = sorted(set(authorized) - set(requested))
+	if not added and not removed:
+		return []
+
+	changes = []
+	if added:
+		changes.append(_("now also asking for {0}").format(", ".join(added)))
+	if removed:
+		changes.append(_("no longer asking for {0}").format(", ".join(removed)))
+
+	return [
+		finding(
+			"scopes.changed_since_authorization",
+			WARN,
+			_("The scopes changed after {0} connection(s) were authorised").format(connections),
+			_("Last authorised with {0}; {1}.").format(", ".join(authorized), "; ".join(changes)),
+			_(
+				"Open each Microsoft Calendar and click Re-authorize. Existing tokens keep the "
+				"permissions they were issued with, so they will not pick this up on their own."
+			),
+		)
+	]
 
 
 # --- Connected App --------------------------------------------------------------------
@@ -714,9 +813,15 @@ def _settings_config():
 		"has_client_secret": bool(secret),
 		"redirect_uri": settings.redirect_uri,
 		"use_calendar": settings.use_calendar,
+		# .get() rather than attribute access: the doctor is what people run when a site is
+		# half-upgraded, and it must not itself blow up on a field the site has not migrated yet.
+		"use_teams": settings.get("use_teams"),
+		"use_transcripts": settings.get("use_transcripts"),
 		"use_mail": settings.use_mail,
 		"use_sso": settings.use_sso,
 		"mail_flow": settings.mail_flow or "Delegated",
+		"default_scopes": settings.get("default_scopes") or "",
+		"authorized_scopes": settings.get("authorized_scopes") or "",
 	}
 
 
@@ -766,6 +871,16 @@ def run_diagnostics():
 
 	settings = _settings_config()
 	findings = check_settings(settings)
+
+	if any(settings.get(field) for field, _scope in graph.CAPABILITY_SCOPES):
+		findings += check_scopes(settings)
+		findings += check_authorized_scopes(
+			graph.get_scopes(settings),
+			graph.parse_scopes(settings.get("authorized_scopes")),
+			# Only authorised connections hold a token; an unauthorised one picks up the new
+			# scopes the first time it signs in, so it is not a problem to report.
+			frappe.db.count("Microsoft Calendar", {"authorized": 1}),
+		)
 
 	if settings.get("use_calendar"):
 		findings += check_event_custom_fields(

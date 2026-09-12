@@ -7,9 +7,16 @@ This is the contract the app implements. Endpoints are Graph **v1.0**. Auth via 
 - **Redirect URI** (Web platform): `https://<site>/api/method/frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback`
   (local: `http://bizmapos.localhost:8090/api/method/...callback` — http allowed for localhost).
 - **Client secret** → pasted into Microsoft Settings (stored as Password).
-- **Delegated API permissions** (Microsoft Graph): `offline_access`, `openid`, `profile`, `User.Read`,
-  `Calendars.ReadWrite`, `OnlineMeetings.ReadWrite`, `OnlineMeetingTranscript.Read.All`.
-  Grant admin consent (transcript scope needs it).
+- **Delegated API permissions** (Microsoft Graph) are DERIVED from the capabilities ticked in
+  Microsoft Settings, not a fixed list. `offline_access`, `openid` and `profile` are always
+  added by the app; on top of those:
+  - Outlook calendar (including the Teams meeting tickbox on an Event): `User.Read`,
+    `Calendars.ReadWrite`
+  - Standalone Teams meetings: `+ OnlineMeetings.ReadWrite`
+  - Transcripts and recordings: `+ OnlineMeetingTranscript.Read.All` (needs admin consent)
+
+  The form prints the exact list to grant. Do not grant more than that: asking for scopes the
+  tenant never consented to is what makes sign-in fail.
 
 ## MSAL (msal>=1.30, installed 1.37)
 ```python
@@ -30,7 +37,8 @@ result = app.acquire_token_by_refresh_token(refresh_token, scopes=SCOPES)
 # On error: result has "error" + "error_description".
 ```
 - SCOPES for token calls: the resource scopes WITHOUT reserved ones (msal injects openid/profile/offline_access).
-  Use e.g. `["User.Read","Calendars.ReadWrite","OnlineMeetings.ReadWrite","OnlineMeetingTranscript.Read.All"]`.
+  Built by `microsoft_graph.derive_scopes()` from the ticked capabilities, e.g. calendar-only
+  gives `["User.Read","Calendars.ReadWrite"]`.
 - Store `refresh_token` (Password), `access_token` (Password), and `token_expiry` (now + expires_in - 300s skew).
 - Validate `state` ourselves (store random state on the Microsoft Calendar doc; verify in callback) for CSRF.
 
