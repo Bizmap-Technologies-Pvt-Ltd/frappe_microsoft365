@@ -726,7 +726,7 @@ def _event_to_graph_body(event):
 	return body
 
 
-def _store_graph_response(event_name, created, calendar_name=None):
+def _store_graph_response(event_name, created, calendar_name=None, live_doc=None):
 	"""Save the bits Graph fills in itself: the event id, join link and Outlook link.
 
 	The id is the link between the two sides, and recording it is not optional. If it does not
@@ -737,6 +737,8 @@ def _store_graph_response(event_name, created, calendar_name=None):
 	So the write is verified, and when it fails the event we just created is removed from the
 	calendar again rather than left as an orphan for the next run to duplicate. Passing
 	``calendar_name`` enables that rollback; without it the failure is only reported.
+	``live_doc`` is the in-memory Event when we are inside its own save, so the values Graph
+	filled in show up on screen without a reload.
 	"""
 	values = {}
 	if created.get("id"):
@@ -761,6 +763,13 @@ def _store_graph_response(event_name, created, calendar_name=None):
 
 	if not ms_id:
 		return False
+
+	# db.set_value writes the row, but the document being saved is still in memory and is what
+	# the browser gets back. Without this the join link exists in the database and stays
+	# invisible on screen until someone reloads the page.
+	if live_doc is not None:
+		for field, value in values.items():
+			live_doc.set(field, value)
 
 	# Read it back. A write can be accepted and still not round-trip (truncation, sanitising),
 	# and a half-stored link is indistinguishable from no link on the next run.
@@ -802,6 +811,36 @@ def _create_graph_event(calendar_name, event):
 
 # --- doc_events (single Frappe Event lifecycle -> Graph) -----------------------------
 
+def event_validate(doc, method=None):
+	"""Refuse a time range Microsoft will reject, while the person can still fix it.
+
+	Frappe does not enforce that an Event ends after it starts, and its form pre-fills both
+	from the current moment, so an event saved without touching the times can end seconds
+	before it begins. Graph answers ErrorPropertyValidationFailure, by which point the save
+	has succeeded and the failure is buried in the Error Log.
+
+	Only events actually bound for Microsoft are checked: this app has no business dictating
+	what an unrelated Event may contain.
+	"""
+	# Never applied to data arriving FROM Microsoft. Outlook is authoritative during a pull,
+	# and refusing what it sends would stall the sync on a record we cannot fix from here.
+	# This is a guard on what a person types into Frappe, nothing else.
+	if frappe.flags.in_microsoft_sync:
+		return
+	if not getattr(doc, "custom_sync_with_microsoft_calendar", 0):
+		return
+	if not doc.starts_on or not doc.ends_on:
+		return
+
+	if get_datetime(doc.ends_on) <= get_datetime(doc.starts_on):
+		frappe.throw(
+			_("This event ends before it starts, and Microsoft will not accept it. Set an end time after {0}.").format(
+				frappe.utils.format_datetime(doc.starts_on)
+			),
+			title=_("Check the times"),
+		)
+
+
 def event_on_update(doc, method=None):
 	"""Push/patch a single Event to Graph on save. Best-effort, never blocks the save."""
 	if frappe.flags.in_microsoft_sync:
@@ -825,9 +864,9 @@ def event_on_update(doc, method=None):
 				cal.name,
 				json=_event_to_graph_body(doc),
 			)
-			_store_graph_response(doc.name, patched or {}, cal.name)
+			_store_graph_response(doc.name, patched or {}, cal.name, live_doc=doc)
 		else:
-			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name)
+			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name, live_doc=doc)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
 

@@ -23,6 +23,7 @@ after_migrate = "frappe_microsoft365.setup.after_migrate"
 
 doc_events = {
 	"Event": {
+		"validate": "frappe_microsoft365.microsoft_calendar_sync.event_validate",
 		"on_update": "frappe_microsoft365.microsoft_calendar_sync.event_on_update",
 		"on_trash": "frappe_microsoft365.microsoft_calendar_sync.event_on_trash",
 	},

@@ -404,14 +404,37 @@ class TestTeamsMeetings(SyncTestCase):
 		self.assertEqual(body["onlineMeetingProvider"], "teamsForBusiness")
 
 	def test_an_end_before_the_start_is_repaired_rather_than_rejected(self):
-		"""Graph answers ErrorPropertyValidationFailure; Frappe pre-fills both times from now."""
-		event = self._local_event(
-			starts_on="2026-09-13 04:54:27", ends_on="2026-09-13 04:54:18"
+		"""Graph answers ErrorPropertyValidationFailure; Frappe pre-fills both times from now.
+
+		A person can no longer save this (event_validate refuses it), but an Event inserted
+		programmatically or predating that guard still must not break the push.
+		"""
+		event = frappe.get_doc(
+			{
+				"doctype": "Event",
+				"subject": "Backwards",
+				"starts_on": "2026-09-13 04:54:27",
+				"ends_on": "2026-09-13 04:54:18",
+				"event_type": "Private",
+			}
 		)
 
 		body = sync._event_to_graph_body(event)
 
 		self.assertGreater(body["end"]["dateTime"], body["start"]["dateTime"])
+
+	def test_a_person_cannot_save_a_backwards_event_that_syncs(self):
+		with self.assertRaises(frappe.ValidationError):
+			self._local_event(starts_on="2026-09-13 04:54:27", ends_on="2026-09-13 04:54:18")
+
+	def test_the_same_event_is_accepted_when_it_comes_from_microsoft(self):
+		"""Outlook is authoritative during a pull; refusing its data would stall the sync."""
+		frappe.flags.in_microsoft_sync = True
+		self.addCleanup(lambda: setattr(frappe.flags, "in_microsoft_sync", False))
+
+		event = self._local_event(starts_on="2026-09-13 04:54:27", ends_on="2026-09-13 04:54:18")
+
+		self.assertTrue(event.name)
 
 	def test_a_sensible_end_is_left_alone(self):
 		event = self._local_event(

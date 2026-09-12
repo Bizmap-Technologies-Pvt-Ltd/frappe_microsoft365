@@ -64,6 +64,23 @@ frappe_microsoft365.rsvp = function (frm, response, label) {
 frappe.ui.form.on("Event", {
 	refresh(frm) {
 		if (frm.is_new()) return;
+
+		// Joining is the thing people come to this page to do, so it is a primary button
+		// rather than a 500-character URL they have to find, select and paste.
+		if (frm.doc.custom_teams_join_url) {
+			frm.add_custom_button(__("Join Meeting"), () => {
+				window.open(frm.doc.custom_teams_join_url, "_blank", "noopener");
+			}).addClass("btn-primary");
+		}
+
+		if (frm.doc.custom_microsoft_web_link) {
+			frm.add_custom_button(
+				__("Open in Outlook"),
+				() => window.open(frm.doc.custom_microsoft_web_link, "_blank", "noopener"),
+				__("Microsoft")
+			);
+		}
+
 		if (!frappe_microsoft365.is_microsoft_invitee(frm.doc)) return;
 
 		const group = __("Microsoft");

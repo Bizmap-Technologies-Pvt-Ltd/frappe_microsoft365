@@ -53,6 +53,9 @@ def create_event_custom_fields():
 				"options": "Microsoft Calendar",
 				"insert_after": "custom_sync_with_microsoft_calendar",
 				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				# Sync is meaningless without knowing which connection to sync through, and
+				# without this the Event saves happily and then does nothing at all.
+				"mandatory_depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_calendar_column",
@@ -117,7 +120,8 @@ def create_event_custom_fields():
 				# Join URLs run past the 140-char default. Nothing queries this column, so it
 				# needs width but no index.
 				"length": 1000,
-				"description": "Filled in by Microsoft once the meeting exists.",
+				"description": "Filled in by Microsoft once the meeting exists. Use the Join Meeting button above.",
+							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_web_link",
@@ -128,7 +132,8 @@ def create_event_custom_fields():
 				"no_copy": 1,
 				# Small Text rather than Data: webLink can be very long and, unlike the event
 				# id, is never looked up, so there is no index to preserve.
-				"description": "Opens this event in Outlook on the web.",
+				"description": "Opens this event in Outlook on the web. Also available as a button above.",
+							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_organizer",
@@ -142,6 +147,7 @@ def create_event_custom_fields():
 				# varchar(140) default. Nothing queries this column, so the width is free.
 				"length": 254,
 				"description": "The Microsoft account that organized this event.",
+							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_my_response",
@@ -155,6 +161,7 @@ def create_event_custom_fields():
 				# leading blank covers an event Microsoft has said nothing about yet.
 				"options": "\nnone\norganizer\ntentativelyAccepted\naccepted\ndeclined\nnotResponded",
 				"description": "Your reply to this invitation, as Microsoft has it.",
+							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_attendees",
@@ -167,6 +174,7 @@ def create_event_custom_fields():
 				# unlike custom_microsoft_event_id nothing ever queries this column, so there is
 				# no index to keep inside InnoDB's 3072-byte key limit.
 				"description": "Everyone invited, with their reply. Refreshed by each sync.",
+							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 		]
 	}

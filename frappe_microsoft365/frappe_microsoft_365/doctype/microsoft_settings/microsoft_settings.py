@@ -16,8 +16,22 @@ class MicrosoftSettings(Document):
 					f"Register this Redirect URI in Azure: <code>{get_redirect_uri(self)}</code>",
 					indicator="blue", alert=True,
 				)
-		if self.enabled and not (self.tenant_id and self.client_id):
-			frappe.throw(_("Tenant ID and Client ID are required to enable the integration."))
+		if self.enabled:
+			# The secret was missing from this check, so a half-configured integration could be
+			# enabled and only fail later, at sign-in, with an Azure error code.
+			missing = [
+				label
+				for label, value in (
+					(_("Tenant ID"), self.tenant_id),
+					(_("Client ID"), self.client_id),
+					(_("Client Secret"), self.get_password("client_secret", raise_exception=False)),
+				)
+				if not value
+			]
+			if missing:
+				frappe.throw(
+					_("{0} are required to enable the integration.").format(", ".join(missing))
+				)
 
 
 @frappe.whitelist()
