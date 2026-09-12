@@ -248,6 +248,34 @@ class TestEmailAccountChecks(BaseTestCase):
 		self.assertIn("email_account.imap_host", ids(found, WARN))
 
 
+class TestMissingCustomFields(BaseTestCase):
+	"""Regression: a plain install left these absent and sync died with a raw SQL error."""
+
+	def test_missing_fields_are_reported_with_the_fix(self):
+		found = doctor.check_event_custom_fields(["custom_sync_with_microsoft_calendar"])
+
+		self.assertIn("fields.event", ids(found, FAIL))
+		self.assertIn("migrate", found[0]["fix"].lower())
+
+	def test_nothing_reported_when_all_present(self):
+		self.assertEqual(doctor.check_event_custom_fields([]), [])
+
+	def test_this_site_has_them(self):
+		"""The app is installed here, so the fields must exist."""
+		import frappe
+
+		missing = [f for f in doctor.EVENT_CUSTOM_FIELDS if not frappe.db.has_column("Event", f)]
+		self.assertEqual(missing, [])
+
+	def test_the_raw_sql_error_is_decoded(self):
+		result = doctor.explain_error(
+			"(1054, \"Unknown column 'custom_sync_with_microsoft_calendar' in 'WHERE'\")"
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("migrate", result["detail"].lower())
+
+
 class TestErrorDecoder(BaseTestCase):
 	def test_recognises_the_common_microsoft_failures(self):
 		cases = {

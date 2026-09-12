@@ -18,6 +18,7 @@ has_permission = {
 # ------------------------------------------------------------------------------
 # Microsoft 365 — post-migrate setup, Event sync, scheduler
 # ------------------------------------------------------------------------------
+after_install = "frappe_microsoft365.setup.after_install"
 after_migrate = "frappe_microsoft365.setup.after_migrate"
 
 doc_events = {

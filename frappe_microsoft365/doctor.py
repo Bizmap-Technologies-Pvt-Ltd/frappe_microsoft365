@@ -490,6 +490,34 @@ def check_social_login_key(key, settings=None):
 	return out
 
 
+#: Custom fields the sync reads and writes. Without them every query fails with a raw SQL
+#: error ("Unknown column ... in WHERE"), which tells an admin nothing.
+EVENT_CUSTOM_FIELDS = [
+	"custom_sync_with_microsoft_calendar",
+	"custom_microsoft_calendar",
+	"custom_microsoft_event_id",
+	"custom_pulled_from_microsoft",
+]
+
+
+def check_event_custom_fields(missing):
+	"""``missing``: list of custom fieldnames absent from the Event doctype."""
+	if not missing:
+		return []
+	return [
+		finding(
+			"fields.event",
+			FAIL,
+			_("Calendar sync fields are missing from Event"),
+			_("Missing: {0}").format(", ".join(missing)),
+			_(
+				"Run `bench --site <site> migrate` (on Frappe Cloud, use Migrate in the site "
+				"dashboard). Until then syncing fails with an Unknown column error."
+			),
+		)
+	]
+
+
 # --- error decoder --------------------------------------------------------------------
 
 def error_patterns():
@@ -568,6 +596,14 @@ def error_patterns():
 		r"TLS required|STARTTLS",
 		_("TLS negotiation failed"),
 		_("Check the SSL and STARTTLS flags — one or the other, not both."),
+	),
+	(
+		r"Unknown column 'custom_.*microsoft",
+		_("The app's custom fields are missing from this site"),
+		_(
+			"They are created on install and on migrate. Run `bench --site <site> migrate`, or "
+			"use Migrate in the Frappe Cloud site dashboard, then sync again."
+		),
 	),
 	(
 		r"Please Authorize OAuth",
@@ -730,6 +766,11 @@ def run_diagnostics():
 
 	settings = _settings_config()
 	findings = check_settings(settings)
+
+	if settings.get("use_calendar"):
+		findings += check_event_custom_fields(
+			[f for f in EVENT_CUSTOM_FIELDS if not frappe.db.has_column("Event", f)]
+		)
 
 	wants_mail = bool(settings.get("use_mail"))
 	wants_sso = bool(settings.get("use_sso"))

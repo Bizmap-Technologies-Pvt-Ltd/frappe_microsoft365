@@ -8,8 +8,22 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 
+def after_install():
+	"""Frappe fires after_install (not after_migrate) on `bench install-app`.
+
+	Wiring only after_migrate meant a plain install left the Event custom fields missing,
+	and the sync then failed with "Unknown column custom_sync_with_microsoft_calendar".
+	"""
+	setup()
+
+
 def after_migrate():
-	"""Dispatcher for all after_migrate work (compose future steps here)."""
+	"""Runs on every `bench migrate`, so upgrades pick up new fields too."""
+	setup()
+
+
+def setup():
+	"""Everything this app needs present on a site. Idempotent, safe to re-run."""
 	create_event_custom_fields()
 
 
