@@ -697,6 +697,15 @@ def error_patterns():
 		_("Check the SSL and STARTTLS flags — one or the other, not both."),
 	),
 	(
+		r"ErrorPropertyValidationFailure",
+		_("Microsoft rejected one of the event's values"),
+		_(
+			"Most often the end time is not after the start time. Frappe pre-fills both from the "
+			"current moment and does not enforce the order, so an event saved without touching "
+			"the times can end before it starts. Check the start and end on the event."
+		),
+	),
+	(
 		r"Unknown column 'custom_.*microsoft",
 		_("The app's custom fields are missing from this site"),
 		_(

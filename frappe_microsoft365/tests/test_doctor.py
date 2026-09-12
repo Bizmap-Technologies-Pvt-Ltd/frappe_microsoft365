@@ -319,6 +319,14 @@ class TestErrorDecoder(BaseTestCase):
 				self.assertTrue(result["matched"], f"should recognise: {text}")
 				self.assertIn(expected.lower(), (result["title"] + result["detail"]).lower())
 
+	def test_graphs_property_validation_error_is_explained(self):
+		result = doctor.explain_error(
+			"Microsoft Graph POST /me/events failed (400): ErrorPropertyValidationFailure"
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("end time", result["detail"].lower())
+
 	def test_unknown_error_is_honest_about_it(self):
 		result = doctor.explain_error("something entirely unrelated")
 

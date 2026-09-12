@@ -403,6 +403,32 @@ class TestTeamsMeetings(SyncTestCase):
 		self.assertTrue(body["isOnlineMeeting"])
 		self.assertEqual(body["onlineMeetingProvider"], "teamsForBusiness")
 
+	def test_an_end_before_the_start_is_repaired_rather_than_rejected(self):
+		"""Graph answers ErrorPropertyValidationFailure; Frappe pre-fills both times from now."""
+		event = self._local_event(
+			starts_on="2026-09-13 04:54:27", ends_on="2026-09-13 04:54:18"
+		)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertGreater(body["end"]["dateTime"], body["start"]["dateTime"])
+
+	def test_a_sensible_end_is_left_alone(self):
+		event = self._local_event(
+			starts_on="2026-09-13 10:00:00", ends_on="2026-09-13 11:30:00"
+		)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertIn("11:30", body["end"]["dateTime"])
+
+	def test_a_missing_end_still_defaults_to_half_an_hour(self):
+		event = self._local_event(starts_on="2026-09-13 10:00:00", ends_on=None)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertIn("10:30", body["end"]["dateTime"])
+
 	def test_join_link_and_outlook_link_are_stored_after_creation(self):
 		event = self._local_event(custom_add_teams_meeting=1)
 		created = {

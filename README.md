@@ -5,7 +5,7 @@
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
-![Tests](https://img.shields.io/badge/tests-177-2b3a8c)
+![Tests](https://img.shields.io/badge/tests-181-2b3a8c)
 
 </div>
 
@@ -289,10 +289,10 @@ No extra Azure permission is needed. Microsoft creates the meeting as part of th
 `OnlineMeetings.ReadWrite` is only required for standalone meetings and transcripts, which are
 separate tickboxes precisely so a calendar-only setup never has to ask for them.
 
-**One limitation, stated on the field itself:** Microsoft does not support turning an existing
-online meeting back into a plain event. Ticking the box on works; unticking it later does
-nothing. To remove a meeting, delete the event and create it again. The app only ever sends
-`isOnlineMeeting: true` rather than pretending the reverse works.
+**One limitation, enforced rather than explained away:** Microsoft cannot turn an existing
+online meeting back into a plain event. So the tickbox **locks itself once the meeting exists**
+rather than sitting there doing nothing when you untick it. To remove a meeting, delete the
+event and create it again. The app only ever sends `isOnlineMeeting: true`.
 
 ### Attendees and RSVP
 

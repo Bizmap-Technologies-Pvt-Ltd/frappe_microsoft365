@@ -682,12 +682,27 @@ def _graph_attendees(event):
 	return attendees
 
 
+def _end_after_start(starts_on, ends_on):
+	"""Graph rejects an event whose end is not after its start, with ErrorPropertyValidationFailure.
+
+	Frappe does not enforce the ordering, and its Event form pre-fills both from "now", so a
+	record saved without touching the times can end a few seconds before it starts. Rather
+	than fail the push over that, fall back to a half hour from the start, which is what an
+	empty end already does.
+	"""
+	ends_on = get_datetime(ends_on) if ends_on else None
+	if ends_on and ends_on > starts_on:
+		return ends_on
+	return add_to_date(starts_on, minutes=30)
+
+
 def _event_to_graph_body(event):
+	starts_on = get_datetime(event.starts_on)
 	body = {
 		"subject": event.subject or "(No subject)",
 		"body": {"contentType": "HTML", "content": event.description or ""},
-		"start": _system_dt_to_ms(event.starts_on),
-		"end": _system_dt_to_ms(event.ends_on or add_to_date(get_datetime(event.starts_on), minutes=30)),
+		"start": _system_dt_to_ms(starts_on),
+		"end": _system_dt_to_ms(_end_after_start(starts_on, event.ends_on)),
 	}
 	if getattr(event, "all_day", 0):
 		body["isAllDay"] = True

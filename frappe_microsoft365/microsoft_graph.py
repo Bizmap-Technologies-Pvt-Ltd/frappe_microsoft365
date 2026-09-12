@@ -332,10 +332,19 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 
 
 def _safe_error(resp):
-	"""A short, safe description of a Graph failure (never echoes request headers/body)."""
+	"""A short, safe description of a Graph failure (never echoes request headers/body).
+
+	Both halves matter: the code is what you search for, and the message is the only part
+	that says WHICH property Graph objected to. "ErrorPropertyValidationFailure" on its own
+	sends people hunting through a payload by hand.
+	"""
 	try:
 		err = (resp.json() or {}).get("error", {})
-		return err.get("code") or err.get("message") or resp.reason
+		code = (err.get("code") or "").strip()
+		message = (err.get("message") or "").strip()
+		if code and message and message != code:
+			return f"{code}: {message}"
+		return code or message or resp.reason
 	except Exception:
 		return resp.reason
 

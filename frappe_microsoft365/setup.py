@@ -95,11 +95,15 @@ def create_event_custom_fields():
 				"label": "Add Teams meeting",
 				"insert_after": "custom_sync_with_microsoft_calendar",
 				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				# Microsoft cannot turn an existing online meeting back into a plain event, so
+				# once the meeting is real this control would be a lie. Lock it then rather
+				# than leave a tickbox that quietly does nothing.
+				"read_only_depends_on": "eval:doc.custom_teams_join_url",
 				"description": (
 					"Creates the event in Outlook as a Teams meeting with a join link, the same as "
-					"ticking Teams meeting in Outlook. Microsoft does not support removing the "
-					"meeting from an event afterwards, so unticking this later has no effect: "
-					"delete the event and create it again instead."
+					"ticking Teams meeting in Outlook. Locked once the meeting exists, because "
+					"Microsoft cannot remove a meeting from an event: to undo it, delete this "
+					"event and create it again."
 				),
 			},
 			{
