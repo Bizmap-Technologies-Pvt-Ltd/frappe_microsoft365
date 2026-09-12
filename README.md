@@ -224,6 +224,19 @@ time — which is why "SMTP works but IMAP doesn't" recurs on the forum. The doc
 configuration and suggests the two ways out: split incoming and outgoing into separate Email
 Accounts, or use the app-only flow, where no user identity is involved.
 
+### Sensitive actions are called out before they happen
+
+Two things in the app have consequences outside Frappe, and both say so on screen first:
+
+- **The Exchange setup script** grants the application standing access to the mailboxes you
+  list, readable with nobody signed in. The dialog explains that in full and will not generate
+  the script until you confirm, the app never runs it (you paste it into Exchange Online
+  yourself), and **the generated script ends with the commands that undo it**, commented out
+  so nothing reverses by accident.
+- **Turning on "Push Frappe events to Microsoft"** writes into a real Outlook calendar, and
+  deleting a Frappe Event then deletes the Microsoft one. Ticking it asks for confirmation and
+  reverts if you decline.
+
 ### What this does NOT do
 
 It does not send or receive mail, replace `Email Account`, or touch the email queue. Frappe's

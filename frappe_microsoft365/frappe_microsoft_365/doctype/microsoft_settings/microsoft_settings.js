@@ -154,10 +154,36 @@ function explain_error() {
 }
 
 function powershell() {
+	// This is the most consequential thing in the app, so the dialog says plainly what the
+	// script does and will not generate it until that has been acknowledged. Nothing is
+	// executed from here: the admin runs it in Exchange Online themselves.
+	const warning = `
+		<div class="alert alert-warning" style="margin-bottom:12px">
+			<b>${__("Read before you run this")}</b>
+			<ul style="margin:8px 0 0 16px;padding:0">
+				<li>${__(
+					"It gives the application <b>permanent access to the mailboxes you list</b>, readable with no one signed in."
+				)}</li>
+				<li>${__(
+					"Access is granted one mailbox at a time. Mailboxes not listed here stay out of reach."
+				)}</li>
+				<li>${__(
+					"It is reversible. The generated script ends with the commands that undo it."
+				)}</li>
+				<li>${__(
+					"Nothing runs from this screen. You paste it into Exchange Online yourself."
+				)}</li>
+			</ul>
+			<div class="small" style="margin-top:8px">${__(
+				"You only need this for shared mailboxes, such as turning support@ into a ticket queue. Ordinary calendar and mail sync does not."
+			)}</div>
+		</div>`;
+
 	const dialog = new frappe.ui.Dialog({
 		title: __("Exchange Setup Script"),
 		size: "large",
 		fields: [
+			{ fieldtype: "HTML", options: warning },
 			{
 				fieldname: "mailboxes",
 				fieldtype: "Small Text",
@@ -165,16 +191,30 @@ function powershell() {
 				description: __(
 					"Access is granted per mailbox, so the application can never reach anything not listed here."
 				),
+				reqd: 1,
 			},
 			{
 				fieldname: "send_as",
 				fieldtype: "Check",
 				label: __("Also allow sending as these mailboxes"),
 			},
+			{
+				fieldname: "understood",
+				fieldtype: "Check",
+				label: __("I understand this grants standing access to the mailboxes listed above"),
+			},
 			{ fieldname: "script", fieldtype: "Code", label: __("Run in Exchange Online PowerShell") },
 		],
 		primary_action_label: __("Generate"),
 		primary_action(values) {
+			if (!values.understood) {
+				frappe.msgprint({
+					title: __("Confirm first"),
+					message: __("Tick the confirmation box to generate the script."),
+					indicator: "orange",
+				});
+				return;
+			}
 			frappe.call({
 				method: "frappe_microsoft365.doctor.app_only_powershell",
 				args: { mailboxes: values.mailboxes, send_as: values.send_as ? 1 : 0 },

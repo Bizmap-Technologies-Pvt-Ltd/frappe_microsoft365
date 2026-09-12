@@ -31,6 +31,30 @@ frappe.ui.form.on("Microsoft Calendar", {
 	},
 });
 
+// Turning push on is the only setting here that writes into someone's real Outlook calendar,
+// and deleting a Frappe Event then deletes the Microsoft one. Say so before it is on.
+frappe.ui.form.on("Microsoft Calendar", {
+	push_to_microsoft_calendar(frm) {
+		if (!frm.doc.push_to_microsoft_calendar || frm.doc.__push_warning_shown) return;
+
+		frappe.confirm(
+			__(
+				"This writes into the real Outlook calendar of <b>{0}</b>.<br><br>" +
+					"Frappe Events marked for sync will be created as Microsoft events, edits are sent " +
+					"across, and <b>deleting a Frappe Event deletes the Microsoft one</b>.<br><br>" +
+					"Leave it off if you only want to read Outlook into Frappe.",
+				[frm.doc.microsoft_user_email || frm.doc.user || __("this account")]
+			),
+			() => {
+				frm.doc.__push_warning_shown = true;
+			},
+			() => {
+				frm.set_value("push_to_microsoft_calendar", 0);
+			}
+		);
+	},
+});
+
 function authorize(frm) {
 	frappe.call({
 		method: "frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.authorize_access",

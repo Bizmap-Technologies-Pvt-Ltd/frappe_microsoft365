@@ -593,7 +593,7 @@ def explain_error(text):
 
 # --- Exchange PowerShell for app-only access ------------------------------------------
 
-def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None, send_as=False):
+def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None, send_as=False, include_undo=True):
 	"""The Exchange Online commands that app-only mailbox access requires.
 
 	Microsoft's biggest documented trap: New-ServicePrincipal wants the Object ID from the
@@ -639,6 +639,27 @@ def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None
 				f'Add-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
 				f"-AccessRights SendAs -Confirm:$false"
 			)
+
+	if include_undo:
+		# Everything above is reversible. Ship the reverse commands with the script so nobody
+		# has to work them out under pressure later.
+		lines += [
+			"",
+			"# " + "-" * 72,
+			"# TO UNDO. Removes the application's access again; run as a tenant admin.",
+			"# " + "-" * 72,
+		]
+		for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+			if send_as:
+				lines.append(
+					f'# Remove-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+					f"-AccessRights SendAs -Confirm:$false"
+				)
+			lines.append(
+				f'# Remove-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity '
+				f"-AccessRights FullAccess -Confirm:$false"
+			)
+		lines.append("# Remove-ServicePrincipal -Identity $exoSp.Identity   # revokes it everywhere")
 
 	return "\n".join(lines)
 
@@ -812,5 +833,11 @@ def app_only_powershell(mailboxes=None, send_as=0):
 	return {
 		"script": powershell_for_app_only(
 			settings.get("client_id"), mailboxes=mailboxes, send_as=frappe.utils.cint(send_as)
-		)
+		),
+		"warning": _(
+			"This grants the application permanent access to the listed mailboxes, with no "
+			"one signed in. Nothing runs from here: you paste it into Exchange Online "
+			"yourself, and the script ends with the commands that reverse it."
+		),
+		"mailboxes": mailboxes or [],
 	}

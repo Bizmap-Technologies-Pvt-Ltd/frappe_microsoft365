@@ -300,6 +300,29 @@ class TestPowerShellGenerator(BaseTestCase):
 		self.assertNotIn("Add-RecipientPermission", without)
 		self.assertIn("Add-RecipientPermission", with_send)
 
+	def test_the_script_ships_with_its_own_undo(self):
+		"""Granting standing mailbox access is reversible; the reverse belongs in the output."""
+		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"], send_as=True)
+
+		self.assertIn("TO UNDO", script)
+		self.assertIn("Remove-MailboxPermission", script)
+		self.assertIn("Remove-RecipientPermission", script)
+		self.assertIn("Remove-ServicePrincipal", script)
+
+	def test_undo_block_can_be_suppressed(self):
+		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"], include_undo=False)
+
+		self.assertNotIn("TO UNDO", script)
+		self.assertIn("Add-MailboxPermission", script)
+
+	def test_undo_lines_are_commented_so_nothing_runs_by_accident(self):
+		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"])
+		undo = script[script.index("TO UNDO"):]
+
+		for line in undo.splitlines():
+			if "Remove-" in line:
+				self.assertTrue(line.strip().startswith("#"), f"undo line must be commented: {line}")
+
 	def test_every_mailbox_is_granted_individually(self):
 		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com", "c@d.com"])
 
