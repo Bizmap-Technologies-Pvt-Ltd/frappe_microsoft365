@@ -57,7 +57,7 @@
    "fieldtype": "Check",
    "label": "Standalone Teams meetings",
    "default": "0",
-   "description": "Meetings not attached to a calendar event. Not needed for the tickbox above."
+   "description": "Standalone meetings, and finding a meeting from its join link. Transcripts need this."
   },
   {
    "fieldname": "use_transcripts",

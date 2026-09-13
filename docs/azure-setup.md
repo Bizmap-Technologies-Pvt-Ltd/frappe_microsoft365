@@ -65,7 +65,9 @@ OnlineMeetingTranscript.Read.All
 Then click **Grant admin consent for <tenant>** (the green check). Admin consent is required —
 `OnlineMeetingTranscript.Read.All` in particular will not work without it.
 
-> Optional: add `OnlineMeetingRecording.Read.All` (delegated) if you also want Teams **recordings**.
+> Add `OnlineMeetingRecording.Read.All` (delegated) as well if you want Teams **recordings**.
+> Microsoft consents to reading the words and reading the video separately, so the transcript scope
+> does not cover recordings — and a tenant that refuses recordings still gets transcripts.
 > Recordings may additionally require Teams Premium / appropriate licensing.
 
 ## 5. Copy the identifiers
@@ -98,15 +100,28 @@ From the app's **Overview** page, copy:
 Teams transcripts are the most permission-sensitive feature. They only work when **all** of these
 hold:
 
+- **Graph access to transcripts is switched on for the tenant.** Microsoft added this control in
+  2026 and **ships it off**, in a different portal from the permissions: Teams admin center >
+  Meetings > Meeting settings > Transcript API access > Microsoft Graph access > On. Until it is
+  on, every transcript call returns `403 Forbidden: Graph API access to transcripts is disabled for
+  this tenant` (inner code `GraphAccessToTranscriptsDisabled`) **no matter how much consent has
+  been granted**. Speaker names additionally need Configure > Include speaker attribution > On.
 - The **delegated** scope `OnlineMeetingTranscript.Read.All` is granted **with tenant admin
-  consent** (step 4). A `403`/`Forbidden` from Graph almost always means the scope or admin consent
-  is missing.
+  consent** (step 4).
+- The **delegated** scope `OnlineMeetings.ReadWrite` is granted too. A transcript is addressed by
+  online meeting id, and the only way to get that from a join link is
+  `GET /me/onlineMeetings?$filter=JoinWebUrl eq '...'`, which this scope covers. Granting the
+  transcript scope alone is a key to a door you cannot walk to.
+
+  A `403` is therefore not one diagnosis but several: read the message body rather than assuming
+  consent is missing, or run **Run Diagnostics**, which decodes it.
 - The meeting is **calendar-associated** — i.e. created via `POST /me/events` with
   `isOnlineMeeting=true` (this app's `create_meeting(..., create_calendar_event=True)`, which is the
   default). Standalone `POST /me/onlineMeetings` meetings are **not** calendar-associated and will
   never expose transcripts.
-- The meeting has **not expired** — Graph only serves transcripts for recent meetings; very old
-  meetings drop off.
+- The meeting has **not expired** — Graph serves a meeting's artifacts for about **60 days** after
+  it happens (a join or an edit adds another 60). Separately, Teams deletes the files themselves on
+  the tenant's retention policy, 120 days by default. Whichever comes first ends it.
 - A transcript actually exists — transcription must have been turned on during the call, and there
   is a processing delay after the meeting ends before the VTT is available.
 

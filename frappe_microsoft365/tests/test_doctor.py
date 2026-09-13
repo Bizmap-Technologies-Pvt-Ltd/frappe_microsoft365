@@ -528,6 +528,320 @@ class TestErrorDecoder(BaseTestCase):
 		self.assertFalse(doctor.explain_error(None)["matched"])
 
 
+class TestTeamsErrorDecoder(BaseTestCase):
+	"""Three of these hit one tenant in a single hour, and the app answered the first wrongly.
+
+	Every 403 this app can produce says "Forbidden" and none of them share a fix, so ordering is
+	behaviour here rather than tidiness: the wrong answer sent a real admin to grant consent that
+	was already granted, which is a loop with no exit.
+	"""
+
+	def test_the_tenant_switch_403_is_not_diagnosed_as_a_consent_problem(self):
+		"""The loop with no exit: every permission consented, and Graph still says Forbidden."""
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSpiOTM1ZTY3NS01ZTY3/transcripts failed "
+			"(403): Forbidden: Graph API access to transcripts is disabled for this tenant.\n"
+			"Transcripts need OnlineMeetingTranscript.Read.All: check it is listed and consented "
+			"under Entra ID > App registrations > your app > API permissions."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("Teams admin center", result["detail"])
+		self.assertIn("Transcript API access", result["detail"])
+		self.assertNotIn("consent", result["detail"].lower())
+
+	def test_the_tenant_switch_is_decoded_before_every_other_403(self):
+		"""First match wins, and three later patterns also match the word Forbidden."""
+		self.assertIn("GraphAccessToTranscriptsDisabled", doctor.error_patterns()[0][0])
+
+	def test_the_apps_own_tenant_switch_message_is_recognised_too(self):
+		"""What a person pastes back in is our sentence, not Microsoft's: the app replaces it."""
+		from frappe_microsoft365 import microsoft_transcripts
+
+		result = doctor.explain_error(microsoft_transcripts._tenant_switch_hint())
+
+		self.assertTrue(result["matched"])
+		self.assertIn("Meeting settings", result["detail"])
+
+	def test_a_genuine_consent_failure_still_gets_the_consent_answer(self):
+		"""Ordering the tenant switch first must not cost us the error it was hiding behind."""
+		result = doctor.explain_error(
+			"AADSTS65001: The user or administrator has not consented to use the application "
+			"with ID '038b9c8e-2699-4858-b5f1-4f7a3d4077c4'."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("consent", result["title"].lower())
+
+	def test_a_recording_403_and_a_transcript_403_give_different_advice(self):
+		"""Microsoft consents to the two separately; one answer for both is wrong half the time."""
+		recording = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSpiOTM1ZTY3/recordings failed (403): Forbidden"
+		)
+		transcript = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSpiOTM1ZTY3/transcripts failed (403): Forbidden"
+		)
+
+		self.assertNotEqual(recording["title"], transcript["title"])
+		self.assertIn("OnlineMeetingRecording.Read.All", recording["detail"])
+		self.assertNotIn("OnlineMeetingTranscript", recording["detail"])
+		self.assertIn("OnlineMeetingTranscript.Read.All", transcript["detail"])
+		self.assertNotIn("OnlineMeetingRecording", transcript["detail"])
+
+	def test_a_recording_403_names_the_permission_before_the_licence(self):
+		"""A tenant that cannot record has no recordings, not a 403 — so the licence is a footnote,
+		and leading with it would send people to the wrong page."""
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSp/recordings/7e31db25/content failed (403): "
+			"Forbidden"
+		)
+
+		self.assertLess(
+			result["detail"].index("OnlineMeetingRecording.Read.All"),
+			result["detail"].index("Meeting recording"),
+		)
+		self.assertIn("never as a 403", result["detail"])
+
+	def test_the_join_link_lookup_names_the_permission_people_miss(self):
+		"""A key to a door you cannot walk to: they grant the transcript permission and stop."""
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings?$filter=JoinWebUrl eq "
+			"'https://teams.microsoft.com/l/meetup-join/19%3ameeting_Yzg5@thread.v2/0' failed "
+			"(403): Forbidden"
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("OnlineMeetings.ReadWrite", result["detail"])
+
+	def test_a_standalone_meeting_is_told_it_can_never_have_a_transcript(self):
+		"""Not 'not yet' — Graph never serves transcripts for a meeting with no calendar event."""
+		result = doctor.explain_error(
+			"Standalone meeting is not calendar-associated; transcripts are unavailable."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("never", result["detail"])
+		self.assertIn("Add Teams meeting", result["detail"])
+
+	def test_an_aged_out_meeting_is_not_blamed_on_permissions(self):
+		"""Graph stops serving a meeting's artifacts ~60 days on, and says only NotFound."""
+		result = doctor.explain_error(
+			"Microsoft could not match this join link to a meeting — either another organisation "
+			"hosted it, or it has aged out."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("60 days", result["detail"])
+		self.assertNotIn("permission", result["detail"].lower())
+
+	def test_a_404_on_a_meeting_path_lands_on_the_same_answer(self):
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSpiOTM1/transcripts failed (404): NotFound"
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("no longer has this meeting", result["title"])
+
+	def test_a_deleted_outlook_event_is_named_as_deleted(self):
+		result = doctor.explain_error(
+			"Microsoft Graph PATCH /me/events/AAMkAGI2 failed (404): ErrorItemNotFound: The "
+			"specified object was not found in the store."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("no longer exists", result["title"])
+
+	def test_a_mailbox_refusal_points_at_the_calendar_permission(self):
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/calendarView failed (403): ErrorAccessDenied: Access is "
+			"denied. Check credentials and try again."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("Calendars.ReadWrite", result["detail"])
+
+	def test_throttling_reads_as_temporary_rather_than_broken(self):
+		"""The app already backs off; a 429 in the log is not something to go and fix."""
+		for text in (
+			"Microsoft Graph rate limit hit (429). The next scheduled sync will retry.",
+			"Microsoft Graph GET /me/events failed (429): TooManyRequests: Application is over "
+			"its MailboxConcurrency limit.",
+		):
+			with self.subTest(text=text):
+				result = doctor.explain_error(text)
+				self.assertTrue(result["matched"])
+				self.assertIn("throttling", result["title"].lower())
+				self.assertIn("Nothing is misconfigured", result["detail"])
+
+	def test_a_mailbox_with_no_exchange_online_licence(self):
+		result = doctor.explain_error(
+			"Microsoft Graph POST /me/sendMail failed (403): MailboxNotEnabledForRESTAPI: REST "
+			"API is not yet supported for this mailbox."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("Licenses and apps", result["detail"])
+
+	def test_the_1406_that_filled_the_error_log_on_every_sign_in(self):
+		"""A real Graph calendar id is 152 characters; the column was Frappe's default 140, and
+		the write was lost silently while sign-in reported success."""
+		result = doctor.explain_error(
+			"(1406, \"Data too long for column 'ms_calendar_id' at row 1\")"
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("migrate", result["detail"].lower())
+
+	def test_an_expired_delta_watermark_is_not_reported_as_a_fault(self):
+		result = doctor.explain_error(
+			"Microsoft Graph sync state expired (syncStateNotFound: The sync state generation is "
+			"not found). A full re-sync is required."
+		)
+
+		self.assertTrue(result["matched"])
+		self.assertIn("nothing to fix", result["detail"].lower())
+
+	def test_a_tenant_that_does_not_exist(self):
+		result = doctor.explain_error("AADSTS90002: Tenant 'bizmap' not found.")
+
+		self.assertTrue(result["matched"])
+		self.assertIn("Directory (tenant) ID", result["detail"])
+
+	def test_an_unrecognised_teams_error_still_falls_through_to_the_honest_answer(self):
+		"""Twenty-five patterns is not omniscience, and pretending otherwise costs trust."""
+		result = doctor.explain_error(
+			"Microsoft Graph GET /me/onlineMeetings/MSp/attendanceReports failed (500): "
+			"UnknownError"
+		)
+
+		self.assertFalse(result["matched"])
+		self.assertIn("Unrecognised", result["title"])
+
+	def test_every_pattern_compiles_and_says_something(self):
+		import re
+
+		for pattern, title, detail in doctor.error_patterns():
+			with self.subTest(pattern=pattern):
+				re.compile(pattern)
+				self.assertTrue(title)
+				self.assertTrue(detail)
+
+
+class TestManualSetupSteps(BaseTestCase):
+	"""The half of the setup that happens in Microsoft's portals and cannot be read from here.
+
+	These must read as "confirm this", never as "this is broken": we genuinely do not know, and
+	telling someone their finished step is broken is the same loop by another route.
+	"""
+
+	def test_the_tenant_switch_step_names_the_teams_admin_center_path(self):
+		step = next(
+			s for s in doctor.manual_setup_steps() if s["id"] == "transcript_api_access"
+		)
+
+		self.assertIn("Teams admin center", step["where"])
+		self.assertIn("Meetings > Meeting settings > Transcript API access", step["where"])
+		self.assertIn("Microsoft Graph access On", step["where"])
+
+	def test_the_consent_step_names_the_entra_path_and_the_button(self):
+		step = next(s for s in doctor.manual_setup_steps() if s["id"] == "admin_consent")
+
+		self.assertIn("Microsoft Entra admin center", step["where"])
+		self.assertIn("Grant admin consent", step["where"])
+		self.assertIn("Re-authorize", step["verify"])
+
+	def test_the_recording_step_names_the_policy_and_the_licence(self):
+		"""A permission alone does not make a recording exist; a licence that records does."""
+		step = next(s for s in doctor.manual_setup_steps() if s["id"] == "recording_allowed")
+
+		self.assertIn("Meeting policies", step["where"])
+		self.assertIn("licence", step["where"])
+
+	def test_every_step_says_where_it_is_what_it_unlocks_and_how_to_tell(self):
+		"""The contract the Settings form renders; a step missing one of these is unusable."""
+		for step in doctor.manual_setup_steps():
+			with self.subTest(step=step["id"]):
+				for field in ("title", "where", "unlocks", "verify"):
+					self.assertTrue(step.get(field), f"{step['id']} has no {field}")
+
+	def test_only_the_capabilities_this_site_ticked_are_listed(self):
+		"""A calendar-only site being told to flip Teams switches is noise, and noise gets skipped."""
+		calendar_only = doctor.manual_setup_steps({"use_calendar": 1})
+
+		self.assertEqual([s["id"] for s in calendar_only], ["admin_consent"])
+
+	def test_transcripts_bring_the_teams_steps_with_them(self):
+		ids = [s["id"] for s in doctor.manual_setup_steps({"use_transcripts": 1})]
+
+		self.assertIn("transcript_api_access", ids)
+		self.assertIn("recording_allowed", ids)
+
+	def test_a_site_with_nothing_ticked_is_told_nothing(self):
+		self.assertEqual(doctor.manual_setup_steps({}), [])
+
+	def test_they_are_notes_never_problems(self):
+		"""SKIP, because nothing was measured. A FAIL here would be a verdict on an unread setting."""
+		for item in doctor.manual_step_findings({"use_transcripts": 1}):
+			with self.subTest(check=item["check"]):
+				self.assertEqual(item["status"], SKIP)
+				self.assertTrue(item["check"].startswith("manual."))
+				self.assertIn("Not checked", item["detail"])
+
+	def test_the_finding_carries_the_portal_path_and_the_proof(self):
+		item = next(
+			f
+			for f in doctor.manual_step_findings({"use_transcripts": 1})
+			if f["check"] == "manual.transcript_api_access"
+		)
+
+		self.assertIn("Transcript API access", item["fix"])
+		self.assertIn("You will know it worked", item["fix"])
+		self.assertIn("microsoftteams", item["doc"])
+
+
+class TestSetupGuideEndpoint(BaseTestCase):
+	def test_it_returns_the_shape_the_form_consumes(self):
+		result = doctor.setup_guide()
+
+		self.assertIn("steps", result)
+		self.assertIn("capabilities", result)
+		for step in result["steps"]:
+			for field in ("title", "where", "unlocks", "verify"):
+				self.assertIn(field, step)
+		for capability in result["capabilities"]:
+			for field in ("id", "label", "enabled", "permissions"):
+				self.assertIn(field, capability)
+
+	def test_the_capabilities_carry_the_permissions_sign_in_will_request(self):
+		"""Derived from the same table get_scopes uses, so the guide cannot advertise a
+		permission the sign-in never asks for."""
+		from frappe_microsoft365 import microsoft_graph as graph
+
+		by_field = {field: list(scopes) for field, scopes in graph.CAPABILITY_SCOPES}
+
+		for capability in doctor.setup_guide()["capabilities"]:
+			with self.subTest(capability=capability["id"]):
+				self.assertEqual(capability["permissions"], by_field[capability["field"]])
+
+	def test_only_the_capabilities_this_site_ticked_are_described(self):
+		"""The dialog prints these as "Covers:", so an unticked one there describes somebody
+		else's setup."""
+		summary = doctor._capability_summary({"use_transcripts": 1})
+
+		self.assertEqual([c["id"] for c in summary], ["transcripts"])
+		self.assertEqual(doctor._capability_summary({}), [])
+
+	def test_it_is_system_manager_only(self):
+		"""It names tenants, portals and what is not yet granted; that is not for every user."""
+		import frappe
+
+		frappe.set_user("Guest")
+		self.addCleanup(frappe.set_user, "Administrator")
+
+		with self.assertRaises(frappe.PermissionError):
+			doctor.setup_guide()
+
+
 class TestPowerShellGenerator(BaseTestCase):
 	def test_looks_up_object_id_instead_of_asking_for_it(self):
 		"""Microsoft's documented #1 trap: the App Registration Object ID is the wrong one."""
@@ -590,3 +904,32 @@ class TestDiagnosticsEndpoint(BaseTestCase):
 			self.assertIn(item["status"], (PASS, WARN, FAIL, SKIP))
 			self.assertTrue(item["check"])
 			self.assertTrue(item["title"])
+
+	def test_the_manual_steps_are_reported_alongside_the_automatic_checks(self):
+		"""Run Diagnostics is the button people press when stuck, and three of the four faults a
+		real tenant hit were invisible to every automatic check in this module."""
+		from unittest.mock import patch
+
+		settings = {
+			"enabled": 1,
+			"tenant_id": TENANT,
+			"client_id": "038b9c8e-2699-4858-b5f1-4f7a3d4077c4",
+			"has_client_secret": True,
+			"redirect_uri": f"https://site.example.com/api/method/{doctor.CALLBACK_METHOD}",
+			"use_transcripts": 1,
+			"default_scopes": "",
+			"authorized_scopes": "",
+			"mail_flow": "Delegated",
+		}
+
+		with patch.object(doctor, "_settings_config", return_value=settings):
+			result = doctor.run_diagnostics()
+
+		self.assertIn("manual.transcript_api_access", ids(result["findings"]))
+		self.assertIn("manual.admin_consent", ids(result["findings"]))
+
+	def test_a_manual_step_never_counts_as_a_problem(self):
+		"""They are unread settings, not failing ones. Counting them would cry wolf every run."""
+		for item in doctor.run_diagnostics()["findings"]:
+			if item["check"].startswith("manual."):
+				self.assertEqual(item["status"], SKIP)

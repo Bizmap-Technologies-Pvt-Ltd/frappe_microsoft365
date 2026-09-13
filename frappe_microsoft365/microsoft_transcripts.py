@@ -5,10 +5,27 @@ event** (created via POST /me/events with isOnlineMeeting=true) and that have **
 
 Delegated permissions required (with tenant-admin consent):
   * transcripts -> OnlineMeetingTranscript.Read.All
-  * recordings  -> OnlineMeetingRecording.Read.All  (also subject to Teams Premium / licensing)
+  * recordings  -> OnlineMeetingRecording.Read.All
 
-All entrypoints are whitelisted and owner-checked. Graph errors surface as clean messages;
-a 403 typically means the scope/consent is missing or the meeting is not calendar-associated.
+Whether a meeting COULD be recorded at all is a separate tenant policy (Teams admin center,
+Meetings > Meeting policies > Meeting recording), and it is not what a 403 here is about: a
+tenant with recording switched off simply has no recordings, and Graph answers 200 with an
+empty list. Naming a licence in a 403 message would send people to the wrong page.
+
+All entrypoints are whitelisted and owner-checked. Graph errors surface as clean messages.
+
+Three 403s look identical and are not
+-------------------------------------
+Every one of them says "Forbidden", and the fix for each is in a different place. Answering
+all three with "grant transcript consent" is what sent a real tenant round a loop:
+
+* **transcripts** -> the tenant switch below, far more often than consent.
+* **recordings**  -> OnlineMeetingRecording.Read.All, which Microsoft consents to separately
+  from the transcript permission. A tenant happy to let an app read words frequently refuses
+  to let it read video, so this one is missing on its own more often than not.
+* **the join-link lookup** -> OnlineMeetings.ReadWrite, which neither of the above includes.
+
+So each has its own hint, and none of them mentions the others.
 """
 
 import frappe
@@ -19,14 +36,31 @@ from frappe_microsoft365.microsoft_calendar_sync import _check_owner
 from frappe_microsoft365.microsoft_graph import MsGraphError
 from frappe_microsoft365.microsoft_meetings import _resolve_online_meeting_id
 
-_PERM_HINT = (
-	"Transcripts require the OnlineMeetingTranscript.Read.All delegated permission with "
-	"tenant-admin consent, and the meeting must be calendar-associated and not expired."
-)
-_REC_PERM_HINT = (
-	"Recordings require the OnlineMeetingRecording.Read.All delegated permission with "
-	"tenant-admin consent (and may require Teams Premium licensing)."
-)
+
+def _transcript_perm_hint():
+	"""Built per call: _() resolves against the current site and language, so a module-level
+	constant would freeze whichever site imported this first."""
+	return _(
+		"Transcripts need OnlineMeetingTranscript.Read.All: check it is listed and consented "
+		"under Entra ID > App registrations > your app > API permissions, then Re-authorize this "
+		"Microsoft Calendar. A meeting created without a calendar event never has one at all."
+	)
+
+
+def _recording_perm_hint():
+	return _(
+		"Recordings need their own OnlineMeetingRecording.Read.All, which tenants often consent "
+		"to separately from the transcript one: add it under Entra ID > App registrations > your "
+		"app > API permissions, grant admin consent, then Re-authorize this Microsoft Calendar."
+	)
+
+
+def _online_meetings_hint():
+	return _(
+		"Finding a meeting from its join link needs OnlineMeetings.ReadWrite, which the transcript "
+		"permission does not include: tick Standalone Teams meetings in Microsoft Settings, consent "
+		"to it in Entra ID > App registrations, then Re-authorize this Microsoft Calendar."
+	)
 
 
 #: Microsoft added a tenant switch for this in 2026 and shipped it OFF. Every tenant now has
@@ -56,6 +90,24 @@ def _wrap_403(e, hint):
 	raise e
 
 
+def _wrap_join_url_403(e):
+	"""Explain a refusal to map a join link to a meeting id; anything else is re-raised as it is.
+
+	Kept apart from _wrap_403 because the permission is a different one: this call is
+	/me/onlineMeetings, not /transcripts, and it fails for tenants that consented to every
+	transcript permission there is. Handing that person the transcript hint tells them to grant
+	what the portal in front of them already shows as granted.
+	"""
+	msg = str(e)
+	if "403" in msg or "Forbidden" in msg or "Authorization" in msg:
+		frappe.throw(
+			f"{msg}\n{_online_meetings_hint()}",
+			MsGraphError,
+			title=_("Microsoft would not look this meeting up"),
+		)
+	raise e
+
+
 # --- transcripts ---------------------------------------------------------------------
 
 @frappe.whitelist()
@@ -68,7 +120,7 @@ def list_transcripts(calendar_name: str, online_meeting_id: str):
 			"GET", f"/me/onlineMeetings/{online_meeting_id}/transcripts", calendar_name
 		)
 	except MsGraphError as e:
-		_wrap_403(e, _PERM_HINT)
+		_wrap_403(e, _transcript_perm_hint())
 	return [
 		{
 			"id": t.get("id"),
@@ -93,7 +145,7 @@ def get_transcript_content(calendar_name: str, online_meeting_id: str, transcrip
 			raw=True,
 		)
 	except MsGraphError as e:
-		_wrap_403(e, _PERM_HINT)
+		_wrap_403(e, _transcript_perm_hint())
 	return {"format": fmt, "content": resp.text}
 
 
@@ -106,7 +158,12 @@ def get_transcripts_for_join_url(calendar_name: str, join_url: str):
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 
-	online_meeting_id = _resolve_online_meeting_id(calendar_name, join_url)
+	try:
+		online_meeting_id = _resolve_online_meeting_id(calendar_name, join_url)
+	except MsGraphError as e:
+		# Refused, not empty. Left unwrapped this surfaced as a bare Graph 403 naming the
+		# /me/onlineMeetings path, which reads like the transcript permission failing.
+		_wrap_join_url_403(e)
 	if not online_meeting_id:
 		return {"online_meeting_id": None, "transcripts": [], "latest_vtt": None}
 
@@ -134,7 +191,7 @@ def get_transcripts_for_join_url(calendar_name: str, join_url: str):
 
 @frappe.whitelist()
 def list_recordings(calendar_name: str, online_meeting_id: str):
-	"""List recordings for an online meeting. Owner-checked. See licensing note."""
+	"""List recordings for an online meeting. Owner-checked. Empty is not an error: see above."""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 	try:
@@ -142,7 +199,7 @@ def list_recordings(calendar_name: str, online_meeting_id: str):
 			"GET", f"/me/onlineMeetings/{online_meeting_id}/recordings", calendar_name
 		)
 	except MsGraphError as e:
-		_wrap_403(e, _REC_PERM_HINT)
+		_wrap_403(e, _recording_perm_hint())
 	return [
 		{
 			"id": r.get("id"),
@@ -179,7 +236,7 @@ def get_recording_content(calendar_name: str, online_meeting_id: str, recording_
 			stream=True,
 		)
 	except MsGraphError as e:
-		_wrap_403(e, _REC_PERM_HINT)
+		_wrap_403(e, _recording_perm_hint())
 	try:
 		return {
 			"content_type": resp.headers.get("Content-Type"),

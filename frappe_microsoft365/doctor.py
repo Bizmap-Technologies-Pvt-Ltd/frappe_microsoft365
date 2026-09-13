@@ -15,6 +15,16 @@ Every rule below is derived from a documented requirement, cited inline:
   https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
 * Microsoft Entra authentication error codes
   https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+* Microsoft, "Manage transcript API access for Teams meetings" (the 2026 tenant switch)
+  https://learn.microsoft.com/en-us/microsoftteams/meeting-transcript-api-access
+* Microsoft, "Manage Teams recording policies for meetings and events"
+  https://learn.microsoft.com/en-us/microsoftteams/meeting-recording
+* Microsoft, "Limits and specifications for Microsoft Teams" (meeting expiration)
+  https://learn.microsoft.com/en-us/microsoftteams/limits-specifications-teams#meeting-expiration
+
+Some of the setup cannot be checked from here at all — a tenant switch with no Graph API
+behind it, a consent grant we only ever see the shadow of, a licence. Those live in
+``manual_setup_steps`` and are reported as notes, never as faults.
 
 The check functions take plain dicts rather than Documents so they stay pure and fully
 testable offline. ``run_diagnostics`` is the thin layer that loads real records into them.
@@ -59,6 +69,15 @@ MS_OAUTH_DOC = (
 	"how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth"
 )
 ENTRA_ERROR_DOC = "https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes"
+
+#: The pages behind the steps nobody here can verify. Each one is the page that carries the
+#: exact menu path quoted in the step, so a reader who distrusts our wording can check it.
+ENTRA_CONSENT_DOC = "https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/grant-admin-consent"
+TEAMS_TRANSCRIPT_API_DOC = "https://learn.microsoft.com/en-us/microsoftteams/meeting-transcript-api-access"
+TEAMS_RECORDING_DOC = "https://learn.microsoft.com/en-us/microsoftteams/meeting-recording"
+TEAMS_RECORDING_OVERVIEW_DOC = (
+	"https://learn.microsoft.com/en-us/microsoftteams/recording-transcription-overview"
+)
 
 PASS, WARN, FAIL, SKIP = "pass", "warn", "fail", "skip"
 
@@ -814,13 +833,100 @@ def error_patterns():
 		# Before the consent patterns: this one also says "Forbidden", and whichever matches
 		# first wins. A tenant with every permission granted still gets a 403 until the switch
 		# below is on, so guessing "consent" here would send people round a loop.
-		r"GraphAccessToTranscriptsDisabled|access to transcripts is disabled",
+		#
+		# "Transcript API access" is matched too, because the app's own message for this case is
+		# the fix rather than Microsoft's sentence: microsoft_transcripts replaces the 403 with
+		# the menu path, and that replacement is what a person pastes back in here.
+		r"GraphAccessToTranscriptsDisabled|access to transcripts is disabled|Transcript API access",
 		_("Graph access to transcripts is switched off for this tenant"),
 		_(
 			"Not a permission problem — Microsoft added a tenant switch in 2026 and ships it "
 			"off. In the Teams admin center: Meetings > Meeting settings > Transcript API "
 			"access > turn Microsoft Graph access On. Speaker names need Configure > Include "
 			"speaker attribution On as well."
+		),
+	),
+	(
+		# Three of this app's 403s read identically and have three different fixes, so all three
+		# are decoded before the generic consent pattern below — which would otherwise claim
+		# every one of them on the word "consented" inside their own hint text.
+		#
+		# Recordings first: Microsoft consents to them separately from transcripts, and a tenant
+		# happy to let an app read words often refuses to let it read video, so this is the one
+		# that goes missing on its own.
+		r"OnlineMeetingRecording\.Read\.All|/recordings[^\n]{0,200}\b403\b",
+		_("Microsoft refused the recording"),
+		_(
+			"Recordings have their own permission. Add OnlineMeetingRecording.Read.All under "
+			"Entra ID > App registrations > your app > API permissions, grant admin consent, then "
+			"Re-authorize the Microsoft Calendar. Whether the tenant records at all is a separate "
+			"setting — Teams admin center > Meetings > Meeting policies > Meeting recording, on a "
+			"licence that records — and that one shows up as no recordings, never as a 403."
+		),
+	),
+	(
+		r"OnlineMeetingTranscript\.Read\.All|/transcripts[^\n]{0,200}\b403\b",
+		_("Microsoft refused the transcript"),
+		_(
+			"Not the tenant switch — that one names itself in the error — so it is the "
+			"permission. Add OnlineMeetingTranscript.Read.All under Entra ID > App registrations "
+			"> your app > API permissions, grant admin consent, then Re-authorize the Microsoft "
+			"Calendar: a token keeps the permissions it was issued with, so consenting alone "
+			"changes nothing."
+		),
+	),
+	(
+		# The permission people miss. They grant the transcript one and stop, but a transcript is
+		# addressed by meeting id, and getting that id from a join link is a different call with
+		# a different permission — a key to a door you cannot walk to.
+		r"OnlineMeetings\.ReadWrite|JoinWebUrl[^\n]{0,400}\b403\b|/me/onlineMeetings[^\n]{0,200}\b403\b",
+		_("Microsoft refused to look up the meeting behind this link"),
+		_(
+			"Mapping a join link to a meeting needs OnlineMeetings.ReadWrite, which the transcript "
+			"permission does not include. Tick Standalone Teams meetings in Microsoft Settings, "
+			"consent to it under Entra ID > App registrations > your app > API permissions, then "
+			"Re-authorize the Microsoft Calendar."
+		),
+	),
+	(
+		r"not calendar-associated|standalone meeting",
+		_("This meeting was never attached to a calendar"),
+		_(
+			"Graph serves transcripts only for a meeting created together with a calendar event, "
+			"so a standalone Teams meeting has none and never will. Create it from a Frappe Event "
+			"with Add Teams meeting ticked — that is the whole reason this app makes meetings "
+			"that way."
+		),
+	),
+	(
+		# 404 rather than 403: the meeting id no longer resolves. Two causes, and naming only one
+		# of them is wrong about half the time.
+		r"could not match this join link|/onlineMeetings/[^\n]{0,300}\b404\b",
+		_("Microsoft no longer has this meeting"),
+		_(
+			"Either another organisation hosted it — the meeting lives in their tenant, not "
+			"yours — or it has aged out: Graph stops serving a meeting's transcript and recording "
+			"about 60 days after it happens, extended by 60 more each time someone joins or edits "
+			"it. Open the meeting in the Teams calendar and use its Recordings and Transcripts tab."
+		),
+	),
+	(
+		r"ErrorItemNotFound|specified object was not found in the store",
+		_("That Outlook item no longer exists"),
+		_(
+			"Deleted in Outlook, moved to another calendar, or a recurring occurrence that was "
+			"changed — the stored Microsoft id points at nothing. Delete the Frappe copy, or untick "
+			"Sync with Microsoft Calendar on it: nothing can patch an event Outlook does not have."
+		),
+	),
+	(
+		r"ErrorAccessDenied|Access is denied\. Check credentials",
+		_("Outlook refused the mailbox"),
+		_(
+			"The token is valid; the mailbox would not serve it. Grant Calendars.ReadWrite "
+			"(delegated) under Entra ID > App registrations > your app > API permissions and "
+			"re-authorise. For somebody else's calendar, they have to share it with this account "
+			"first."
 		),
 	),
 	(
@@ -850,6 +956,14 @@ def error_patterns():
 		r"AADSTS700016|application with identifier",
 		_("The application is not present in this tenant"),
 		_("Check the tenant id, or have an admin consent the app into the tenant first."),
+	),
+	(
+		r"AADSTS90002",
+		_("That tenant does not exist"),
+		_(
+			"Microsoft could not find the tenant named in the sign-in URL. Copy Directory (tenant) "
+			"ID from the Azure app registration Overview page into Microsoft Settings."
+		),
 	),
 	(
 		r"invalid_grant",
@@ -893,6 +1007,27 @@ def error_patterns():
 		_("Check the SSL and STARTTLS flags — one or the other, not both."),
 	),
 	(
+		r"MailboxNotEnabledForRESTAPI|REST API is not yet supported for this mailbox",
+		_("That mailbox is not in Exchange Online"),
+		_(
+			"The account has no Exchange Online licence, or its mailbox is on-premises, inactive "
+			"or soft-deleted. Assign a licence in Microsoft 365 admin center > Users > Active "
+			"users > the user > Licenses and apps, and confirm the mailbox is hosted in Exchange "
+			"Online."
+		),
+	),
+	(
+		# After everything that names a resource: a throttled transcript call is still a transcript
+		# call, but by this point nothing more specific has claimed it.
+		r"\b429\b|TooManyRequests|activityLimitReached|rate limit",
+		_("Microsoft is throttling this tenant"),
+		_(
+			"Nothing is misconfigured. Short waits are honoured in place and longer ones left to "
+			"the next scheduled run, so this clears itself. If every run hits it, sync fewer "
+			"calendars at once or narrow the sync window."
+		),
+	),
+	(
 		r"ErrorPropertyValidationFailure",
 		_("Microsoft rejected one of the event's values"),
 		_(
@@ -907,6 +1042,25 @@ def error_patterns():
 		_(
 			"They are created on install and on migrate. Run `bench --site <site> migrate`, or "
 			"use Migrate in the Frappe Cloud site dashboard, then sync again."
+		),
+	),
+	(
+		r"Data too long for column|\(1406,",
+		_("A Microsoft id is longer than the column holding it"),
+		_(
+			"Graph ids run past Frappe's default 140 characters, so the value is refused and the "
+			"write silently lost while everything on screen still looks like it worked. Run "
+			"`bench --site <site> migrate` (Frappe Cloud: Migrate in the site dashboard) to pick "
+			"up the widened fields, then authorise again."
+		),
+	),
+	(
+		r"syncStateNotFound|resyncRequired|sync state expired",
+		_("The calendar sync watermark expired"),
+		_(
+			"Microsoft invalidated the delta token, which happens after a long gap or a mailbox "
+			"move. The next run starts a full sync by itself — nothing to fix unless it repeats "
+			"every run."
 		),
 	),
 	(
@@ -929,6 +1083,162 @@ def explain_error(text):
 		"detail": _("No known Microsoft cause matches this message."),
 		"doc": ENTRA_ERROR_DOC,
 	}
+
+
+# --- the steps nothing here can check -------------------------------------------------
+
+def manual_setup_steps(settings=None):
+	"""The setup that happens in Microsoft's portals, which this app cannot verify.
+
+	Every other check in this module reads something and reports what it found. These cannot be
+	read at all:
+
+	* The transcript tenant switch is a Teams setting with no Microsoft Graph resource behind
+	  it — only Teams PowerShell (``Get-CsTeamsMeetingConfiguration``) can read it, and this app
+	  holds a delegated Graph token, not a Teams admin session.
+	* Consent is visible to us only as its shadow: a token either carries a permission or it
+	  does not, and a token issued before the grant looks exactly like a grant that never
+	  happened.
+	* A licence, and whether anyone pressed record, are facts about the tenant and the meeting,
+	  not about this configuration.
+
+	So they are reported as things to confirm, never as faults. An admin who has already done
+	one of them must not be told it is broken — that is the loop this whole module exists to
+	end.
+
+	``settings`` filters to the capabilities the site actually ticked; None returns all of
+	them. Telling a calendar-only site to go and flip Teams switches is noise.
+	"""
+	steps = [
+		{
+			"id": "admin_consent",
+			# First because it is the one that is chronologically first, and because every
+			# permission named in the other steps is worthless until it is done.
+			"needs": ("use_calendar", "use_teams", "use_transcripts"),
+			"title": _("Confirm an administrator consented to the permissions"),
+			"where": _(
+				"Microsoft Entra admin center > App registrations > your app > API permissions > "
+				"Grant admin consent for <tenant>."
+			),
+			"unlocks": _(
+				"Every Graph permission this app asks for. The transcript and recording ones "
+				"cannot be consented by the person signing in — only by a tenant admin."
+			),
+			"verify": _(
+				"The API permissions table reads 'Granted for <tenant>' on each row. Then "
+				"Re-authorize every Microsoft Calendar: an existing token keeps the permissions "
+				"it was issued with."
+			),
+			"doc": ENTRA_CONSENT_DOC,
+		},
+		{
+			"id": "transcript_api_access",
+			"needs": ("use_transcripts",),
+			"title": _("Confirm Graph access to transcripts is on for the tenant"),
+			"where": _(
+				"Teams admin center > Meetings > Meeting settings > Transcript API access > "
+				"Microsoft Graph access On. Speaker names also need Configure > Include speaker "
+				"attribution On."
+			),
+			"unlocks": _(
+				"Reading any transcript at all. Microsoft added this switch in 2026 and ships it "
+				"off, so a tenant with every permission granted still gets 403 until it is on."
+			),
+			"verify": _(
+				"Get Transcript & Recording on a finished meeting stops answering that Graph "
+				"access to transcripts is disabled for this tenant."
+			),
+			"doc": TEAMS_TRANSCRIPT_API_DOC,
+		},
+		{
+			"id": "recording_allowed",
+			"needs": ("use_transcripts",),
+			"title": _("Confirm this tenant is allowed to record"),
+			"where": _(
+				"Teams admin center > Meetings > Meeting policies > the organiser's policy > "
+				"Meeting recording On. Recording also needs a licence that includes it (Business "
+				"Basic/Standard/Premium, E1/E3/E5) and OneDrive and SharePoint switched on."
+			),
+			"unlocks": _(
+				"Recordings only. Transcripts are unaffected — separate permission, separate "
+				"licence."
+			),
+			"verify": _(
+				"Record and transcribe offers Start recording inside a meeting, and the finished "
+				"meeting shows a recording in Teams."
+			),
+			"doc": TEAMS_RECORDING_DOC,
+		},
+		{
+			"id": "recorded_in_the_meeting",
+			"needs": ("use_transcripts",),
+			"title": _("Confirm the meeting itself was recorded or transcribed"),
+			"where": _(
+				"In the meeting: More > Record and transcribe > Start recording or Start "
+				"transcription. Organisers can set it in advance in the meeting options."
+			),
+			"unlocks": _(
+				"Anything to fetch. Teams produces nothing for a meeting nobody recorded, and an "
+				"empty answer looks exactly like a permission problem from this side."
+			),
+			"verify": _(
+				"The meeting's Recordings and Transcripts tab in the Teams calendar lists them. "
+				"If Teams has none, this app can have none."
+			),
+			"doc": TEAMS_RECORDING_OVERVIEW_DOC,
+		},
+	]
+
+	if settings is None:
+		return steps
+	return [step for step in steps if any(settings.get(field) for field in step["needs"])]
+
+
+def manual_step_findings(settings=None):
+	"""The manual steps in the shape the doctor renders, so they sit beside the real checks.
+
+	SKIP, which the form draws as a grey "Note": these are not measurements and must never be
+	counted as problems. The detail leads with "Not checked" for the same reason — a finding
+	that reads like a verdict on something we never looked at is worse than silence.
+	"""
+	return [
+		finding(
+			"manual.{0}".format(step["id"]),
+			SKIP,
+			step["title"],
+			_("Not checked — nothing here can read it. {0}").format(step["unlocks"]),
+			_("{0} You will know it worked: {1}").format(step["where"], step["verify"]),
+			step.get("doc") or "",
+		)
+		for step in manual_setup_steps(settings)
+	]
+
+
+def _capability_summary(settings):
+	"""What this site asked for, and the permission each capability needs granting.
+
+	Derived from graph.CAPABILITY_SCOPES rather than a second list, so the guide can never
+	advertise a permission the sign-in will not request.
+
+	Only the ticked ones, to match the steps: a guide that says it covers Teams meetings on a
+	calendar-only site is describing somebody else's setup.
+	"""
+	labels = {
+		"use_calendar": _("Outlook calendar"),
+		"use_teams": _("Standalone Teams meetings"),
+		"use_transcripts": _("Transcripts and recordings"),
+	}
+	return [
+		{
+			"id": field.replace("use_", ""),
+			"field": field,
+			"label": labels.get(field, field),
+			"enabled": True,
+			"permissions": list(scopes),
+		}
+		for field, scopes in graph.CAPABILITY_SCOPES
+		if settings.get(field)
+	]
 
 
 # --- Exchange PowerShell for app-only access ------------------------------------------
@@ -1087,6 +1397,11 @@ def run_diagnostics():
 			# scopes the first time it signs in, so it is not a problem to report.
 			frappe.db.count("Microsoft Calendar", {"authorized": 1}),
 		)
+		# The half of the setup that lives in Microsoft's portals. Reported here because this is
+		# the button people press when something is wrong, and the fault that cost a real tenant
+		# an hour — a tenant switch shipped off — is on this list and invisible to every check
+		# above it.
+		findings += manual_step_findings(settings)
 
 	if settings.get("use_calendar"):
 		findings += check_event_custom_fields(
@@ -1182,6 +1497,22 @@ def run_for_email_account(email_account: str):
 
 	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
 	return {"findings": findings, "counts": counts}
+
+
+@frappe.whitelist()
+def setup_guide():
+	"""The setup Frappe cannot verify, for the form to show. Read-only. System Manager only.
+
+	Returns ``{"steps": [{"title", "where", "unlocks", "verify"}], "capabilities": [...]}``.
+	Steps are filtered to the capabilities ticked in Microsoft Settings, in the order they have
+	to be done.
+	"""
+	frappe.only_for("System Manager")
+	settings = _settings_config()
+	return {
+		"steps": manual_setup_steps(settings),
+		"capabilities": _capability_summary(settings),
+	}
 
 
 @frappe.whitelist()

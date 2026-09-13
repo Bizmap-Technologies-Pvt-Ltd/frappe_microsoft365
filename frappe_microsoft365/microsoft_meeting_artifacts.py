@@ -99,6 +99,19 @@ def _expiry_note():
 	).format(MEETING_EXPIRY_DAYS)
 
 
+def _teams_tab_note():
+	"""Where a person can see for themselves what Microsoft actually holds.
+
+	This app can only report what Graph answers, and Graph goes quiet for reasons that have
+	nothing to do with the meeting — an expired one, a tenant switch, a permission. Teams shows
+	the same meeting's files from the other side, so a single look there splits "nothing was
+	ever recorded" from "the connection cannot reach it" without anyone guessing.
+	"""
+	return _(
+		"Open the meeting in the Teams calendar and check its Recordings and Transcripts tab."
+	)
+
+
 def _event_for_artifacts(event_name, resolve=True):
 	"""The Event, its calendar and its online meeting id, with every precondition checked."""
 	doc = frappe.get_doc("Event", event_name)
@@ -111,8 +124,20 @@ def _event_for_artifacts(event_name, resolve=True):
 
 	calendar = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(calendar)
-	if not calendar.enabled or not calendar.authorized:
-		frappe.throw(_("The Microsoft Calendar for this event is disabled or not authorized."))
+	# Split, because from here the two are indistinguishable and their fixes are not: one is a
+	# tickbox on a form, the other is a sign-in that has to happen in a browser. "Disabled or
+	# not authorized" made the reader go and check both.
+	if not calendar.enabled:
+		frappe.throw(
+			_("The Microsoft Calendar {0} is switched off. Open it and tick Enabled.").format(calendar_name)
+		)
+	if not calendar.authorized:
+		frappe.throw(
+			_(
+				"The Microsoft Calendar {0} is not signed in to Microsoft. Open it and click "
+				"Authorize Microsoft Access."
+			).format(calendar_name)
+		)
 
 	# Gated on the start, never on the booked end. A calendar slot is a reservation, not a
 	# record: people book an hour and talk for four minutes, and Microsoft has the transcript
@@ -126,10 +151,24 @@ def _event_for_artifacts(event_name, resolve=True):
 
 	meeting_id = doc.get("custom_microsoft_online_meeting_id")
 	if not meeting_id and resolve:
-		meeting_id = _resolve_online_meeting_id(calendar_name, join_url)
+		from frappe_microsoft365 import microsoft_transcripts as ms
+
+		try:
+			meeting_id = _resolve_online_meeting_id(calendar_name, join_url)
+		except MsGraphError as e:
+			# This step needs OnlineMeetings.ReadWrite, which the transcript permission does not
+			# include — so it is the one that fails for people who granted transcript consent and
+			# stopped. Left to fall through, the dialog showed a raw Graph 403 against a path
+			# nobody recognises.
+			ms._wrap_join_url_403(e)
 		if not meeting_id:
+			# Matched nothing rather than refused. An external organiser's meeting lives in their
+			# tenant and is not in this one at all, which is the cause that "too old" hides.
 			frappe.throw(
-				_("Microsoft could not match this join link to a meeting. {0}").format(_expiry_note())
+				_(
+					"Microsoft could not match this join link to a meeting — either another "
+					"organisation hosted it, or it has aged out. {0}"
+				).format(_expiry_note())
 			)
 		frappe.db.set_value(
 			"Event", doc.name, "custom_microsoft_online_meeting_id", meeting_id, update_modified=False
@@ -269,7 +308,12 @@ def describe_state(state):
 	if kind == "partial":
 		missing = _("recording") if state["has_transcript"] else _("transcript")
 		if not state["next_check"]:
-			return _("Microsoft never produced the {0} for this meeting.").format(missing)
+			# One side landed, so the connection and the permissions are demonstrably fine —
+			# which makes "nobody started it" the likely answer and a setup hunt a waste.
+			return _(
+				"Microsoft never produced the {0} for this meeting, so it was most likely never "
+				"started. {1}"
+			).format(missing, _teams_tab_note())
 		return _("Microsoft has not finished the {0} yet. {1} {2}").format(
 			missing, _next_step(state), _processing_note()
 		)
@@ -288,13 +332,23 @@ def describe_state(state):
 		)
 
 	if kind == "nothing_found":
+		# "You can still check by hand" was the end of the road: true, and nothing a person could
+		# act on. Graph answering 200-with-nothing all day is usually a meeting nobody recorded,
+		# but it looks identical to a connection that cannot reach what exists — and this branch
+		# is reached from the form, which never sees the 403 the catch-up job stored. One look in
+		# Teams tells those apart, so name it and name what to do with each answer.
 		return _(
 			"Microsoft still has no transcript or recording a day after this meeting, so it was "
-			"most likely never recorded or transcribed. You can still check by hand."
-		)
+			"most likely never recorded or transcribed. {0} If either is there, the gap is in this "
+			"connection: run Microsoft Settings > Troubleshoot > Run Diagnostics."
+		).format(_teams_tab_note())
 
 	if kind == "expired":
-		return _("This meeting is too old. {0}").format(_expiry_note())
+		# Graph stops serving long before Teams deletes anything, so "too old" on its own sends
+		# people away from files that are still sitting there.
+		return _("This meeting is too old, but the files may still exist. {0} {1}").format(
+			_expiry_note(), _teams_tab_note()
+		)
 
 	return _("This event has no Teams meeting.")
 
@@ -329,8 +383,9 @@ def fetch_meeting_artifacts(event: str):
 def _fetch_into(doc, calendar_name, meeting_id):
 	"""Ask Graph, write what came back, record the attempt. Never raises for 'not ready yet'.
 
-	A transcript error and a recording error are kept apart: recordings need their own
-	permission and licence, and a tenant that refuses them must not cost you the transcript.
+	A transcript error and a recording error are kept apart: recordings are consented
+	separately, and a tenant that refuses them must not cost you the transcript — nor answer
+	the refusal with advice about transcripts.
 	"""
 	from frappe_microsoft365 import microsoft_transcripts as ms
 
@@ -342,7 +397,13 @@ def _fetch_into(doc, calendar_name, meeting_id):
 		transcripts, error = [], str(e)
 	else:
 		if transcripts:
-			attached = _attach_transcripts(doc, calendar_name, meeting_id, transcripts)
+			try:
+				attached = _attach_transcripts(doc, calendar_name, meeting_id, transcripts)
+			except MsGraphError as e:
+				# Raised only when every part was refused; anything partial has already been
+				# saved. Routed through the same field as the others so one refusal is reported
+				# once, with its own hint, rather than escaping as a bare traceback.
+				error = str(e)
 
 	try:
 		recordings = ms.list_recordings(calendar_name, meeting_id)
@@ -414,17 +475,25 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 
 	ordered = sorted(transcripts, key=lambda t: t.get("created_date_time") or "")
 	contents = []
+	refusal = None
 	for transcript in ordered:
 		try:
 			content = ms.get_transcript_content(calendar_name, meeting_id, transcript["id"]).get(
 				"content"
 			)
-		except MsGraphError:
+		except MsGraphError as e:
+			# One part failing must not cost the others, so this keeps going — but it is kept,
+			# not dropped. Microsoft listing a transcript it will not then hand over is a
+			# refusal, and swallowing it reported "Microsoft has not finished processing" about
+			# a transcript that was finished and being withheld.
+			refusal = refusal or e
 			continue
 		if content:
 			contents.append((transcript.get("created_date_time"), content))
 
 	if not contents:
+		if refusal:
+			raise refusal
 		return []
 
 	_delete_previous_transcripts(doc)
@@ -564,7 +633,11 @@ def download_recording(event: str, recording_id: str | None = None):
 
 	if not recording_id:
 		if not stored:
-			frappe.throw(_("Microsoft has no recording for this meeting. {0}").format(_expiry_note()))
+			frappe.throw(
+				_("Microsoft has no recording for this meeting, so most likely nobody started one. {0}").format(
+					_teams_tab_note()
+				)
+			)
 		recording_id = stored[0]["id"]
 	elif stored and recording_id not in [r.get("id") for r in stored]:
 		# The id has to have come from this Event, or this endpoint becomes a way to pull any
@@ -586,8 +659,19 @@ def download_recording(event: str, recording_id: str | None = None):
 			stream=True,
 		)
 	except MsGraphError as e:
+		detail = str(e)
+		if "403" in detail or "Forbidden" in detail:
+			# Listing a recording and reading its bytes take the same permission, so a 403 that
+			# only appears here is consent that was never granted — not this meeting ageing out.
+			# The expiry note would send someone hunting in OneDrive for a file Microsoft is
+			# refusing rather than missing.
+			from frappe_microsoft365 import microsoft_transcripts as ms
+
+			frappe.throw(
+				_("Microsoft refused this recording: {0}. {1}").format(detail, ms._recording_perm_hint())
+			)
 		frappe.throw(
-			_("Microsoft could not give us the recording: {0}. {1}").format(str(e), _expiry_note())
+			_("Microsoft could not give us the recording: {0}. {1}").format(detail, _expiry_note())
 		)
 
 	suffix = f"-part-{part}" if len(stored) > 1 else ""

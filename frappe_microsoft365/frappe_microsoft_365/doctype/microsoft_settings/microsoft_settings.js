@@ -17,6 +17,7 @@ frappe.ui.form.on("Microsoft Settings", {
 	...scope_handlers,
 	refresh(frm) {
 		frm.add_custom_button(__("Set Up"), () => show_plan(frm)).addClass("btn-primary");
+		frm.add_custom_button(__("Setup Guide"), () => setup_guide());
 		frm.add_custom_button(__("Run Diagnostics"), () => run_diagnostics(), __("Troubleshoot"));
 		frm.add_custom_button(__("Explain an Error"), () => explain_error(), __("Troubleshoot"));
 		frm.add_custom_button(__("Exchange Setup Script"), () => powershell(), __("Troubleshoot"));
@@ -25,11 +26,79 @@ frappe.ui.form.on("Microsoft Settings", {
 
 		if (!CAPABILITY_FIELDS.some((field) => frm.doc[field])) {
 			frm.dashboard.set_headline(
-				__("Pick at least one capability above, then click <b>Set Up</b>.")
+				__(
+					"Pick at least one capability above, then click <b>Set Up</b>. <b>Setup Guide</b> walks the Microsoft side in the order it has to happen."
+				)
 			);
 		}
 	},
 });
+
+// The Microsoft side spans two portals and Frappe, and the order is the whole point: a token
+// carries only what was consented before it was issued, and the tenant switch transcripts need
+// lives somewhere nobody thinks to look. The README says all of this, but the person who needs it
+// is on this screen, not on GitHub.
+function setup_guide() {
+	frappe.call({
+		method: "frappe_microsoft365.doctor.setup_guide",
+		freeze: true,
+		freeze_message: __("Working out your setup steps…"),
+		callback: (r) => {
+			const guide = r.message || {};
+			const esc = frappe.utils.escape_html;
+
+			const covered = (guide.capabilities || []).map((c) =>
+				esc(typeof c === "string" ? c : c.label || c.id || "")
+			);
+
+			const head = [
+				`<p class="small">${__(
+					"Do these in order. A token carries only what was consented when it was issued, so anything ticked afterwards does nothing until the connection is re-authorised."
+				)}</p>`,
+			];
+			if (covered.length) {
+				head.push(
+					`<p class="small text-muted">${__("Covers: {0}", [
+						`<b>${covered.join(", ")}</b>`,
+					])}</p>`
+				);
+			}
+
+			const steps = (guide.steps || []).map((step, index) => {
+				const rows = [
+					`<div style="margin-bottom:14px;padding-left:10px;border-left:3px solid var(--blue-400,#ccc)">`,
+					`<div><b>${index + 1}. ${esc(step.title || "")}</b></div>`,
+				];
+				// The portal path is what people scan for, so it never reads as prose.
+				if (step.where) {
+					rows.push(`<div style="margin-top:4px"><code>${esc(step.where)}</code></div>`);
+				}
+				if (step.unlocks) {
+					rows.push(`<div class="small" style="margin-top:4px">${esc(step.unlocks)}</div>`);
+				}
+				if (step.verify) {
+					rows.push(
+						`<div class="small text-muted" style="margin-top:4px"><b>${__(
+							"Check"
+						)}:</b> ${esc(step.verify)}</div>`
+					);
+				}
+				rows.push("</div>");
+				return rows.join("");
+			});
+
+			new frappe.ui.Dialog({
+				title: __("Setup Guide"),
+				size: "large",
+				fields: [{ fieldtype: "HTML", options: head.join("") + steps.join("") }],
+				primary_action_label: __("Close"),
+				primary_action(dialog) {
+					dialog.hide();
+				},
+			}).show();
+		},
+	});
+}
 
 // Show exactly what sign-in will request, so nobody has to reverse-engineer it from the
 // tickboxes — the guesswork that had admins editing the scope field by hand. Derived on the

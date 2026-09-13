@@ -13,6 +13,11 @@ This is the contract the app implements. Endpoints are Graph **v1.0**. Auth via 
   - Outlook calendar (including the Teams meeting tickbox on an Event): `User.Read`,
     `Calendars.ReadWrite`
   - Standalone Teams meetings: `+ OnlineMeetings.ReadWrite`
+> **Before any of this works:** Graph access to transcripts is a tenant switch that Microsoft
+> ships **off** — Teams admin center > Meetings > Meeting settings > Transcript API access >
+> Microsoft Graph access. With it off, every endpoint below returns
+> `403 GraphAccessToTranscriptsDisabled` regardless of permissions or consent.
+
   - Transcripts and recordings: `+ OnlineMeetingTranscript.Read.All` (needs admin consent)
 
   The form prints the exact list to grant. Do not grant more than that: asking for scopes the

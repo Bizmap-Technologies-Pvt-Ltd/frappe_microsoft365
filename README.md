@@ -44,7 +44,8 @@ in the first place.
   apart. Setting up mail or sign-in creates what each needs and never modifies anything that
   already exists.
 - **A doctor for when it breaks** — connecting Frappe to Microsoft 365 takes fifteen-odd steps
-  and almost every mistake surfaces as `AUTHENTICATE failed` or `535 5.7.3`. **Run Diagnostics**
+  across two Microsoft portals, and almost every mistake surfaces as `AUTHENTICATE failed` or
+  `535 5.7.3`. **Setup Guide** walks them in the order they have to happen; **Run Diagnostics**
   reads your configuration and names the failing step; **Explain an Error** decodes a message
   from the Error Log into a cause and a fix.
 - **Secure by design** — MSAL auth-code flow, token refresh, CSRF state validation; secrets and
@@ -82,7 +83,7 @@ in the first place.
 - Python ≥ 3.10 (whatever your Frappe version requires: v15 runs on 3.10+, v16 needs 3.14).
   The only extra dependency is **`msal`** (declared in `pyproject.toml`, installed
   automatically by `bench get-app`).
-- An **Azure AD (Microsoft Entra) app registration** — free; see [`docs/azure-setup.md`](docs/azure-setup.md).
+- An **Azure AD (Microsoft Entra) app registration** — free; walked through step by step below.
 
 ## Compatibility
 
@@ -141,8 +142,8 @@ bench --site m365.localhost migrate
 bench start          # then open http://m365.localhost:8000/app
 ```
 
-Now do the **Azure app registration** (5 minutes) following [`docs/azure-setup.md`](docs/azure-setup.md),
-then configure (below). The one value Azure needs from you is the **Redirect URI**:
+Now do the Microsoft side — *Set it up, in order*, below. The one value Entra needs from you is
+the **Redirect URI**:
 
 ```
 http://m365.localhost:8000/api/method/frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback
@@ -150,20 +151,190 @@ http://m365.localhost:8000/api/method/frappe_microsoft365.frappe_microsoft_365.d
 
 (Use your real site URL/port. `http://...localhost` is accepted by Azure for local testing.)
 
-## Configure
+## Set it up, in order
 
-1. **Frappe Desk → Microsoft Settings** → tick the capabilities you want. The **Delegated Scopes**
-   section then shows the exact permission list to grant — for calendar only that is
-   `offline_access openid profile User.Read Calendars.ReadWrite`, and nothing more.
-2. **Azure** → register an app, add the Redirect URI above (Web platform), create a client secret,
-   and grant exactly those **Delegated** Microsoft Graph permissions, then *Grant admin consent*.
-   Back in **Microsoft Settings**, paste Tenant ID, Client ID, Client Secret, the Redirect URI →
-   tick **Enabled** → Save.
-3. **Microsoft Calendar** → New → give it a name → Save → click **Authorize Microsoft Access** →
-   sign in. The account email + default calendar fill in automatically. Use **Test Connection** /
-   **Sync Now** to verify.
+Setup spans **two Microsoft portals and Frappe**, and the order is not decoration. The permission
+list depends on what you ticked in Frappe; the tenant switch in step 7 lives in a portal most
+people never open; and the token you end up with carries only the permissions that were consented
+*before* it was issued. Done out of order, every one of those bites you as a 403 that names
+nothing.
 
-Full walkthrough with screenshots-worthy detail: [`docs/azure-setup.md`](docs/azure-setup.md).
+The same checklist is available inside the app: **Microsoft Settings → Setup Guide**.
+
+### 1. Frappe — tick the capabilities you want
+
+`Microsoft Settings → Capabilities`
+
+Calendar, Teams meetings, transcripts, mail and sign-in are independent — tick what you want and
+leave the rest alone. **Delegated Scopes**, immediately below, then prints the exact permission
+list to grant. Copy it: step 5 is nothing but pasting it into Entra.
+
+Do this first. Which permissions to grant, and whether you have to visit the Teams admin center at
+all, both follow from it.
+
+### 2. Entra — register the application
+
+`entra.microsoft.com → Entra ID → App registrations → New registration`
+
+- **Name:** anything you will recognise later, e.g. `Frappe Microsoft 365`.
+- **Supported account types:** *Accounts in this organizational directory only* unless people from
+  other Microsoft work/school tenants have to connect. Personal Microsoft accounts cannot use the
+  Teams or transcript permissions at all.
+- Leave the redirect URI blank — it is the next step.
+
+Afterwards, from the app's **Overview** page, copy **Application (client) ID** and **Directory
+(tenant) ID**. You paste both into Frappe in step 8.
+
+### 3. Entra — add the redirect URI
+
+`Your app → Authentication → Add a platform → Web`
+
+```
+https://<your-site>/api/method/frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback
+```
+
+The platform must be **Web** — this is a confidential client with a secret, not a SPA. The URI has
+to match what Frappe sends *exactly*: scheme, host, port, path. `http://` is accepted for
+`localhost` hosts, so local testing works. A mismatch surfaces at sign-in as `AADSTS50011` and
+never says which character is wrong.
+
+### 4. Entra — create a client secret
+
+`Your app → Certificates & secrets → Client secrets → New client secret`
+
+**Copy the Value, not the Secret ID.** Azure prints them side by side in the same row, only the
+Value works, and it is shown once and never again. Microsoft's only comment on the mix-up is
+`AADSTS7000215` at sign-in, long after you have moved on — which is why Microsoft Settings refuses
+a secret that looks like a GUID on save.
+
+Note the expiry date. Secrets expire and sign-in stops working the day they do.
+
+### 5. Entra — add the delegated permissions
+
+`Your app → API permissions → Add a permission → Microsoft Graph → Delegated permissions`
+
+Add exactly what Microsoft Settings printed in step 1 — no more. Asking for scopes the tenant never
+consented to is itself a way to make sign-in fail.
+
+**Granting one does not imply the others.** They stack:
+
+| Ticked in Frappe | Delegated Microsoft Graph permissions |
+| --- | --- |
+| Outlook calendar | `User.Read` `Calendars.ReadWrite` |
+| Standalone Teams meetings | `User.Read` `OnlineMeetings.ReadWrite` |
+| Meeting transcripts and recordings | the row above, **plus** `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+
+Transcripts are the row people get wrong, and all three permissions are load-bearing.
+`OnlineMeetingTranscript.Read.All` reads a transcript you can already address by online meeting id
+— but you start from a join URL, and turning that into a meeting id is `OnlineMeetings.ReadWrite`.
+Recordings are consented separately again as `OnlineMeetingRecording.Read.All`, because Microsoft
+treats reading the words and reading the video as different permissions and plenty of tenants grant
+one and refuse the other. Frappe enforces the first half: *Meeting transcripts and recordings* only
+appears once *Standalone Teams meetings* is on, and is cleared if you turn that back off.
+
+`offline_access`, `openid` and `profile` are requested automatically at sign-in and never belong in
+a list you maintain — but `offline_access` still has to be **granted here** like any other, or
+Microsoft issues no refresh token and the connection dies when the first access token expires.
+
+Mail and sign-in are not Graph permissions at all; their lists are in *Set up only what you want*.
+
+### 6. Entra — grant admin consent, and check it took
+
+`Your app → API permissions → Grant admin consent for <tenant>`
+
+Then read the **Status** column. Every permission you added should show a green tick and
+**Granted for &lt;tenant&gt;**. A row still reading *Not granted* is a permission that will 403 at
+runtime however correctly the app asks for it.
+
+If the button is greyed out, your account cannot consent — a Privileged Role Administrator or
+Cloud Application Administrator has to do this step for you.
+
+### 7. Teams admin center — turn on transcript API access
+
+**Only if you ticked transcripts.** Skip this step otherwise.
+
+`admin.teams.microsoft.com → Meetings → Meeting settings → Transcript API access`
+
+This is a **different portal from Entra**, and consent is no substitute for it. Microsoft added a
+tenant-level switch for Graph access to transcripts in 2026 and **ships it off**, so a tenant with
+every permission granted and consented still gets:
+
+```
+403 Forbidden: Graph API access to transcripts is disabled for this tenant.
+```
+
+Turn **Microsoft Graph access** **On**. Then select **Configure** and turn **Include speaker
+attribution** **On** if you want speaker names in the VTT — that one is off by default too, and
+without it the transcript is text with nobody's name against it.
+
+The PowerShell equivalent, if you would rather not click:
+
+```powershell
+Set-CsTeamsMeetingConfiguration -EnableGraphTranscriptAccess true -EnableAttributedTranscripts true -Identity Global
+```
+
+There is no request-side workaround and re-granting consent does nothing, which is why both the
+error message and the doctor name this switch specifically rather than blaming permissions.
+
+### 8. Frappe — paste the credentials and enable
+
+`Microsoft Settings → Azure AD Application`
+
+Paste **Tenant ID**, **Client ID** and the secret **Value** from step 4, tick **Enabled**, Save.
+
+Leave **Redirect URI** blank unless the site's public URL is not what Frappe computes — blank uses
+the site URL, which is right for most installs. If you do fill it in, it must match the URI you
+registered in step 3 character for character.
+
+### 9. Frappe — Set Up (only if you ticked mail or sign-in)
+
+`Microsoft Settings → Set Up`
+
+Calendar, Teams and transcripts need nothing created; this app talks to Graph directly. This step
+exists for **Outlook mail**, which needs a `Connected App` for Frappe's Email Account, and **Sign
+in with Microsoft**, which needs a `Social Login Key`. Set Up shows a plan first and only ever
+creates what is missing — anything that already exists is reported and left exactly as it is.
+
+The mail `Connected App` has a redirect URI of its own, computed by Frappe from the record name, so
+it cannot be known until the record exists. Register that one in Entra too; **Run Diagnostics**
+prints the exact URI. A missing one shows up later as `AADSTS50011`.
+
+### 10. Frappe — authorize a connection
+
+`Microsoft Calendar → New → Save → Authorize Microsoft Access`
+
+Give the connection an **Account Name**, set **User** to the person it belongs to, Save, then
+authorize and sign in as that person. The Microsoft account email and default calendar fill in
+automatically.
+
+Two toggles here are off on purpose. **Push Frappe events to Microsoft** stays off until you want
+Frappe writing into a real calendar. **Fetch transcripts after meetings** stays off until you want
+them collected without anyone pressing a button.
+
+**If a connection already existed when you changed the capabilities, Re-authorize it.** A token
+carries the permissions consented when it was issued; ticking another capability does not widen a
+token that already exists, and the new feature fails with a 403 that explains nothing. This is why
+step 1 is step 1. **Scopes Last Authorised** on Microsoft Settings records what the last sign-in
+actually asked for, and Run Diagnostics compares it against what is requested now.
+
+### 11. Verify
+
+- **Microsoft Settings → Troubleshoot → Run Diagnostics.** It reads the whole configuration —
+  settings, the Connected App, every Email Account, the authorised scopes — and names the failing
+  step instead of the symptom.
+- **The Delegated Scopes preview** shows exactly what sign-in will request. If it lists something
+  you did not grant in step 5, sign-in fails; if you granted something it does not list, you
+  granted more than this app will ever use.
+- **Microsoft Calendar → Test Connection**, then **Sync Now**. A working sync reports *Pulled n,
+  deleted n, pushed n*.
+- **Transcripts:** open an Event whose Teams meeting has finished and click **Get Transcript &
+  Recording**. Working looks like a `.vtt` attached to the Event and the recordings listed on it.
+  *Microsoft has not finished processing this meeting* is a normal answer in the first half hour —
+  see *Transcripts and recordings*. A 403 naming the tenant is step 7; a 403 naming permissions is
+  step 5 or 6.
+
+Azure-side detail beyond this, including the app-only path for shared mailboxes:
+[`docs/azure-setup.md`](docs/azure-setup.md).
 
 ## How the sync behaves
 
@@ -402,21 +573,17 @@ kilobytes and is the part people search and quote, so that one *is* kept.
 **One tenant switch, and it ships off.** Microsoft added a tenant-level control for Graph
 access to transcripts in 2026 and **defaults it to off**, so a tenant with every permission
 consented still gets `403 Forbidden: Graph API access to transcripts is disabled for this
-tenant`. In the **Teams admin center**: *Meetings > Meeting settings > Transcript API access*,
-turn **Microsoft Graph access** On (and *Configure > Include speaker attribution* On if you want
-speaker names in the VTT). There is no request-side workaround, and re-granting consent does
-nothing — which is why both the error message and the doctor name this switch specifically
-rather than blaming permissions.
+tenant`. It lives in the Teams admin center, not Entra — step 7 of *Set it up, in order*. There
+is no request-side workaround, and re-granting consent does nothing, which is why both the error
+message and the doctor name this switch specifically rather than blaming permissions.
 
-**Requirements.** This is the **Transcripts** capability, which needs
-`OnlineMeetingTranscript.Read.All`; recordings additionally need
-`OnlineMeetingRecording.Read.All` and a Teams licence that records. Microsoft consents to reading
-the words and reading the video separately, so a tenant that refuses recordings still gets
-transcripts rather than losing both. Transcripts build on **Standalone Teams meetings**
-(`OnlineMeetings.ReadWrite`), because a transcript is addressed by online meeting id and
-resolving that from a join link needs it. Only meetings created **as calendar events** have
-transcripts at all — standalone Teams meetings do not, which is why this app creates them the
-calendar way.
+**Requirements.** Three delegated permissions, not one: `OnlineMeetings.ReadWrite` to turn a join
+link into the meeting the transcript belongs to, `OnlineMeetingTranscript.Read.All` to read the
+transcript, and `OnlineMeetingRecording.Read.All` for the recordings — which also need a Teams
+licence that records. Microsoft consents to reading the words and reading the video separately, so
+a tenant that refuses recordings still gets transcripts rather than losing both. Only meetings
+created **as calendar events** have transcripts at all — standalone Teams meetings do not, which
+is why this app creates them the calendar way.
 
 **Why not webhooks?** Graph can push a notification the moment a transcript appears, but the
 tenant-wide subscriptions (`getAllTranscripts`, `getAllRecordings`) are **application-permission
@@ -473,13 +640,28 @@ endpoint/permission contract, and [`docs/azure-setup.md`](docs/azure-setup.md) f
 
 ## Troubleshooting
 
-- **Redirect URI mismatch (AADSTS50011):** the Redirect URI in Microsoft Settings must match the one
-  registered in Azure *exactly* (scheme, host, port, path).
-- **Transcript 403 / empty:** transcripts need `OnlineMeetingTranscript.Read.All` + admin consent, the
-  meeting must be **calendar-associated** (create it via Microsoft Calendar / `create_meeting`, not a
-  standalone online meeting) and **not expired**.
-- **Token errors after a while:** click **Re-authorize** on the Microsoft Calendar; refresh tokens
-  rotate automatically but a revoked consent requires re-auth.
+Step numbers refer to *Set it up, in order*.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `403 Forbidden: Graph API access to transcripts is disabled for this tenant` (inner error `GraphAccessToTranscriptsDisabled`) | The tenant switch, which Microsoft ships **off**. Not a permission problem | Step 7. Teams admin center, not Entra. Re-granting consent does nothing |
+| `403` on transcripts naming permissions or authorization | `OnlineMeetingTranscript.Read.All` missing, or granted but never consented | Steps 5 and 6, then **Re-authorize** every Microsoft Calendar |
+| Transcripts work, recordings 403 | `OnlineMeetingRecording.Read.All` is consented separately, and a Teams licence that records is needed | Add it in step 5, consent, Re-authorize |
+| `Microsoft could not match this join link to a meeting` | Only `OnlineMeetingTranscript.Read.All` was granted; turning a join URL into a meeting id is a different permission — or the meeting has expired | Add `OnlineMeetings.ReadWrite` (step 5), consent, Re-authorize |
+| Speaker names missing from the `.vtt` | *Include speaker attribution* is off by default | Step 7 → **Configure** |
+| A newly ticked capability 403s while everything else works | Tokens carry the scopes consented when they were issued, and do not widen | **Re-authorize** each Microsoft Calendar. Run Diagnostics names which ones |
+| Works for an hour, then needs re-authorising forever | `offline_access` was never granted, so Microsoft returns no refresh token | Grant `offline_access` (step 5), consent, Re-authorize |
+| `AADSTS50011` | The redirect URI does not match one registered on the app, to the character | Step 3. The mail `Connected App` has a second URI of its own — Run Diagnostics prints it |
+| `AADSTS7000215` / `invalid_client` | The Secret ID was pasted instead of the secret Value, or the secret expired | Step 4. Create a new secret and copy the **Value** column |
+| `AADSTS65001` | Admin consent was never granted | Step 6 |
+| `AADSTS700016` | The application is not in this tenant | Wrong Tenant ID in step 8, or the app was never consented into the tenant |
+| `invalid_grant` | The refresh token expired, or consent or the password changed | **Re-authorize**. Recurring within hours means `offline_access` is missing |
+| Transcript list is empty on a meeting you know was transcribed | Processing lag, a standalone (not calendar-associated) meeting, or a meeting past its expiry | Wait — the app keeps asking for a day. See *Transcripts and recordings* |
+| `AUTHENTICATE failed` / `535 5.7.3` on mail | A dozen unrelated causes, all rendered identically | **Explain an Error**, then Run Diagnostics — the shared-mailbox identity conflict is one of them |
+| `Unknown column 'custom_..._microsoft...'` | The app's custom fields are not on this site | `bench --site <site> migrate` |
+
+**Explain an Error** (Microsoft Settings → Troubleshoot) decodes any message from the Error Log
+into a cause and a next step, including ones not listed here.
 
 ## Contributing
 

@@ -219,6 +219,49 @@ class TestFetchArtifacts(ArtifactsTestCase):
 		self.assertEqual(len(result["transcripts"]), 1)
 		self.assertEqual(result["recordings"], 0)
 
+	def test_a_transcript_microsoft_will_not_hand_over_is_reported_not_hidden(self):
+		"""Listing a transcript and then refusing its content is a refusal, not a delay.
+
+		The refusal used to be swallowed by the loop that reads each part, so the fetch came back
+		empty and the form said "Microsoft has not finished processing this meeting" — about a
+		transcript that was finished and being withheld, with the hint that named the fix thrown
+		away on the way past.
+		"""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		event = self._finished_meeting()
+
+		with patch.object(
+			ms, "list_transcripts", return_value=[{"id": "t1", "created_date_time": "2026-09-12T11:00:00Z"}]
+		), patch.object(
+			ms, "get_transcript_content", side_effect=MsGraphError("403 Forbidden: read the hint")
+		), patch.object(ms, "list_recordings", return_value=[]):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.fetch_meeting_artifacts(event.name)
+
+		self.assertIn("read the hint", str(ctx.exception))
+
+	def test_one_refused_part_does_not_cost_the_parts_that_worked(self):
+		"""Transcription restarts mid-meeting, so parts fail independently. Reporting the refusal
+		must not go so far as to throw away an hour of transcript that came back fine."""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		event = self._finished_meeting()
+
+		with patch.object(
+			ms,
+			"list_transcripts",
+			return_value=[
+				{"id": "t1", "created_date_time": "2026-09-12T11:00:00Z"},
+				{"id": "t2", "created_date_time": "2026-09-12T12:00:00Z"},
+			],
+		), patch.object(
+			ms, "get_transcript_content", side_effect=[{"content": VTT}, MsGraphError("403 Forbidden")]
+		), patch.object(ms, "list_recordings", return_value=[]):
+			result = artifacts.fetch_meeting_artifacts(event.name)
+
+		self.assertEqual(len(result["transcripts"]), 1)
+
 	def test_an_error_from_microsoft_is_repeated_not_reinterpreted(self):
 		"""The one thing worse than a Graph error is a guess about what it meant."""
 		from frappe_microsoft365.microsoft_graph import MsGraphError
@@ -305,6 +348,24 @@ class TestWhatItSays(ArtifactsTestCase):
 		self.assertEqual(result["state"], "nothing_found")
 		self.assertIn("never recorded", result["message"].lower())
 
+	def test_a_day_later_it_also_says_what_to_go_and_look_at(self):
+		"""The old ending, "you can still check by hand", named no hand and no thing to check.
+
+		Graph answering 200-with-nothing all day looks identical whether nobody recorded the
+		meeting or this connection cannot reach what exists — and this sentence is built from the
+		Event's own fields, so it never sees the 403 the catch-up job stored. One look at the
+		meeting in Teams separates the two, which makes it the only advice worth giving here.
+		"""
+		event = self._finished_meeting(ended_hours_ago=30)
+		event.db_set("custom_microsoft_artifacts_attempts", len(artifacts.RETRY_MINUTES), update_modified=False)
+		event.reload()
+
+		message = self._fetch(event)["message"]
+
+		self.assertIn("Recordings and Transcripts", message)
+		self.assertIn("Run Diagnostics", message)
+		self.assertNotIn("by hand", message)
+
 	def test_after_sixty_days_it_says_the_meeting_is_too_old(self):
 		event = self._finished_meeting(ended_hours_ago=24 * (artifacts.MEETING_EXPIRY_DAYS + 5))
 
@@ -312,6 +373,28 @@ class TestWhatItSays(ArtifactsTestCase):
 
 		self.assertEqual(result["state"], "expired")
 		self.assertIn("too old", result["message"].lower())
+
+	def test_too_old_to_fetch_is_not_the_same_as_gone(self):
+		"""Graph stops serving at 60 days; Teams keeps the files on a retention policy that
+		defaults to 120. "Too old" alone sends someone away from a recording still sitting in
+		the meeting's own tab."""
+		event = self._finished_meeting(ended_hours_ago=24 * (artifacts.MEETING_EXPIRY_DAYS + 5))
+
+		message = self._fetch(event)["message"]
+
+		self.assertIn("may still exist", message)
+		self.assertIn("Recordings and Transcripts", message)
+
+	def test_one_artifact_that_never_arrived_points_at_the_meeting_not_the_setup(self):
+		"""The transcript landing proves the connection and the permissions work, so the missing
+		recording is about the meeting. Sending someone to Azure from here wastes an afternoon."""
+		event = self._finished_meeting(ended_hours_ago=24 * (artifacts.MEETING_EXPIRY_DAYS + 5))
+
+		result = self._fetch(event, transcripts=[{"id": "t1", "created_date_time": "2026-07-12T11:00:00Z"}])
+
+		self.assertEqual(result["state"], "partial")
+		self.assertIn("never started", result["message"])
+		self.assertIn("Recordings and Transcripts", result["message"])
 
 	def test_a_finished_fetch_says_what_landed(self):
 		event = self._finished_meeting()
@@ -652,7 +735,7 @@ class TestTheTenantSwitch(ArtifactsTestCase):
 		from frappe_microsoft365.microsoft_graph import MsGraphError
 
 		with self.assertRaises(frappe.ValidationError) as ctx:
-			ms._wrap_403(MsGraphError(self.GRAPH_403), ms._PERM_HINT)
+			ms._wrap_403(MsGraphError(self.GRAPH_403), ms._transcript_perm_hint())
 
 		said = str(ctx.exception)
 		self.assertIn("Teams admin center", said)
@@ -666,7 +749,7 @@ class TestTheTenantSwitch(ArtifactsTestCase):
 		from frappe_microsoft365.microsoft_graph import MsGraphError
 
 		with self.assertRaises(frappe.ValidationError) as ctx:
-			ms._wrap_403(MsGraphError("Graph GET /x failed (403): Forbidden"), ms._PERM_HINT)
+			ms._wrap_403(MsGraphError("Graph GET /x failed (403): Forbidden"), ms._transcript_perm_hint())
 
 		self.assertIn("OnlineMeetingTranscript.Read.All", str(ctx.exception))
 
@@ -701,3 +784,203 @@ class TestTheTenantSwitch(ArtifactsTestCase):
 		explained = doctor.explain_error("Microsoft Graph GET /me/events failed (403): Forbidden")
 
 		self.assertNotIn("Transcript API access", explained.get("detail") or "")
+
+
+class TestWhichPermissionIsMissing(ArtifactsTestCase):
+	"""Three Microsoft refusals that read identically and are fixed in three different places.
+
+	The report behind this: a tenant that had granted transcript consent was told to grant
+	transcript consent, by a 403 that was really about something else. Every message below has
+	to send someone somewhere they have not already been.
+	"""
+
+	def _forbidden(self, path):
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		return MsGraphError(f"Microsoft Graph GET {path} failed (403): Forbidden")
+
+	def test_a_recordings_403_is_not_answered_with_the_transcript_fix(self):
+		"""Microsoft consents to reading video separately from reading words: a tenant happy with
+		one often refuses the other, so the two 403s are different problems with different fixes."""
+		with patch.object(
+			graph, "graph_request", side_effect=self._forbidden("/me/onlineMeetings/m1/recordings")
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				ms.list_recordings(CALENDAR, "m1")
+
+		said = str(ctx.exception)
+		self.assertIn("OnlineMeetingRecording.Read.All", said)
+		self.assertNotIn("OnlineMeetingTranscript.Read.All", said)
+		self.assertIn("API permissions", said, "a permission nobody can find is not a fix")
+
+	def test_a_transcripts_403_is_not_answered_with_the_recording_fix(self):
+		with patch.object(
+			graph, "graph_request", side_effect=self._forbidden("/me/onlineMeetings/m1/transcripts")
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				ms.list_transcripts(CALENDAR, "m1")
+
+		said = str(ctx.exception)
+		self.assertIn("OnlineMeetingTranscript.Read.All", said)
+		self.assertNotIn("OnlineMeetingRecording.Read.All", said)
+
+	def test_the_transcript_and_recording_advice_are_not_the_same_sentence(self):
+		"""Both reach the user through one wrapper, and one shared hint is exactly how two causes
+		became one indistinguishable message."""
+		self.assertNotEqual(ms._transcript_perm_hint(), ms._recording_perm_hint())
+
+	def test_a_403_resolving_the_join_link_names_the_meetings_permission(self):
+		"""Mapping a join link to a meeting id is /me/onlineMeetings, which needs
+		OnlineMeetings.ReadWrite — a permission neither transcript nor recording consent
+		includes. People tick transcripts, grant that, and stop, so this is the step that fails
+		for them; it used to surface as a raw Graph 403 against a path nobody recognises."""
+		event = self._finished_meeting(custom_microsoft_online_meeting_id=None)
+
+		with patch.object(
+			artifacts,
+			"_resolve_online_meeting_id",
+			side_effect=self._forbidden("/me/onlineMeetings?$filter=JoinWebUrl eq 'x'"),
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.fetch_meeting_artifacts(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("OnlineMeetings.ReadWrite", said)
+		self.assertIn("Standalone Teams meetings", said, "name the tickbox that asks for it")
+		self.assertNotIn("OnlineMeetingTranscript.Read.All", said)
+
+	def test_a_join_link_that_matches_nothing_is_not_called_a_permission_problem(self):
+		"""An empty answer is not a refusal. Microsoft never saw this meeting — most often
+		because another organisation hosted it — and no permission will change that."""
+		event = self._finished_meeting(custom_microsoft_online_meeting_id=None)
+
+		with patch.object(artifacts, "_resolve_online_meeting_id", return_value=None):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.fetch_meeting_artifacts(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("another organisation", said)
+		self.assertNotIn("OnlineMeetings.ReadWrite", said)
+
+	def test_a_403_downloading_a_recording_is_consent_not_expiry(self):
+		"""Listing a recording and reading its bytes take the same permission, so a 403 that
+		appears only at download time is consent that was never granted. The expiry note sent
+		someone hunting through OneDrive for a file Microsoft was refusing, not missing."""
+		event = self._finished_meeting()
+		event.db_set("custom_microsoft_recordings_data", '[{"id": "r1"}]', update_modified=False)
+
+		with patch.object(
+			graph, "graph_request", side_effect=self._forbidden("/recordings/r1/content")
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.download_recording(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("OnlineMeetingRecording.Read.All", said)
+		self.assertNotIn("60 days", said)
+
+
+class TestTheConnectionItself(ArtifactsTestCase):
+	"""Two states of one record that used to share a sentence, and share no fix."""
+
+	def test_a_switched_off_calendar_names_the_tickbox(self):
+		"""Saying "disabled or not authorized" made the reader check both, one of which was fine."""
+		event = self._finished_meeting()
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "enabled", 0)
+		self.addCleanup(frappe.db.set_value, "Microsoft Calendar", CALENDAR, "enabled", 1)
+
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			artifacts.fetch_meeting_artifacts(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("tick Enabled", said)
+		self.assertNotIn("Authorize", said)
+
+	def test_a_calendar_nobody_signed_into_names_the_button(self):
+		event = self._finished_meeting()
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "authorized", 0)
+		self.addCleanup(frappe.db.set_value, "Microsoft Calendar", CALENDAR, "authorized", 1)
+
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			artifacts.fetch_meeting_artifacts(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("Authorize Microsoft Access", said)
+		self.assertNotIn("tick Enabled", said)
+
+
+#: A dialog is read standing up, once. Two sentences of cause and action land; a paragraph is
+#: skipped, which costs more than saying nothing at all. The longest message here is the
+#: nothing-found one at a little over 300 characters, so this ceiling leaves room to rephrase
+#: and none to append.
+MAX_MESSAGE_CHARS = 340
+
+
+class TestTheMessagesStayReadable(ArtifactsTestCase):
+	"""Advice is only advice if someone reads it to the end."""
+
+	def _state(self, kind, **overrides):
+		"""A state dict by hand: describe_state is pure, and building every branch through the
+		database would test the state machine again rather than the sentences."""
+		state = {
+			"state": kind,
+			"has_transcript": False,
+			"recordings": 0,
+			"attempts": 0,
+			"expires_on": None,
+			"next_check": None,
+			"auto": False,
+			"still_booked": False,
+			"booked_until": None,
+		}
+		state.update(overrides)
+		return state
+
+	def _every_message(self):
+		later = add_to_date(now_datetime(), hours=2)
+		described = {
+			"not started": self._state("not_started"),
+			"complete, both": self._state("complete", has_transcript=True, recordings=2),
+			"complete, transcript only": self._state("complete", has_transcript=True),
+			"complete, recording only": self._state("complete", recordings=1),
+			"partial, still trying": self._state(
+				"partial", has_transcript=True, next_check=later, auto=True
+			),
+			"partial, given up": self._state("partial", has_transcript=True),
+			"processing, inside the slot": self._state(
+				"processing", still_booked=True, booked_until=later, next_check=later, auto=True
+			),
+			"processing": self._state("processing", next_check=later, auto=True),
+			"processing, nothing scheduled": self._state("processing", next_check=later),
+			"nothing found": self._state("nothing_found"),
+			"expired": self._state("expired"),
+			"no meeting": self._state("no_meeting"),
+		}
+		messages = {name: artifacts.describe_state(state) for name, state in described.items()}
+		messages.update(
+			{
+				"transcript permission": ms._transcript_perm_hint(),
+				"recording permission": ms._recording_perm_hint(),
+				"online meetings permission": ms._online_meetings_hint(),
+				"tenant switch": ms._tenant_switch_hint(),
+				"expiry note": artifacts._expiry_note(),
+				"teams tab note": artifacts._teams_tab_note(),
+				"processing note": artifacts._processing_note(),
+			}
+		)
+		return messages
+
+	def test_no_message_grows_into_a_wall_of_text(self):
+		"""Every one of these was added to answer a real support question, and the next one will
+		be too. The ceiling is what stops the answers accumulating into a paragraph nobody finishes.
+
+		Graph's own text is excluded on purpose: this bounds what we wrote, not what Microsoft said.
+		"""
+		for name, message in self._every_message().items():
+			with self.subTest(message=name):
+				self.assertTrue(message.strip(), "a state with no sentence explains nothing")
+				self.assertLessEqual(
+					len(message),
+					MAX_MESSAGE_CHARS,
+					f"{name!r} is {len(message)} characters: say less, or say it elsewhere",
+				)
