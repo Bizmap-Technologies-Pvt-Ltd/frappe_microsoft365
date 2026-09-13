@@ -835,7 +835,27 @@ def _upsert_event(doc, ev, existing_map=None):
 	# the Event this call just created instead of creating another one beside it.
 	if existing_map is not None:
 		existing_map[ms_id] = event.name
+	_give_it_to_its_owner(event.name, doc.user)
 	return "created"
+
+
+def _give_it_to_its_owner(event_name, user):
+	"""A pulled event belongs to the person whose calendar it came from.
+
+	Frappe stamps owner with whoever is running, and set_user_and_timestamp does it
+	unconditionally on insert, so it cannot simply be assigned beforehand. The scheduled pass
+	runs as Administrator, so every event pulled on a schedule was owned by Administrator —
+	while the same event pulled by somebody pressing Sync Now was owned by them.
+
+	The ownership is not cosmetic. These are created Private, and Frappe shows a private event
+	to its owner, to people it is shared with, and to its participants — so an event owned by
+	Administrator is invisible to the one person whose calendar it came out of. On a
+	single-admin site nothing looks wrong; on the second connection the feature quietly stops
+	working for everybody but the admin.
+	"""
+	if not user:
+		return
+	frappe.db.set_value("Event", event_name, "owner", user, update_modified=False)
 
 
 def _apply(doc, values):

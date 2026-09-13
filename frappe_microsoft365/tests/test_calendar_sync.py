@@ -1514,3 +1514,62 @@ class TestEditingDoesNotReplaceTheMeeting(SyncTestCase):
 		)
 
 		self.assertNotIn("isOnlineMeeting", sync._event_to_graph_body(event))
+
+
+class TestPulledEventsBelongToTheirPerson(SyncTestCase):
+	"""The multi-user case, which a single-admin site cannot reveal.
+
+	Pulled events are Private, and Frappe shows a private event to its owner, the people it is
+	shared with, and its participants. Frappe stamps owner with whoever is running — and the
+	scheduled pass runs as Administrator — so every event pulled on a schedule was owned by
+	Administrator and invisible to the person whose calendar it came from. Pressing Sync Now
+	made the same event visible, because that ran as them. Nothing looks wrong until a second
+	person connects a calendar.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		self.person = "m365-owner-test@example.com"
+		if not frappe.db.exists("User", self.person):
+			frappe.get_doc({
+				"doctype": "User", "email": self.person, "first_name": "Calendar",
+				"send_welcome_email": 0, "roles": [{"role": "Desk User"}],
+			}).insert(ignore_permissions=True)
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", self.person)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.addCleanup(frappe.clear_document_cache, "Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+
+	def _pull_one(self):
+		frappe.flags.in_microsoft_sync = True
+		self.addCleanup(lambda: frappe.flags.pop("in_microsoft_sync", None))
+		sync._upsert_event(self.calendar, {
+			"id": "AAMk-owner-1", "subject": "Their meeting",
+			"start": {"dateTime": "2026-10-01T10:00:00.0000000", "timeZone": "UTC"},
+			"end": {"dateTime": "2026-10-01T11:00:00.0000000", "timeZone": "UTC"},
+			"isAllDay": False, "type": "singleInstance", "attendees": [],
+			"organizer": {"emailAddress": {"address": "org@example.com"}},
+			"responseStatus": {"response": "accepted"},
+		})
+		return frappe.db.get_value("Event", {"custom_microsoft_event_id": "AAMk-owner-1"}, "name")
+
+	def test_the_event_belongs_to_whose_calendar_it_came_from(self):
+		"""Not to Administrator, who merely happened to be running the scheduler."""
+		name = self._pull_one()
+
+		self.assertEqual(frappe.db.get_value("Event", name, "owner"), self.person)
+
+	def test_that_person_can_actually_see_it(self):
+		"""Ownership is the mechanism, visibility is the point — so assert the point."""
+		name = self._pull_one()
+
+		self.assertTrue(frappe.has_permission("Event", doc=name, user=self.person))
+
+	def test_a_connection_with_no_user_is_left_alone(self):
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", None)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+
+		name = self._pull_one()
+
+		self.assertTrue(frappe.db.get_value("Event", name, "owner"))
