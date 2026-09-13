@@ -182,11 +182,23 @@ class TestScopeDerivation(BaseTestCase):
 		self.assertIn("OnlineMeetings.ReadWrite", scopes)
 		self.assertNotIn("OnlineMeetingTranscript.Read.All", scopes)
 
-	def test_transcripts_add_only_the_transcript_permission(self):
+	def test_transcripts_add_the_transcript_and_recording_permissions(self):
+		"""Microsoft grants reading the words and reading the video separately."""
 		scopes = graph.derive_scopes({"use_teams": 1, "use_transcripts": 1})
 
 		self.assertEqual(
-			scopes, ["User.Read", "OnlineMeetings.ReadWrite", "OnlineMeetingTranscript.Read.All"]
+			scopes,
+			[
+				"User.Read",
+				"OnlineMeetings.ReadWrite",
+				"OnlineMeetingTranscript.Read.All",
+				"OnlineMeetingRecording.Read.All",
+			],
+		)
+
+	def test_a_calendar_only_setup_never_asks_to_read_recordings(self):
+		self.assertNotIn(
+			"OnlineMeetingRecording.Read.All", graph.derive_scopes({"use_calendar": 1, "use_teams": 1})
 		)
 
 	def test_everything_ticked_is_the_full_list(self):
@@ -199,6 +211,7 @@ class TestScopeDerivation(BaseTestCase):
 				"Calendars.ReadWrite",
 				"OnlineMeetings.ReadWrite",
 				"OnlineMeetingTranscript.Read.All",
+				"OnlineMeetingRecording.Read.All",
 			],
 		)
 

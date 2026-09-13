@@ -32,8 +32,11 @@ in the first place.
 - **Attendees and RSVP** — organiser, the attendee list with everyone's reply, and your own
   response status on the Event, plus **Accept / Tentative / Decline** buttons on invitations you
   received. Frappe's event participants go out as Outlook attendees.
-- **Transcripts and recordings** — list and fetch Teams meeting transcripts (VTT) and recordings
-  for meetings that are calendar-associated and not expired.
+- **Transcripts and recordings land on the Event** — after a Teams meeting, **Get Transcript**
+  attaches the VTT to the Event, where it is searchable and yours to keep. A recording is not
+  copied into your file store — it stays with Microsoft and **Download Recording** streams it
+  through Frappe on demand. When Microsoft's retention has already removed either, you are told
+  that plainly. See *Transcripts and recordings*.
 - **Take only the parts you want** — calendar, Teams meetings, transcripts, mail and sign-in are
   independent. The Azure scopes are **derived from what you tick** and shown before you
   authorise, so the permissions you grant in Azure and the ones the app requests cannot drift
@@ -206,7 +209,7 @@ permissions each capability needs, and only then offers to apply it.
 | --- | --- | --- |
 | Outlook calendar | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `Calendars.ReadWrite`, `offline_access` |
 | Standalone Teams meetings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetings.ReadWrite`, `offline_access` |
-| Meeting transcripts and recordings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetingTranscript.Read.All`, `offline_access` |
+| Meeting transcripts and recordings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetingTranscript.Read.All`, `OnlineMeetingRecording.Read.All`, `offline_access` |
 | Outlook mail | A `Connected App` for Frappe's Email Account | Exchange delegated: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` — or the `.default` app-only scope for shared mailboxes |
 | Sign in with Microsoft | A `Social Login Key` | Graph delegated: `openid`, `email`, `profile` |
 
@@ -220,8 +223,14 @@ The split is what makes that work. **Outlook calendar** is `Calendars.ReadWrite`
 else — including the **Add Teams meeting** tickbox on an Event, because Microsoft mints the
 Teams link as part of the event rather than as a separate meeting. `OnlineMeetings.ReadWrite`
 is only for meetings created outside a calendar event and for resolving a join URL back to a
-meeting; `OnlineMeetingTranscript.Read.All` is only for transcripts. Both are permissions
-tenants routinely refuse, which is why wanting a calendar no longer asks for them.
+meeting; `OnlineMeetingTranscript.Read.All` and `OnlineMeetingRecording.Read.All` are only
+for transcripts and recordings. All are permissions tenants routinely refuse — reading the
+words and reading the video are consented separately — which is why wanting a calendar no
+longer asks for any of them.
+
+Transcripts build on standalone meetings, so their tickbox appears only once that one is on,
+and turning that one back off turns transcripts off with it rather than leaving a hidden
+capability asking Azure for consent.
 
 `offline_access`, `openid` and `profile` are added automatically at sign-in and never belong in
 a scope list of your own.
@@ -336,6 +345,43 @@ added in Outlook.
 in the structured `onlineMeeting` property for its own Teams meetings; a third-party link
 is loose text in the event body, and guessing at it would produce wrong links more often
 than right ones. Open the event in Outlook for those.
+
+### Transcripts and recordings
+
+Once a Teams meeting has finished, the Event grows **Get Transcript** under the *Microsoft*
+menu. It fetches the latest transcript and **attaches it to the Event as a `.vtt` file**, and
+notes any recordings it found. Fetching again replaces the attachment rather than piling up
+copies.
+
+The two are deliberately handled differently:
+
+- **The transcript is attached.** A VTT is a few kilobytes, it is the part people actually
+  search and quote, and once it is a File on the Event it survives whatever Microsoft later
+  does with its own copy.
+- **The recording is not.** A Teams recording routinely runs to hundreds of megabytes, and
+  copying one into the site's file store per meeting is a bad trade. Microsoft keeps it; the
+  Event records that it exists, and **Download Recording** fetches it when someone asks.
+
+**Why the recording isn't just a link.** Graph's `recordingContentUrl` is an API endpoint that
+requires a bearer token — paste it into a browser and you get `401`, not a video. So the
+download streams through Frappe, authorised by Frappe's own permissions, and the token never
+leaves the server.
+
+**Expiry is reported, not guessed.** Teams recordings and transcripts are deleted under your
+tenant's retention policy, and Graph publishes no expiry date for them — the `callRecording`
+resource simply has no such property. Rather than invent a countdown, a fetch that comes back
+empty says what is actually true: Microsoft no longer has this, and why.
+
+Three read-only fields carry the state: the online meeting id (resolved once from the join
+link and kept), when the transcript was last fetched, and one line per recording.
+
+**Requirements.** This is the **Transcripts** capability, which needs
+`OnlineMeetings.ReadWrite` — a transcript is addressed by online meeting id, and resolving
+that from a join link needs it. Recordings additionally need
+`OnlineMeetingRecording.Read.All` and a Teams licence that records; if that permission is
+missing the transcript still lands rather than the whole action failing. Only meetings created
+**as calendar events** have transcripts — standalone Teams meetings do not, which is why the
+app creates them the calendar way.
 
 ### Sensitive actions are called out before they happen
 

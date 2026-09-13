@@ -81,6 +81,34 @@ frappe.ui.form.on("Event", {
 			);
 		}
 
+		// A finished Teams meeting can bring its transcript and recording back.
+		if (frm.doc.custom_teams_join_url) {
+			const past = frm.doc.ends_on && frappe.datetime.now_datetime() > frm.doc.ends_on;
+			if (past) {
+				frm.add_custom_button(
+					__("Get Transcript"),
+					() => frappe_microsoft365.fetch_artifacts(frm),
+					__("Microsoft")
+				);
+			}
+			if (frm.doc.custom_microsoft_recordings) {
+				frm.add_custom_button(
+					__("Download Recording"),
+					() => {
+						// Streamed through Frappe: Graph's own URL needs a bearer token, so a
+						// browser given it would get 401 rather than a video.
+						window.open(
+							"/api/method/frappe_microsoft365.microsoft_meeting_artifacts.download_recording" +
+								"?event=" + encodeURIComponent(frm.doc.name),
+							"_blank",
+							"noopener"
+						);
+					},
+					__("Microsoft")
+				);
+			}
+		}
+
 		if (!frappe_microsoft365.is_microsoft_invitee(frm.doc)) return;
 
 		const group = __("Microsoft");
@@ -93,3 +121,21 @@ frappe.ui.form.on("Event", {
 		});
 	},
 });
+
+frappe_microsoft365.fetch_artifacts = function (frm) {
+	frappe.call({
+		method: "frappe_microsoft365.microsoft_meeting_artifacts.fetch_meeting_artifacts",
+		args: { event: frm.doc.name },
+		freeze: true,
+		freeze_message: __("Asking Microsoft…"),
+		callback: (r) => {
+			const result = r.message || {};
+			frappe.msgprint({
+				title: __("Meeting files"),
+				message: result.message,
+				indicator: result.transcript ? "green" : "orange",
+			});
+			frm.reload_doc();
+		},
+	});
+};

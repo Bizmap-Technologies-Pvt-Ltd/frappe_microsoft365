@@ -34,6 +34,27 @@ class MicrosoftSettings(Document):
 				)
 
 		self._reject_the_secret_id()
+		self._drop_capabilities_that_lost_their_prerequisite()
+
+	def _drop_capabilities_that_lost_their_prerequisite(self):
+		"""Transcripts are reached through the meeting behind a join URL, so they cannot work
+		without the standalone-meetings permission.
+
+		The field is hidden when its prerequisite is off, and a hidden Check keeps whatever value
+		it had — which would leave sign-in quietly asking Azure for transcript and recording
+		consent that nothing on screen admits to wanting. Clear it instead, and say so.
+		"""
+		if self.use_transcripts and not self.use_teams:
+			self.use_transcripts = 0
+			frappe.msgprint(
+				_(
+					"Meeting transcripts and recordings were turned off: they need "
+					"<b>Standalone Teams meetings</b>, which resolves a join link to the meeting "
+					"they belong to."
+				),
+				indicator="orange",
+				alert=True,
+			)
 
 	def _reject_the_secret_id(self):
 		"""Azure shows a secret's Value and its Secret ID together, and only the Value works.

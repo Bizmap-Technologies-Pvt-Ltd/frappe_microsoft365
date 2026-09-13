@@ -162,6 +162,38 @@ def create_event_custom_fields():
 							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
+				"fieldname": "custom_microsoft_online_meeting_id",
+				"fieldtype": "Data",
+				"label": "Online Meeting ID",
+				"insert_after": "custom_microsoft_web_link",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+				# Resolved from the join URL once and kept: transcripts and recordings are
+				# addressed by meeting id, and resolving costs a Graph call every time.
+				"length": 500,
+			},
+			{
+				"fieldname": "custom_microsoft_transcript_fetched_on",
+				"fieldtype": "Datetime",
+				"label": "Transcript Fetched On",
+				"insert_after": "custom_microsoft_online_meeting_id",
+				"read_only": 1,
+				"no_copy": 1,
+				"depends_on": "eval:doc.custom_microsoft_transcript_fetched_on",
+				"description": "The transcript is attached to this event.",
+			},
+			{
+				"fieldname": "custom_microsoft_recordings",
+				"fieldtype": "Small Text",
+				"label": "Recordings",
+				"insert_after": "custom_microsoft_transcript_fetched_on",
+				"read_only": 1,
+				"no_copy": 1,
+				"depends_on": "eval:doc.custom_microsoft_recordings",
+				"description": "Held by Microsoft, not copied here. Use Download Recording.",
+			},
+			{
 				"fieldname": "custom_microsoft_attendees",
 				"fieldtype": "Small Text",
 				"label": "Attendees",

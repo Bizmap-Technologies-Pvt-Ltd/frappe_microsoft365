@@ -21,7 +21,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 #: which Microsoft account it is attached to.
 BASE_SCOPE = "User.Read"
 
-#: Capability field on Microsoft Settings -> the ONE delegated scope it needs. Ordered so the
+#: Capability field on Microsoft Settings -> the delegated scopes it needs. Ordered so the
 #: derived list reads the same way every time.
 #:
 #: The split matters because the permissions are not interchangeable, verified against the
@@ -32,14 +32,17 @@ BASE_SCOPE = "User.Read"
 #:   Event needs Calendars.ReadWrite and nothing else.
 #: * OnlineMeetings.ReadWrite is needed only for standalone meetings (POST /me/onlineMeetings)
 #:   and for resolving a join URL to a meeting id.
-#: * OnlineMeetingTranscript.Read.All is needed only for transcripts.
+#: * OnlineMeetingTranscript.Read.All is needed only for transcripts, and recordings need
+#:   their own OnlineMeetingRecording.Read.All on top of it — Microsoft grants the two
+#:   separately, and a tenant that consents to reading words often will not consent to
+#:   reading video.
 #:
 #: Bundling them forced admins to hand-edit the scope field back down to what their tenant had
 #: actually consented to, which is the failure this split removes.
 CAPABILITY_SCOPES = (
-	("use_calendar", "Calendars.ReadWrite"),
-	("use_teams", "OnlineMeetings.ReadWrite"),
-	("use_transcripts", "OnlineMeetingTranscript.Read.All"),
+	("use_calendar", ("Calendars.ReadWrite",)),
+	("use_teams", ("OnlineMeetings.ReadWrite",)),
+	("use_transcripts", ("OnlineMeetingTranscript.Read.All", "OnlineMeetingRecording.Read.All")),
 )
 
 #: Added by build_authorize_url, never derived and never valid in an override: MSAL treats
@@ -122,9 +125,12 @@ def derive_scopes(capabilities):
 	"""
 	capabilities = capabilities or {}
 	scopes = [BASE_SCOPE]
-	for field, scope in CAPABILITY_SCOPES:
-		if capabilities.get(field) and scope not in scopes:
-			scopes.append(scope)
+	for field, field_scopes in CAPABILITY_SCOPES:
+		if not capabilities.get(field):
+			continue
+		for scope in field_scopes:
+			if scope not in scopes:
+				scopes.append(scope)
 	return scopes
 
 
