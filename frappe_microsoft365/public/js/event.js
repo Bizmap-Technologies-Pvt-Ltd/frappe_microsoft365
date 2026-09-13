@@ -62,6 +62,10 @@ frappe_microsoft365.rsvp = function (frm, response, label) {
 };
 
 frappe.ui.form.on("Event", {
+	custom_sync_with_microsoft_calendar(frm) {
+		frappe_microsoft365.offer_a_connection(frm);
+	},
+
 	refresh(frm) {
 		if (frm.is_new()) return;
 
@@ -98,6 +102,42 @@ frappe.ui.form.on("Event", {
 		});
 	},
 });
+
+// Ticking the sync box makes the connection field mandatory. Somebody who has never connected
+// therefore hits "Microsoft Calendar is required", with nothing on screen explaining what a
+// Microsoft Calendar is or how to get one — a dead end at the exact moment they were trying to
+// use the feature for the first time. Everyone in a company meets this once.
+frappe_microsoft365.offer_a_connection = async function (frm) {
+	if (!frm.doc.custom_sync_with_microsoft_calendar) return;
+	if (frm.doc.custom_microsoft_calendar) return;
+
+	// Permission-scoped by the server, so this only ever counts the person's own connections.
+	const mine = await frappe.db.get_list("Microsoft Calendar", { limit: 1 });
+	if (mine.length) return;
+
+	const dialog = new frappe.ui.Dialog({
+		title: __("Connect your Microsoft account"),
+		indicator: "blue",
+		primary_action_label: __("Connect now"),
+		primary_action: () => {
+			dialog.hide();
+			// Their own connection, created for them: the doctype fills in the user, and
+			// Authorize on the form is the only step left.
+			frappe.new_doc("Microsoft Calendar", { account_name: frappe.session.user_fullname });
+		},
+		secondary_action_label: __("Not now"),
+		secondary_action: () => {
+			dialog.hide();
+			frm.set_value("custom_sync_with_microsoft_calendar", 0);
+		},
+	});
+	dialog.set_message(
+		__(
+			"You have not connected a Microsoft account yet. Each person connects their own, once — after that your events sync both ways and Teams meetings, transcripts and recordings work from here."
+		)
+	);
+	dialog.show();
+};
 
 frappe_microsoft365.stored_recordings = function (frm) {
 	try {

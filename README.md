@@ -151,6 +151,30 @@ http://m365.localhost:8000/api/method/frappe_microsoft365.frappe_microsoft_365.d
 
 (Use your real site URL/port. `http://...localhost` is accepted by Azure for local testing.)
 
+## How it works for a whole company
+
+One tenant, one app registration, one connection per person — nobody shares a token and nobody
+sees anybody else's calendar.
+
+| | |
+| --- | --- |
+| **The admin, once** | Registers the Azure app, grants admin consent, turns on the Teams transcript switch, fills in Microsoft Settings. The walkthrough below. |
+| **Each employee, once** | Creates their own **Microsoft Calendar** and clicks **Authorize**. Roughly twenty seconds, no admin involvement. |
+| **After that** | Their events sync both ways, their Teams meetings, their transcripts and recordings — all under their own delegated token. |
+
+Ticking **Sync with Microsoft Calendar** on an Event when you have no connection offers to make
+one there and then, which is where most people meet this for the first time.
+
+**What is separated, and enforced rather than assumed:** a person sees only their own connection
+in the list and can only authorize, sync or disconnect their own. An event pulled from someone's
+calendar is created Private and **owned by them**, so it appears on their calendar and on nobody
+else's — that ownership is set explicitly, because the scheduled sync runs as Administrator and
+would otherwise leave everyone's events owned by the scheduler.
+
+**One thing it does not do:** it syncs the signed-in person's own calendar (`/me/calendarView`).
+A shared mailbox's calendar, or a room calendar, is not covered — that needs delegated access to
+the shared mailbox or the application-permission path, neither of which this app sets up today.
+
 ## Set it up, in order
 
 Setup spans **two Microsoft portals and Frappe**, and the order is not decoration. The permission
