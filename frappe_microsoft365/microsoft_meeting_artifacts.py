@@ -212,6 +212,12 @@ def _state(doc):
 		# message can mention it without any of them having to branch on it.
 		"still_booked": bool(ends_on and ends_on > now),
 		"booked_until": ends_on,
+		# What the last attempt was told. A tenant that has just had Graph access to transcripts
+		# switched on answers inconsistently for a while — one call 403s, the next returns an
+		# empty list — and reporting that empty list as "still processing" sends someone off to
+		# wait for Microsoft when the thing they are actually waiting for is their own setting
+		# reaching every node.
+		"last_refusal": _remembered_refusal(doc),
 	}
 
 	if not doc.get("custom_teams_join_url"):
@@ -249,6 +255,22 @@ def _next_check_at(ends_on, attempts):
 	if not ends_on or attempts >= len(RETRY_MINUTES):
 		return None
 	return add_to_date(ends_on, minutes=RETRY_MINUTES[attempts])
+
+
+def _remembered_refusal(doc):
+	"""The tenant-switch refusal, if that is what the last attempt hit.
+
+	Matched against the sentence this app generates rather than Microsoft's, because ours is
+	the one that got stored — and against a distinctive fragment rather than the whole thing,
+	so a reworded hint degrades to the ordinary message instead of lying about a new one.
+	"""
+	from frappe_microsoft365.microsoft_transcripts import TENANT_SWITCH, TENANT_SWITCH_TEXT
+
+	status = doc.get("custom_microsoft_artifacts_status") or ""
+	if TENANT_SWITCH in status or TENANT_SWITCH_TEXT in status:
+		return True
+	# Our own replacement wording never quotes Microsoft, so match it too.
+	return "Transcript API access" in status
 
 
 def _stored_recordings(doc):
@@ -319,6 +341,16 @@ def describe_state(state):
 		)
 
 	if kind == "processing":
+		if state.get("last_refusal"):
+			# Names the setting for two reasons: it is where the reader has to go, and it is how
+			# this sentence recognises itself on the next attempt. The status field holds exactly
+			# one message, so a memory that does not survive being rewritten is not a memory.
+			return _(
+				"Microsoft refused this recently: Graph access to transcripts was off for the "
+				"tenant (Teams admin center > Meetings > Meeting settings > Transcript API "
+				"access). If you just switched it on it takes a while to reach every server, so "
+				"an empty answer now is not evidence the meeting has no transcript."
+			)
 		if state.get("still_booked"):
 			# The slot has not run out, but the call may well be over — Teams produces nothing
 			# until it actually ends, so "nothing yet" here means one of two things and it

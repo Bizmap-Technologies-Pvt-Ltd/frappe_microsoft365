@@ -984,3 +984,55 @@ class TestTheMessagesStayReadable(ArtifactsTestCase):
 					MAX_MESSAGE_CHARS,
 					f"{name!r} is {len(message)} characters: say less, or say it elsewhere",
 				)
+
+
+class TestAFlappingTenantSwitch(ArtifactsTestCase):
+	"""A tenant that has just had Graph access to transcripts switched on answers
+	inconsistently for a while: one call 403s, the next returns an empty list.
+
+	Reported live — the button said "Microsoft has not finished processing this meeting" and
+	sixty seconds later the same call refused with the tenant-switch message. Reporting that
+	empty list as processing sends someone off to wait for Microsoft when what they are waiting
+	for is their own setting reaching every server.
+	"""
+
+	def _refused_once(self):
+		event = self._finished_meeting()
+		event.db_set(
+			"custom_microsoft_artifacts_status",
+			ms._tenant_switch_hint(),
+			update_modified=False,
+		)
+		event.reload()
+		return event
+
+	def test_an_empty_answer_after_a_refusal_does_not_claim_processing(self):
+		event = self._refused_once()
+
+		message = self._fetch(event)["message"]
+
+		self.assertIn("just switched it on", message)
+		self.assertNotIn("has not finished processing", message)
+
+	def test_the_memory_survives_the_next_attempt(self):
+		"""The status field holds one message, so a memory that does not survive being rewritten
+		is not a memory — the sentence has to recognise itself."""
+		event = self._refused_once()
+
+		self._fetch(event)
+		second = self._fetch(event)["message"]
+
+		self.assertIn("just switched it on", second)
+
+	def test_it_says_the_empty_answer_proves_nothing(self):
+		"""The honest part: we cannot tell 'no transcript' from 'setting not live yet'."""
+		event = self._refused_once()
+
+		self.assertIn("not evidence", self._fetch(event)["message"])
+
+	def test_a_meeting_that_never_hit_the_switch_gets_the_ordinary_message(self):
+		event = self._finished_meeting()
+
+		message = self._fetch(event)["message"]
+
+		self.assertNotIn("just switched it on", message)
