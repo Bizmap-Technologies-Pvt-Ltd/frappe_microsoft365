@@ -32,11 +32,12 @@ in the first place.
 - **Attendees and RSVP** — organiser, the attendee list with everyone's reply, and your own
   response status on the Event, plus **Accept / Tentative / Decline** buttons on invitations you
   received. Frappe's event participants go out as Outlook attendees.
-- **Transcripts and recordings land on the Event** — after a Teams meeting, **Get Transcript**
-  attaches the VTT to the Event, where it is searchable and yours to keep. A recording is not
-  copied into your file store — it stays with Microsoft and **Download Recording** streams it
-  through Frappe on demand. When Microsoft's retention has already removed either, you are told
-  that plainly. See *Transcripts and recordings*.
+- **Transcripts and recordings land on the Event** — the transcript is attached as a `.vtt` you
+  can search and keep; the recording stays with Microsoft and streams through Frappe on demand
+  rather than filling your file store. Microsoft takes minutes to hours to produce them, so the
+  app keeps asking on a backoff for a day instead of reporting an empty answer as *nothing was
+  recorded* — and a five-hour meeting's two recording parts both arrive, because Teams splits at
+  four hours. See *Transcripts and recordings*.
 - **Take only the parts you want** — calendar, Teams meetings, transcripts, mail and sign-in are
   independent. The Azure scopes are **derived from what you tick** and shown before you
   authorise, so the permissions you grant in Azure and the ones the app requests cannot drift
@@ -348,40 +349,72 @@ than right ones. Open the event in Outlook for those.
 
 ### Transcripts and recordings
 
-Once a Teams meeting has finished, the Event grows **Get Transcript** under the *Microsoft*
-menu. It fetches the latest transcript and **attaches it to the Event as a `.vtt` file**, and
-notes any recordings it found. Fetching again replaces the attachment rather than piling up
-copies.
+Once a Teams meeting has finished, its transcript is **attached to the Event as a `.vtt` file**
+and its recordings are listed on the Event, ready to download.
 
-The two are deliberately handled differently:
+**Nothing is ready the moment a meeting ends.** Microsoft publishes no schedule for this: an
+ordinary meeting is usually ready in 5-30 minutes, a long or heavy one can take a few hours,
+and Graph lags the Teams UI — the transcript can be readable in Teams while the API still
+returns an empty list. So the app does not ask once and declare the meeting unrecorded:
 
-- **The transcript is attached.** A VTT is a few kilobytes, it is the part people actually
-  search and quote, and once it is a File on the Event it survives whatever Microsoft later
-  does with its own copy.
-- **The recording is not.** A Teams recording routinely runs to hundreds of megabytes, and
-  copying one into the site's file store per meeting is a bad trade. Microsoft keeps it; the
-  Event records that it exists, and **Download Recording** fetches it when someone asks.
+- **It keeps asking, on a widening backoff.** 10 minutes after the meeting, then 25, 45, 75
+  minutes, 2, 3, 4½, 6, 8, 10, 12, 16, 20 and 24 hours — fourteen attempts across a day. (Polling
+  every fifteen minutes for the same day would cost ninety-six calls and find it no sooner.)
+- **The manual button stays.** **Get Transcript & Recording** is always there while something is
+  still missing, for when you don't want to wait for the next step.
+- **The button disappears once there is nothing left to fetch.** With the transcript attached and
+  a recording listed, the Event offers only **Download Recording**. With one of the two still
+  missing it says exactly which — **Check for Recording**, **Check for Transcript**.
+
+This is **opt-in per connection**: tick **Fetch transcripts after meetings** on a Microsoft
+Calendar. Without it, nothing is fetched until someone presses the button.
+
+**An empty answer means four different things, and the Event says which:**
+
+| | What you are told |
+| --- | --- |
+| Minutes after the meeting | Microsoft has not finished processing this meeting. Checking again around *hh:mm*. |
+| Microsoft returned an error | Microsoft's own error, verbatim — `ErrorAccessDenied`, a 403, whatever it said |
+| A day later, still nothing | Most likely never recorded or transcribed. You can still check by hand. |
+| More than ~60 days later | This meeting is too old — see the two clocks below |
+
+**Long meetings come back in pieces.** A Teams recording stops and restarts at **4 hours or
+1.5 GB**, whichever comes first, so a five-hour meeting is *two* recordings. Transcription can be
+stopped and restarted too. Everything here is plural: every transcript is attached
+(`…-part-1.vtt`, `…-part-2.vtt`), every recording is listed as *Part 1 of 2*, and **Download
+Recording** asks which part you want.
+
+**Two clocks end it, and neither is guesswork:**
+
+- **The meeting expires.** Graph's list-recordings endpoint works only for a meeting that hasn't
+  expired — **60 days** after a one-off meeting, with another 60 added whenever someone joins or
+  edits it. After that these endpoints return nothing, whatever still sits in OneDrive.
+- **The file expires.** Teams deletes recordings and transcripts on your tenant's retention
+  policy — **120 days** by default, and an admin can set it from one day to never.
 
 **Why the recording isn't just a link.** Graph's `recordingContentUrl` is an API endpoint that
-requires a bearer token — paste it into a browser and you get `401`, not a video. So the
-download streams through Frappe, authorised by Frappe's own permissions, and the token never
-leaves the server.
-
-**Expiry is reported, not guessed.** Teams recordings and transcripts are deleted under your
-tenant's retention policy, and Graph publishes no expiry date for them — the `callRecording`
-resource simply has no such property. Rather than invent a countdown, a fetch that comes back
-empty says what is actually true: Microsoft no longer has this, and why.
-
-Three read-only fields carry the state: the online meeting id (resolved once from the join
-link and kept), when the transcript was last fetched, and one line per recording.
+requires a bearer token — paste it into a browser and you get `401`, not a video. So the download
+streams through Frappe, authorised by Frappe's own permissions, and the token never leaves the
+server. The bytes are not stored: a Teams recording routinely runs to hundreds of megabytes, and
+copying one into the site's file store per meeting is a bad trade. A transcript is a few
+kilobytes and is the part people search and quote, so that one *is* kept.
 
 **Requirements.** This is the **Transcripts** capability, which needs
-`OnlineMeetings.ReadWrite` — a transcript is addressed by online meeting id, and resolving
-that from a join link needs it. Recordings additionally need
-`OnlineMeetingRecording.Read.All` and a Teams licence that records; if that permission is
-missing the transcript still lands rather than the whole action failing. Only meetings created
-**as calendar events** have transcripts — standalone Teams meetings do not, which is why the
-app creates them the calendar way.
+`OnlineMeetingTranscript.Read.All`; recordings additionally need
+`OnlineMeetingRecording.Read.All` and a Teams licence that records. Microsoft consents to reading
+the words and reading the video separately, so a tenant that refuses recordings still gets
+transcripts rather than losing both. Transcripts build on **Standalone Teams meetings**
+(`OnlineMeetings.ReadWrite`), because a transcript is addressed by online meeting id and
+resolving that from a join link needs it. Only meetings created **as calendar events** have
+transcripts at all — standalone Teams meetings do not, which is why this app creates them the
+calendar way.
+
+**Why not webhooks?** Graph can push a notification the moment a transcript appears, but the
+tenant-wide subscriptions (`getAllTranscripts`, `getAllRecordings`) are **application-permission
+only** — standing access to every meeting in the tenant with nobody signed in — and the
+per-meeting ones only notify if you subscribed *before the meeting started*, plus they need a
+public HTTPS endpoint Microsoft can reach and renewal every few days. For a self-hosted Frappe
+that is a worse trade than fourteen polls.
 
 ### Sensitive actions are called out before they happen
 

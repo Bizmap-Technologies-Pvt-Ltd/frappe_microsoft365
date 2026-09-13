@@ -194,6 +194,46 @@ def create_event_custom_fields():
 				"description": "Held by Microsoft, not copied here. Use Download Recording.",
 			},
 			{
+				# What the buttons act on: the recording ids, so offering part 2 of a long
+				# meeting costs no Graph call. The field above is the same thing for humans.
+				"fieldname": "custom_microsoft_recordings_data",
+				"fieldtype": "Long Text",
+				"label": "Recordings Data",
+				"insert_after": "custom_microsoft_recordings",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+			{
+				"fieldname": "custom_microsoft_artifacts_status",
+				"fieldtype": "Small Text",
+				"label": "Transcript Status",
+				"insert_after": "custom_microsoft_recordings_data",
+				"read_only": 1,
+				"no_copy": 1,
+				"depends_on": "eval:doc.custom_microsoft_artifacts_status",
+			},
+			{
+				# Where the backoff has got to. Attempts, not a timer: the schedule is derived
+				# from the meeting's end, so a missed run never shifts the whole sequence.
+				"fieldname": "custom_microsoft_artifacts_attempts",
+				"fieldtype": "Int",
+				"label": "Artifact Checks",
+				"insert_after": "custom_microsoft_artifacts_status",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+			{
+				"fieldname": "custom_microsoft_artifacts_checked_on",
+				"fieldtype": "Datetime",
+				"label": "Artifacts Checked On",
+				"insert_after": "custom_microsoft_artifacts_attempts",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+			{
 				"fieldname": "custom_microsoft_attendees",
 				"fieldtype": "Small Text",
 				"label": "Attendees",

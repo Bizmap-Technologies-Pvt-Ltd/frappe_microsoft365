@@ -24,6 +24,7 @@
   "sync_section",
   "pull_from_microsoft_calendar",
   "push_to_microsoft_calendar",
+  "fetch_artifacts_automatically",
   "column_break_sync",
   "last_sync",
   "last_error",
@@ -148,6 +149,13 @@
    "label": "Push Frappe events to Microsoft",
    "default": "0",
    "description": "Writes into the real Outlook calendar. Deleting a Frappe Event deletes the Microsoft one."
+  },
+  {
+   "fieldname": "fetch_artifacts_automatically",
+   "fieldtype": "Check",
+   "label": "Fetch transcripts after meetings",
+   "default": "0",
+   "description": "Attaches the transcript and lists recordings once Microsoft has processed them."
   },
   {
    "fieldname": "column_break_sync",

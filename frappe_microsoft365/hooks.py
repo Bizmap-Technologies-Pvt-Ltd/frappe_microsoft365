@@ -33,6 +33,9 @@ scheduler_events = {
 	"cron": {
 		"*/15 * * * *": [
 			"frappe_microsoft365.microsoft_calendar_sync.sync_all",
+			# Its own entry, not a tail call inside sync_all: a Teams meeting can take hours to
+			# process, and chasing artifacts must never be able to break calendar sync.
+			"frappe_microsoft365.microsoft_meeting_artifacts.fetch_pending",
 		],
 	},
 }

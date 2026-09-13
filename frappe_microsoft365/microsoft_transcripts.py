@@ -127,6 +127,9 @@ def list_recordings(calendar_name: str, online_meeting_id: str):
 		{
 			"id": r.get("id"),
 			"created_date_time": r.get("createdDateTime"),
+			# A meeting past four hours comes back as several recordings; without the end time
+			# there is no way to tell a caller which part covers which stretch of the meeting.
+			"end_date_time": r.get("endDateTime"),
 			"recording_content_url": r.get("recordingContentUrl"),
 		}
 		for r in resp.get("value", [])

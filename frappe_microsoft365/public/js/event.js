@@ -83,30 +83,7 @@ frappe.ui.form.on("Event", {
 
 		// A finished Teams meeting can bring its transcript and recording back.
 		if (frm.doc.custom_teams_join_url) {
-			const past = frm.doc.ends_on && frappe.datetime.now_datetime() > frm.doc.ends_on;
-			if (past) {
-				frm.add_custom_button(
-					__("Get Transcript"),
-					() => frappe_microsoft365.fetch_artifacts(frm),
-					__("Microsoft")
-				);
-			}
-			if (frm.doc.custom_microsoft_recordings) {
-				frm.add_custom_button(
-					__("Download Recording"),
-					() => {
-						// Streamed through Frappe: Graph's own URL needs a bearer token, so a
-						// browser given it would get 401 rather than a video.
-						window.open(
-							"/api/method/frappe_microsoft365.microsoft_meeting_artifacts.download_recording" +
-								"?event=" + encodeURIComponent(frm.doc.name),
-							"_blank",
-							"noopener"
-						);
-					},
-					__("Microsoft")
-				);
-			}
+			frappe_microsoft365.add_artifact_buttons(frm);
 		}
 
 		if (!frappe_microsoft365.is_microsoft_invitee(frm.doc)) return;
@@ -122,6 +99,87 @@ frappe.ui.form.on("Event", {
 	},
 });
 
+frappe_microsoft365.stored_recordings = function (frm) {
+	try {
+		return JSON.parse(frm.doc.custom_microsoft_recordings_data || "[]");
+	} catch (e) {
+		return [];
+	}
+};
+
+// The buttons follow the state, so the form never offers to fetch what it already has, and
+// never hides the manual check while Microsoft might still be processing.
+frappe_microsoft365.add_artifact_buttons = function (frm) {
+	const group = __("Microsoft");
+	const past = frm.doc.ends_on && frappe.datetime.now_datetime() > frm.doc.ends_on;
+	if (!past) return;
+
+	const recordings = frappe_microsoft365.stored_recordings(frm);
+	const has_transcript = !!frm.doc.custom_microsoft_transcript_fetched_on;
+
+	if (!has_transcript || !recordings.length) {
+		// Named for what is still missing: "Get Transcript" on an event whose transcript is
+		// already attached reads like the first fetch failed.
+		const label = has_transcript
+			? __("Check for Recording")
+			: recordings.length
+			? __("Check for Transcript")
+			: __("Get Transcript & Recording");
+		frm.add_custom_button(label, () => frappe_microsoft365.fetch_artifacts(frm), group);
+	}
+
+	if (recordings.length) {
+		frm.add_custom_button(
+			__("Download Recording"),
+			() => frappe_microsoft365.download_recording(frm, recordings),
+			group
+		);
+	}
+};
+
+frappe_microsoft365.download_recording = function (frm, recordings) {
+	// Streamed through Frappe: Graph's own URL needs a bearer token, so a browser given it
+	// would get 401 rather than a video.
+	const fetch_one = (id) =>
+		window.open(
+			"/api/method/frappe_microsoft365.microsoft_meeting_artifacts.download_recording" +
+				"?event=" + encodeURIComponent(frm.doc.name) +
+				(id ? "&recording_id=" + encodeURIComponent(id) : ""),
+			"_blank",
+			"noopener"
+		);
+
+	if (recordings.length < 2) {
+		fetch_one(recordings.length ? recordings[0].id : null);
+		return;
+	}
+
+	// Teams splits a recording every 4 hours or 1.5 GB, so a long meeting has parts and the
+	// person has to be asked which one they want.
+	const dialog = new frappe.ui.Dialog({
+		title: __("Which part?"),
+		fields: [
+			{
+				fieldname: "part",
+				fieldtype: "Select",
+				label: __("Recording"),
+				reqd: 1,
+				options: recordings.map((r, i) => ({
+					value: r.id,
+					label: __("Part {0} of {1}", [i + 1, recordings.length]) +
+						(r.created ? " — " + frappe.datetime.str_to_user(r.created.replace("T", " ").slice(0, 19)) : ""),
+				})),
+			},
+		],
+		primary_action_label: __("Download"),
+		primary_action: (values) => {
+			dialog.hide();
+			fetch_one(values.part);
+		},
+	});
+	dialog.show();
+};
+
 frappe_microsoft365.fetch_artifacts = function (frm) {
 	frappe.call({
 		method: "frappe_microsoft365.microsoft_meeting_artifacts.fetch_meeting_artifacts",
@@ -130,10 +188,11 @@ frappe_microsoft365.fetch_artifacts = function (frm) {
 		freeze_message: __("Asking Microsoft…"),
 		callback: (r) => {
 			const result = r.message || {};
+			const landed = result.state === "complete" || result.state === "partial";
 			frappe.msgprint({
 				title: __("Meeting files"),
 				message: result.message,
-				indicator: result.transcript ? "green" : "orange",
+				indicator: landed ? "green" : "orange",
 			});
 			frm.reload_doc();
 		},
