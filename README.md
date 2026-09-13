@@ -183,12 +183,18 @@ connection and can sync or disconnect any of them — somebody has to be able to
 broken connection. It is worth knowing that the separation is between ordinary users, not from
 your administrators.
 
+**Recurring events go both ways.** A recurring Outlook meeting arrives as its individual
+occurrences. A repeating Frappe Event is sent as a real Outlook series — daily, weekly (on the
+days you tick), monthly, quarterly, half-yearly or yearly, ending on **Repeat Till** or never.
+The occurrences Microsoft generates from it are not mirrored back as separate Events: the
+repeating Event already represents them, exactly as one Graph series master represents its own.
+A frequency this app cannot map is sent as a single event rather than as a wrong series.
+
 **What it does not cover.** It syncs the signed-in person's **default** calendar
 (`/me/calendarView`) — a second calendar in the same mailbox is neither read nor written, and
 there is no picker. A shared mailbox's calendar or a room calendar is not covered either; that
 needs delegated access to the shared mailbox or the application-permission path, neither of which
-this app sets up today. Recurrence travels one way: a recurring Outlook meeting arrives as its
-individual occurrences, but a repeating Frappe Event is pushed to Outlook as a single one-off.
+this app sets up today.
 
 ## Connect Frappe to Microsoft 365, in order
 

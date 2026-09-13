@@ -230,10 +230,19 @@ flow and the generated Exchange setup script cover that.
 
 ## Will a repeating Frappe Event become a recurring series in Outlook?
 
-No. The push sends each Frappe Event to Graph as a single one-off event; Frappe's repeat
-settings are not translated into a Graph recurrence. In the other direction a recurring Outlook
-series arrives as individual occurrences, one Frappe Event each, which is what stops a repeating
-meeting being duplicated on every run.
+Yes. **Repeat On** is translated into a Graph recurrence — daily, weekly on the days you tick,
+monthly, quarterly, half-yearly or yearly — ending on **Repeat Till**, or never if that is empty.
+A weekly series always includes the day it starts on, because Graph rejects one that does not.
+
+The occurrences Microsoft generates from that series are not mirrored back as separate Frappe
+Events; the repeating Event already stands for them, in the same way one Graph series master
+stands for its own occurrences.
+
+In the other direction a recurring series organised **in Outlook** arrives as individual
+occurrences, one Frappe Event each, since Frappe has nothing else to attach them to.
+
+A frequency this app cannot map to Graph is sent as a single event rather than as a wrong
+series: a wrong recurrence writes itself across a real calendar for months.
 
 ## Will it pick up Zoom or Google Meet links?
 

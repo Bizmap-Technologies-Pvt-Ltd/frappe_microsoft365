@@ -1573,3 +1573,126 @@ class TestPulledEventsBelongToTheirPerson(SyncTestCase):
 		name = self._pull_one()
 
 		self.assertTrue(frappe.db.get_value("Event", name, "owner"))
+
+
+class TestRecurrenceReachesOutlook(SyncTestCase):
+	"""A repeating Frappe Event used to arrive in Outlook as a single one-off.
+
+	The pull expanded recurring Outlook series into occurrences carefully; the push dropped the
+	repeat rule on the floor with nothing to say so. Silently lossy in the direction nobody was
+	looking.
+	"""
+
+	def _repeating(self, **kwargs):
+		values = {
+			"subject": "Standup",
+			"starts_on": "2026-09-14 09:00:00",   # a Monday
+			"ends_on": "2026-09-14 09:15:00",
+			"repeat_this_event": 1,
+		}
+		values.update(kwargs)
+		return frappe._dict(values)
+
+	def test_a_one_off_event_sends_no_recurrence(self):
+		body = sync._event_to_graph_body(self._repeating(repeat_this_event=0))
+
+		self.assertNotIn("recurrence", body)
+
+	def test_daily_becomes_a_daily_pattern(self):
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Daily"))
+
+		self.assertEqual(body["recurrence"]["pattern"]["type"], "daily")
+		self.assertEqual(body["recurrence"]["pattern"]["interval"], 1)
+
+	def test_weekly_carries_the_ticked_days(self):
+		body = sync._event_to_graph_body(
+			self._repeating(repeat_on="Weekly", monday=1, wednesday=1)
+		)
+
+		self.assertEqual(body["recurrence"]["pattern"]["type"], "weekly")
+		self.assertEqual(
+			sorted(body["recurrence"]["pattern"]["daysOfWeek"]), ["monday", "wednesday"]
+		)
+
+	def test_a_weekly_series_always_includes_its_own_start_day(self):
+		"""Graph rejects a weekly series that does not repeat on the day it starts."""
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Weekly", friday=1))
+
+		self.assertIn("monday", body["recurrence"]["pattern"]["daysOfWeek"])
+
+	def test_quarterly_is_a_monthly_pattern_every_third_month(self):
+		"""Graph has no quarterly; that is what quarterly means."""
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Quarterly"))
+
+		self.assertEqual(body["recurrence"]["pattern"]["type"], "absoluteMonthly")
+		self.assertEqual(body["recurrence"]["pattern"]["interval"], 3)
+		self.assertEqual(body["recurrence"]["pattern"]["dayOfMonth"], 14)
+
+	def test_yearly_carries_the_month_as_well(self):
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Yearly"))
+
+		self.assertEqual(body["recurrence"]["pattern"]["type"], "absoluteYearly")
+		self.assertEqual(body["recurrence"]["pattern"]["month"], 9)
+
+	def test_no_repeat_till_means_no_end(self):
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Daily"))
+
+		self.assertEqual(body["recurrence"]["range"]["type"], "noEnd")
+
+	def test_repeat_till_becomes_an_end_date(self):
+		body = sync._event_to_graph_body(
+			self._repeating(repeat_on="Daily", repeat_till="2026-12-31")
+		)
+
+		self.assertEqual(body["recurrence"]["range"]["type"], "endDate")
+		self.assertEqual(body["recurrence"]["range"]["endDate"], "2026-12-31")
+
+	def test_an_unmapped_frequency_sends_a_single_event_rather_than_a_wrong_series(self):
+		"""A wrong recurrence writes itself across somebody's real calendar for months."""
+		body = sync._event_to_graph_body(self._repeating(repeat_on="Fortnightly"))
+
+		self.assertNotIn("recurrence", body)
+
+
+class TestOurOwnSeriesDoesNotComeBack(SyncTestCase):
+	"""We push one series; Graph expands it into occurrences; calendarView returns them.
+
+	Without recognising them, every occurrence would be mirrored back as its own Frappe Event
+	beside the repeating one that created it — forever, and growing.
+	"""
+
+	def _occurrence(self, series_master_id):
+		return {
+			"id": "AAMk-occurrence-1",
+			"seriesMasterId": series_master_id,
+			"type": "occurrence",
+			"subject": "Standup",
+			"start": {"dateTime": "2026-10-01T09:00:00.0000000", "timeZone": "UTC"},
+			"end": {"dateTime": "2026-10-01T09:15:00.0000000", "timeZone": "UTC"},
+			"isAllDay": False, "attendees": [],
+			"organizer": {"emailAddress": {"address": "org@example.com"}},
+			"responseStatus": {"response": "organizer"},
+		}
+
+	def test_an_occurrence_of_a_series_we_pushed_is_skipped(self):
+		pushed = self._local_event(ms_id="AAMk-series-master-1")
+		self.assertTrue(pushed)
+
+		frappe.flags.in_microsoft_sync = True
+		self.addCleanup(lambda: frappe.flags.pop("in_microsoft_sync", None))
+		outcome = sync._upsert_event(self.calendar, self._occurrence("AAMk-series-master-1"))
+
+		self.assertEqual(outcome, "skipped")
+		self.assertFalse(
+			frappe.db.exists("Event", {"custom_microsoft_event_id": "AAMk-occurrence-1"}),
+			"the repeating Event already represents this occurrence",
+		)
+
+	def test_an_occurrence_of_somebody_elses_series_is_still_mirrored(self):
+		"""A recurring meeting organised in Outlook must keep arriving as occurrences."""
+		frappe.flags.in_microsoft_sync = True
+		self.addCleanup(lambda: frappe.flags.pop("in_microsoft_sync", None))
+
+		outcome = sync._upsert_event(self.calendar, self._occurrence("AAMk-not-ours"))
+
+		self.assertEqual(outcome, "created")

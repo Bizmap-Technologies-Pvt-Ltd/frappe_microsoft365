@@ -67,7 +67,11 @@ EVENT_SELECT = (
 	# Graph returns only the properties asked for, so the invitation side of an event —
 	# who was invited, who organised it and what we replied — has to be selected explicitly
 	# or it never reaches Frappe at all.
-	"attendees,organizer,isOrganizer,responseStatus,responseRequested"
+	"attendees,organizer,isOrganizer,responseStatus,responseRequested,"
+	# Which series an occurrence belongs to. Without it there is no way to tell an occurrence of
+	# a series this app pushed from an ordinary Outlook event, and every one of them would be
+	# mirrored back as a separate Frappe Event beside the repeating one that created them.
+	"seriesMasterId"
 )
 
 #: How much of the calendar the delta window covers. Graph fixes the window when the delta
@@ -805,6 +809,17 @@ def _upsert_event(doc, ev, existing_map=None):
 	if ev.get("type") == "seriesMaster":
 		return "skipped"
 
+	# An occurrence of a series this app pushed is already represented in Frappe — by the
+	# repeating Event that created it. Mirroring it back would put a separate Event beside the
+	# repeating one for every occurrence, forever, and the two models do not even disagree:
+	# Frappe keeps one record with a repeat rule, exactly as Graph keeps one series master.
+	#
+	# calendarView never returns that master, so this is the only place the relationship is
+	# visible at all.
+	series_id = ev.get("seriesMasterId")
+	if series_id and _is_ours(series_id):
+		return "skipped"
+
 	if existing:
 		event = frappe.get_doc("Event", existing)
 		locally_originated = not event.custom_pulled_from_microsoft
@@ -856,6 +871,17 @@ def _give_it_to_its_owner(event_name, user):
 	if not user:
 		return
 	frappe.db.set_value("Event", event_name, "owner", user, update_modified=False)
+
+
+def _is_ours(series_master_id):
+	"""Did this app push the series behind this occurrence?
+
+	Matched on the id Graph gave back when the series was created, which is stored on the
+	repeating Event — so this is a lookup, not a guess.
+	"""
+	return bool(
+		frappe.db.exists("Event", {"custom_microsoft_event_id": series_master_id})
+	)
 
 
 def _apply(doc, values):
@@ -1033,6 +1059,66 @@ def _end_after_start(starts_on, ends_on):
 	return add_to_date(starts_on, minutes=30)
 
 
+#: Frappe's repeat_on -> Graph's recurrence pattern. Quarterly and Half Yearly have no Graph
+#: equivalent and are expressed as an absoluteMonthly pattern with a wider interval, which is
+#: what they are.
+REPEAT_PATTERNS = {
+	"Daily": ("daily", 1),
+	"Weekly": ("weekly", 1),
+	"Monthly": ("absoluteMonthly", 1),
+	"Quarterly": ("absoluteMonthly", 3),
+	"Half Yearly": ("absoluteMonthly", 6),
+	"Yearly": ("absoluteYearly", 1),
+}
+
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _recurrence(event):
+	"""A Frappe repeating Event as a Graph recurrence, or None when it does not repeat.
+
+	Graph wants the pattern (how often) and the range (until when) separately, and it validates
+	them against the event's own start — a weekly series whose daysOfWeek does not include the
+	start day is rejected outright, so the start day is always included.
+	"""
+	if not getattr(event, "repeat_this_event", 0):
+		return None
+
+	mapped = REPEAT_PATTERNS.get(getattr(event, "repeat_on", None))
+	if not mapped:
+		# An unmapped frequency is better sent as a single event than as a wrong series: a
+		# wrong recurrence writes itself across somebody's real calendar for months.
+		return None
+
+	kind, interval = mapped
+	starts_on = get_datetime(event.starts_on)
+	pattern = {"type": kind, "interval": interval}
+
+	if kind == "weekly":
+		days = [day for day in WEEKDAYS if getattr(event, day, 0)]
+		# Graph rejects a weekly series that does not repeat on its own start day.
+		start_day = WEEKDAYS[starts_on.weekday()]
+		if start_day not in days:
+			days.append(start_day)
+		pattern["daysOfWeek"] = days
+	elif kind == "absoluteMonthly":
+		pattern["dayOfMonth"] = starts_on.day
+	elif kind == "absoluteYearly":
+		pattern["dayOfMonth"] = starts_on.day
+		pattern["month"] = starts_on.month
+
+	range_ = {"type": "noEnd", "startDate": starts_on.strftime("%Y-%m-%d")}
+	if getattr(event, "repeat_till", None):
+		range_ = {
+			"type": "endDate",
+			"startDate": starts_on.strftime("%Y-%m-%d"),
+			"endDate": get_datetime(event.repeat_till).strftime("%Y-%m-%d"),
+		}
+	range_["recurrenceTimeZone"] = get_system_timezone()
+
+	return {"pattern": pattern, "range": range_}
+
+
 def _event_to_graph_body(event):
 	starts_on = get_datetime(event.starts_on)
 	body = {
@@ -1072,6 +1158,12 @@ def _event_to_graph_body(event):
 	attendees = _graph_attendees(event)
 	if attendees:
 		body["attendees"] = attendees
+
+	# A repeating Frappe Event used to reach Outlook as a single one-off: the series was simply
+	# dropped, with nothing to say so. Sent only when it maps to something Graph understands.
+	recurrence = _recurrence(event)
+	if recurrence:
+		body["recurrence"] = recurrence
 
 	return body
 
