@@ -138,7 +138,16 @@ def list_recordings(calendar_name: str, online_meeting_id: str):
 
 @frappe.whitelist()
 def get_recording_content(calendar_name: str, online_meeting_id: str, recording_id: str):
-	"""Return the raw recording bytes' download via Graph. Owner-checked. See licensing note."""
+	"""Describe a recording's content — type and size — without downloading it.
+
+	``stream=True`` is the whole point of this function. Without it ``requests`` reads the
+	entire body before returning, so asking "how big is this?" about a Teams recording pulled
+	up to 1.5 GB into the worker and threw it away to read two headers. The headers arrive with
+	the response; the body is closed unread.
+
+	To actually fetch the bytes, use ``microsoft_meeting_artifacts.download_recording``, which
+	streams them through to the browser a chunk at a time.
+	"""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 	try:
@@ -147,10 +156,15 @@ def get_recording_content(calendar_name: str, online_meeting_id: str, recording_
 			f"/me/onlineMeetings/{online_meeting_id}/recordings/{recording_id}/content",
 			calendar_name,
 			raw=True,
+			stream=True,
 		)
 	except MsGraphError as e:
 		_wrap_403(e, _REC_PERM_HINT)
-	return {
-		"content_type": resp.headers.get("Content-Type"),
-		"content_length": resp.headers.get("Content-Length"),
-	}
+	try:
+		return {
+			"content_type": resp.headers.get("Content-Type"),
+			"content_length": resp.headers.get("Content-Length"),
+		}
+	finally:
+		# An unread streamed body holds its pooled connection open until the process ends.
+		resp.close()

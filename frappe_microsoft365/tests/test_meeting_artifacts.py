@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 import frappe
 from frappe.utils import add_to_date, now_datetime
+from werkzeug.wrappers import Response
 
+from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365 import microsoft_meeting_artifacts as artifacts
 from frappe_microsoft365 import microsoft_transcripts as ms
 from frappe_microsoft365.tests.base import BaseTestCase
@@ -16,9 +18,59 @@ VTT = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nPriya: Let's begin.\n"
 VTT_TWO = "WEBVTT\n\n01:00:01.000 --> 01:00:04.000\nPriya: Back after the break.\n"
 
 
+class UnbufferableResponse:
+	"""A Graph response that makes buffering fail loudly instead of quietly costing 1.5 GB.
+
+	``.content`` and ``.text`` are the two ways requests reads a whole body into memory, and
+	reading either is precisely the bug: a Teams recording part runs to 1.5 GB, which a web
+	worker cannot hold. Raising here turns that regression into a failing test rather than a
+	worker the OOM killer takes out in production.
+	"""
+
+	def __init__(self, chunks=(b"one", b"two", b"three"), headers=None):
+		self.chunks = list(chunks)
+		self.headers = {} if headers is None else headers
+		self.chunk_size = None
+		self.closed = False
+
+	@property
+	def content(self):
+		raise AssertionError("the recording must never be read into memory in one piece")
+
+	@property
+	def text(self):
+		raise AssertionError("the recording must never be read into memory in one piece")
+
+	def iter_content(self, chunk_size=None):
+		# Deliberately not a generator: the chunk size has to be recorded when it is asked for,
+		# not on the first read, or a test that never iterates would see nothing.
+		self.chunk_size = chunk_size
+		return iter(self.chunks)
+
+	def close(self):
+		self.closed = True
+
+
+#: A bench where jobs run, for the status sentences that are not about the queue.
+#:
+#: Every expectation in this file predates the background-health check and assumes something
+#: is running the catch-up job. Left unpinned they would pass or fail on whether the developer
+#: happened to have a worker up, which would say nothing about Graph — the actual subject.
+HEALTHY_QUEUE = {"ok": True, "reasons": [], "fixes": []}
+
+DEAD_QUEUE = {
+	"ok": False,
+	"reasons": ["The scheduler is off for this site, so nothing is queued on a schedule."],
+	"fixes": ["Run `bench --site test enable-scheduler`."],
+}
+
+
 class ArtifactsTestCase(BaseTestCase):
 	def setUp(self):
 		super().setUp()
+		queue = patch.object(artifacts.background, "health", return_value=HEALTHY_QUEUE)
+		queue.start()
+		self.addCleanup(queue.stop)
 		if not frappe.db.exists("Microsoft Calendar", CALENDAR):
 			frappe.get_doc(
 				{
@@ -221,6 +273,28 @@ class TestWhatItSays(ArtifactsTestCase):
 
 		self.assertIn("Checking again", message)
 
+	def test_a_dead_scheduler_makes_the_promised_time_a_lie_and_it_says_so(self):
+		"""The tickbox only decides whether the catch-up job would ask; something still has to
+		run it. With nothing consuming the queue, "Checking again around 14:48" names a time
+		that nothing can keep — the same class of lie as the tickbox being off, but worse,
+		because it is specific."""
+		event = self._finished_meeting(ended_hours_ago=0)
+		event.db_set("ends_on", add_to_date(now_datetime(), minutes=-5), update_modified=False)
+		event.reload()
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "fetch_artifacts_automatically", 1)
+		self.addCleanup(
+			frappe.db.set_value, "Microsoft Calendar", CALENDAR, "fetch_artifacts_automatically", 0
+		)
+		frappe.clear_cache(doctype="Microsoft Calendar")
+
+		with patch.object(artifacts.background, "health", return_value=DEAD_QUEUE):
+			message = self._fetch(event)["message"]
+
+		self.assertNotIn("Checking again", message)
+		self.assertIn("Nothing is checking automatically", message)
+		self.assertIn("enable-scheduler", message)
+		self.assertIn("Get Transcript & Recording", message)
+
 	def test_a_day_later_it_says_it_was_never_recorded(self):
 		event = self._finished_meeting(ended_hours_ago=30)
 		event.db_set("custom_microsoft_artifacts_attempts", len(artifacts.RETRY_MINUTES), update_modified=False)
@@ -396,3 +470,134 @@ class TestGuards(ArtifactsTestCase):
 
 		with self.assertRaises(frappe.PermissionError):
 			artifacts.download_recording(event.name, recording_id="someone-elses")
+
+
+class TestDownloadingARecording(ArtifactsTestCase):
+	"""The bytes pass through; they are never collected on the way."""
+
+	def _recorded(self, *recording_ids):
+		event = self._finished_meeting()
+		event.db_set(
+			"custom_microsoft_recordings_data",
+			json.dumps([{"id": r} for r in recording_ids]),
+			update_modified=False,
+		)
+		return event
+
+	def _download(self, event, recording_id=None, **response_kwargs):
+		"""Returns the werkzeug Response, the fake Graph response, and the patched call."""
+		fake = UnbufferableResponse(**response_kwargs)
+		with patch.object(graph, "graph_request", return_value=fake) as requested:
+			response = artifacts.download_recording(event.name, recording_id=recording_id)
+		return response, fake, requested
+
+	def test_the_recording_is_never_read_into_memory(self):
+		"""It used to be resp.content — the whole file resident in a gunicorn worker, and copied
+		a second time when Frappe assigned it to response.data."""
+		event = self._recorded("r1")
+
+		response, fake, requested = self._download(event)
+
+		self.assertIsInstance(response, Response)
+		self.assertTrue(requested.call_args.kwargs["raw"])
+		self.assertTrue(requested.call_args.kwargs["stream"])
+		self.assertTrue(response.is_streamed)
+		self.assertTrue(response.direct_passthrough)
+		self.assertEqual(fake.chunk_size, artifacts.RECORDING_CHUNK_BYTES)
+		self.assertEqual(b"".join(response.response), b"onetwothree")
+
+	def test_the_download_is_named_for_the_event(self):
+		event = self._recorded("r1")
+
+		response, _fake, _requested = self._download(event)
+
+		disposition = response.headers["Content-Disposition"]
+		self.assertTrue(disposition.startswith("attachment"), disposition)
+		self.assertIn(f"teams-recording-{event.name}.mp4", disposition)
+		self.assertEqual(response.headers["Content-Type"], "video/mp4")
+
+	def test_a_part_of_a_long_meeting_is_named_for_its_part(self):
+		"""Teams splits at 4 hours or 1.5 GB, so two downloads called the same thing are two
+		files the person cannot tell apart."""
+		event = self._recorded("r1", "r2")
+
+		response, _fake, requested = self._download(event, recording_id="r2")
+
+		self.assertIn(f"teams-recording-{event.name}-part-2.mp4", response.headers["Content-Disposition"])
+		self.assertIn("/recordings/r2/content", requested.call_args.args[1])
+
+	def test_the_first_part_is_sent_when_none_is_named(self):
+		event = self._recorded("r1", "r2")
+
+		response, _fake, requested = self._download(event)
+
+		self.assertIn(f"teams-recording-{event.name}-part-1.mp4", response.headers["Content-Disposition"])
+		self.assertIn("/recordings/r1/content", requested.call_args.args[1])
+
+	def test_the_length_microsoft_states_is_passed_on(self):
+		"""Without it the browser shows an unknown-duration spinner for a gigabyte download."""
+		event = self._recorded("r1")
+
+		response, _fake, _requested = self._download(event, headers={"Content-Length": "1610612736"})
+
+		self.assertEqual(response.headers["Content-Length"], "1610612736")
+
+	def test_a_length_is_never_invented(self):
+		"""A Content-Length that does not match the body truncates the file the person keeps."""
+		event = self._recorded("r1")
+
+		response, _fake, _requested = self._download(event)
+
+		self.assertNotIn("Content-Length", response.headers)
+
+	def test_microsofts_own_content_type_wins(self):
+		"""It encoded the file; mp4 is only what Teams has always produced, not a promise."""
+		event = self._recorded("r1")
+
+		response, _fake, _requested = self._download(event, headers={"Content-Type": "video/quicktime"})
+
+		self.assertEqual(response.headers["Content-Type"], "video/quicktime")
+
+	def test_the_connection_is_released_when_the_response_closes(self):
+		"""A download someone cancels halfway must not pin a socket until the request times out."""
+		event = self._recorded("r1")
+
+		response, fake, _requested = self._download(event)
+		response.close()
+
+		self.assertTrue(fake.closed)
+
+	def test_a_recording_id_from_another_meeting_never_reaches_microsoft(self):
+		"""The ownership check has to happen before the fetch, or the refusal costs a Graph call
+		on someone else's recording — which is half of what the guard is there to prevent."""
+		event = self._recorded("r1")
+
+		with patch.object(graph, "graph_request") as requested:
+			with self.assertRaises(frappe.PermissionError):
+				artifacts.download_recording(event.name, recording_id="someone-elses")
+
+		requested.assert_not_called()
+
+	def test_a_meeting_with_no_recording_says_so_instead_of_asking(self):
+		event = self._finished_meeting()
+
+		with patch.object(graph, "graph_request") as requested:
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.download_recording(event.name)
+
+		requested.assert_not_called()
+		self.assertIn("no recording", str(ctx.exception))
+
+	def test_a_refusal_from_microsoft_mentions_the_expiry(self):
+		"""By the time a download 404s, the likeliest cause is the meeting ageing out, and
+		"not found" on its own sends people looking in OneDrive for a file that is still there."""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		event = self._recorded("r1")
+
+		with patch.object(graph, "graph_request", side_effect=MsGraphError("404: itemNotFound")):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.download_recording(event.name)
+
+		self.assertIn("itemNotFound", str(ctx.exception))
+		self.assertIn("60 days", str(ctx.exception))

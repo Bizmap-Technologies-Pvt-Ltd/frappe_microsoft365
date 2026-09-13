@@ -27,6 +27,7 @@
   "fetch_artifacts_automatically",
   "column_break_sync",
   "last_sync",
+  "last_sync_seconds",
   "last_error",
   "delta_link",
   "delta_window_end"
@@ -166,6 +167,14 @@
    "fieldtype": "Datetime",
    "label": "Last Sync",
    "read_only": 1
+  },
+  {
+   "fieldname": "last_sync_seconds",
+   "fieldtype": "Float",
+   "label": "Last Sync Seconds",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "How long the last sync took. Slow ones run in the background."
   },
   {
    "fieldname": "last_error",

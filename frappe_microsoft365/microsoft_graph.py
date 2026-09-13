@@ -11,9 +11,11 @@ import time
 
 import frappe
 import requests
+from http import cookiejar
 from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
+from requests.adapters import HTTPAdapter
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -61,6 +63,17 @@ DEFAULT_RETRY_AFTER_SECONDS = 2
 
 #: Safety valve for link-following loops (nextLink / deltaLink paging).
 MAX_PAGES = 50
+
+#: Connection pool for the shared session, sized for a single worker process: Graph and the
+#: login authority are the only hosts it ever talks to, and a worker runs a handful of calls
+#: at a time, so a small pool with headroom is enough.
+POOL_CONNECTIONS = 10
+POOL_MAXSIZE = 20
+
+#: How far ahead of expiry a cached token stops being served. The stored expiry is already five
+#: minutes early (see _store_tokens), so this only covers the call that starts in the last
+#: moments of the window and would otherwise have the token die under it in flight.
+TOKEN_CACHE_LEEWAY_SECONDS = 60
 
 
 class MsGraphError(frappe.ValidationError):
@@ -252,6 +265,37 @@ def _raise_on_token_error(result):
 
 # --- per-calendar token management ---------------------------------------------------
 
+def _token_cache():
+	"""The request-local token cache: ``{calendar name: (token, expiry)}``.
+
+	frappe.local is the point. A module-level dict would outlive the request inside a
+	long-running worker, and one worker serves every site on the bench — a calendar name that
+	exists on two sites would hand site B the access token belonging to site A.
+	"""
+	cache = getattr(frappe.local, "microsoft365_token_cache", None)
+	if cache is None:
+		cache = {}
+		frappe.local.microsoft365_token_cache = cache
+	return cache
+
+
+def _cache_token(calendar_name, token, expiry):
+	_token_cache()[calendar_name] = (token, expiry)
+
+
+def clear_token_cache(calendar_name=None):
+	"""Forget one calendar's cached token, or all of them. Call this wherever a token changes.
+
+	The 401 path depends on it: back-dating token_expiry only forces a refresh if the cached
+	copy goes with it, otherwise the retry re-sends the token Graph has just refused and 401s
+	again, for as many times as it is allowed to.
+	"""
+	if calendar_name is None:
+		_token_cache().clear()
+	else:
+		_token_cache().pop(calendar_name, None)
+
+
 def _store_tokens(calendar_name, result):
 	expiry = add_to_date(now_datetime(), seconds=(result.get("expires_in") or 3600) - 300)
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
@@ -264,16 +308,37 @@ def _store_tokens(calendar_name, result):
 		doc.microsoft_user_email = claims.get("preferred_username")
 	doc.flags.ignore_permissions = True
 	doc.save()
+
+	# Whatever the rest of the request does next has to use the token that was just minted; the
+	# cache still holds the one this refresh replaced.
+	token = result.get("access_token")
+	if token:
+		_cache_token(calendar_name, token, expiry)
+	else:
+		clear_token_cache(calendar_name)
 	return doc
 
 
 def get_valid_access_token(calendar):
-	"""Return a non-expired access token for a Microsoft Calendar doc/name, refreshing if needed."""
+	"""Return a non-expired access token for a Microsoft Calendar doc/name, refreshing if needed.
+
+	Every Graph call lands here, and resolving a token from storage is two queries plus an AES
+	decrypt, so the answer is kept for the rest of the request: a 50-page delta run otherwise
+	pays that 50 times over for a token that stays valid for the whole run.
+	"""
 	name = calendar if isinstance(calendar, str) else calendar.name
+
+	cached = _token_cache().get(name)
+	if cached:
+		cached_token, cached_expiry = cached
+		if cached_expiry > add_to_date(now_datetime(), seconds=TOKEN_CACHE_LEEWAY_SECONDS):
+			return cached_token
+
 	doc = frappe.get_doc("Microsoft Calendar", name)
 	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
 	expiry = get_datetime(doc.token_expiry) if doc.token_expiry else None
 	if token and expiry and expiry > now_datetime():
+		_cache_token(name, token, expiry)
 		return token
 	# refresh
 	refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
@@ -286,11 +351,68 @@ def get_valid_access_token(calendar):
 
 # --- authenticated Graph requests ----------------------------------------------------
 
-def graph_request(method, path, calendar, json=None, params=None, headers=None, raw=False, _retried=False):
+_session = None
+
+
+class _RefuseCookies(cookiejar.DefaultCookiePolicy):
+	"""A cookie policy that accepts nothing. See _graph_session."""
+
+	def set_ok(self, cookie, request):
+		return False
+
+
+def _graph_session():
+	"""The pooled HTTPS session for this process, built on first use.
+
+	Every Graph call used to open its own TCP+TLS connection. Measured against
+	graph.microsoft.com that is ~44 ms per call versus ~11 ms on a socket that is already open —
+	three quarters of the transport time — and a 50-page delta run pays it once per page.
+
+	No urllib3 Retry is mounted, deliberately: graph_request owns the 401/429 policy including
+	Retry-After, and an adapter retrying underneath it would multiply every attempt invisibly.
+	"""
+	global _session
+	if _session is None:
+		session = requests.Session()
+		# One session serves every site in this worker, so anything it remembers is shared by
+		# all of them. The bearer token never touches it — that is built per call — but a plain
+		# Session also keeps a cookie jar, and Graph setting one affinity cookie would replay it
+		# across tenants. Graph v1.0 authenticates purely by token, so it needs no cookies.
+		session.cookies.set_policy(_RefuseCookies())
+		adapter = HTTPAdapter(pool_connections=POOL_CONNECTIONS, pool_maxsize=POOL_MAXSIZE)
+		session.mount("https://", adapter)
+		session.mount("http://", adapter)
+		_session = session
+	return _session
+
+
+def _http_request(method, url, **kwargs):
+	"""The single point where a Graph call reaches the network — and the seam the tests mock.
+
+	Pooling leaves no module-level ``requests.request`` to intercept, because the call is
+	dispatched on the long-lived session instead, so this is what a test patches to keep the
+	suite off the network.
+	"""
+	return _graph_session().request(method, url, **kwargs)
+
+
+def _release(resp):
+	"""Hand the pooled connection back before walking away from a response.
+
+	Only bites when stream=True: the body is still on the wire, and a streamed response nobody
+	reads keeps its connection checked out of the pool for the life of the process.
+	"""
+	resp.close()
+
+
+def graph_request(method, path, calendar, json=None, params=None, headers=None, raw=False, stream=False, _retried=False):
 	"""Authenticated Graph v1.0 call. Refreshes the token once on 401 and retries.
 
 	`path` is relative to GRAPH_BASE (e.g. '/me/events') or an absolute graph URL.
 	Returns parsed JSON (or the requests.Response when raw=True).
+
+	`stream` leaves the body on the wire for the caller to consume in chunks — a Teams recording
+	runs to gigabytes, and buffering one to hand back a .content is how a worker gets killed.
 	"""
 	name = calendar if isinstance(calendar, str) else calendar.name
 	token = get_valid_access_token(name)
@@ -298,39 +420,55 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 	req_headers = {"Authorization": f"Bearer {token}"}
 	if headers:
 		req_headers.update(headers)
-	resp = requests.request(method, url, json=json, params=params, headers=req_headers, timeout=30)
+	resp = _http_request(
+		method, url, json=json, params=params, headers=req_headers, timeout=30, stream=stream
+	)
 
 	if resp.status_code == 401 and not _retried:
-		# force refresh then retry once
+		# Force refresh then retry once. Dropping the cached token is half of the force: without
+		# it the retry would resolve to the very token Graph has just rejected.
 		frappe.db.set_value("Microsoft Calendar", name, "token_expiry", add_to_date(now_datetime(), seconds=-60))
-		return graph_request(method, path, name, json=json, params=params, headers=headers, raw=raw, _retried=True)
+		clear_token_cache(name)
+		_release(resp)
+		return graph_request(
+			method, path, name, json=json, params=params, headers=headers,
+			raw=raw, stream=stream, _retried=True,
+		)
 
 	if resp.status_code == 429 and not _retried:
 		# Honour Retry-After for short waits; longer backoffs are left to the next run.
 		wait = _retry_after_seconds(resp)
 		if wait is not None:
 			time.sleep(wait)
+			_release(resp)
 			return graph_request(
-				method, path, name, json=json, params=params, headers=headers, raw=raw, _retried=True
+				method, path, name, json=json, params=params, headers=headers,
+				raw=raw, stream=stream, _retried=True,
 			)
 
 	if resp.status_code == 429:
+		_release(resp)
 		frappe.throw(
 			_("Microsoft Graph rate limit hit (429). The next scheduled sync will retry."), MsGraphError
 		)
 
 	if resp.status_code == 410:
 		# Delta token expired/invalid — the caller has to restart with a full sync.
+		detail = _safe_error(resp)
+		_release(resp)
 		frappe.throw(
-			f"Microsoft Graph sync state expired ({_safe_error(resp)}). A full re-sync is required.",
+			f"Microsoft Graph sync state expired ({detail}). A full re-sync is required.",
 			MsGraphResyncRequired,
 		)
 
 	if resp.status_code >= 400:
 		detail = _safe_error(resp)
+		_release(resp)
 		frappe.throw(f"Microsoft Graph {method} {path} failed ({resp.status_code}): {detail}", MsGraphError)
 
-	if raw:
+	if raw or stream:
+		# `stream` too: touching .content below would pull the whole body into memory, which is
+		# the one thing a streaming caller asked us not to do.
 		return resp
 	if resp.status_code == 204 or not resp.content:
 		return {}

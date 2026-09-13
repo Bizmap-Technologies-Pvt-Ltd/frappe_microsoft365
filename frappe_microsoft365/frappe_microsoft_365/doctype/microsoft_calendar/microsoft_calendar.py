@@ -185,13 +185,54 @@ def disconnect(calendar_name: str):
 		"oauth_state": "", "oauth_state_expiry": None,
 		"delta_link": "", "delta_window_end": None, "last_error": "",
 	})
+	# Tokens are also held in a request-local cache to keep a paging run from re-reading and
+	# re-decrypting them on every call. Wiping the row without wiping that cache would leave a
+	# live token in memory for the rest of this request — harmless today, because nothing here
+	# calls Graph afterwards, and exactly the kind of thing that stops being harmless quietly.
+	graph.clear_token_cache(calendar_name)
 	return {"disconnected": True}
 
 
 @frappe.whitelist()
-def sync(calendar_name: str | None = None):
-	"""Two-way sync entrypoint (M2). Owner-checked."""
+def sync(calendar_name: str | None = None, run_inline: int = 0):
+	"""Two-way sync entrypoint (M2). Owner-checked.
+
+	Stays in the request whenever it can. The pulled/deleted/pushed counts are the reason
+	anyone presses Sync Now, and a job queued in the background can only ever answer
+	"queued" — so an incremental run, which is a second or two, is worth holding the request
+	open for.
+
+	A sync that is known in advance to be slow goes to a worker instead. A first sync walks up
+	to 50 Graph pages plus a call per pending push; it outlives the gunicorn timeout, and the
+	browser is handed a 504 while the sync quietly finishes server-side. Nothing is broken and
+	it looks entirely broken. The reasons travel back with the answer so the form can say why
+	it has no counts for the person this time.
+	"""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
-	from frappe_microsoft365.microsoft_calendar_sync import sync_calendar
+	from frappe_microsoft365.microsoft_calendar_sync import (
+		background_reasons,
+		enqueue_sync,
+		sync_blocked_by_dead_queue,
+		sync_calendar,
+	)
+
+	# "Run now anyway", pressed by someone who has just been told the queue is dead. They are
+	# choosing a long wait with their eyes open, which is a different thing from us choosing it
+	# for them, so this is the one path that ignores how slow the sync is expected to be.
+	if frappe.utils.cint(run_inline):
+		return sync_calendar(calendar_name)
+
+	reasons = background_reasons(doc)
+	if reasons:
+		# Asked before queueing, not after: frappe.enqueue succeeds perfectly well against a
+		# Redis nobody is listening to, so a job id here would be a receipt for work that will
+		# never happen. This is the one place a person is waiting to be told that.
+		blocked = sync_blocked_by_dead_queue()
+		if blocked:
+			return {"queued": False, "blocked": True, "health": blocked, "reasons": reasons}
+		# enqueue_sync owns the "queued" verdict; hard-coding True here would tell the person a
+		# job had started even on the run where the queue refused it.
+		return {**enqueue_sync(calendar_name), "reasons": reasons}
+
 	return sync_calendar(calendar_name)

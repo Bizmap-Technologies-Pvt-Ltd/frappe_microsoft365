@@ -56,6 +56,18 @@ def create_event_custom_fields():
 				# Sync is meaningless without knowing which connection to sync through, and
 				# without this the Event saves happily and then does nothing at all.
 				"mandatory_depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				# Two scheduled jobs filter tabEvent by this column every 15 minutes — the push
+				# looking for events to send, the artifacts job for meetings whose files may
+				# have landed — and EXPLAIN reported `type: ALL` for both: a full scan of every
+				# Event on the site, twice a quarter hour, forever.
+				#
+				# This is the only narrow column either query has. Everything else they filter
+				# on is a checkbox or a small integer, and an index over two or three distinct
+				# values is worse than none — the optimiser ignores it while every Event write
+				# still pays to maintain it. A site has a handful of Microsoft Calendars, so
+				# narrowing on the link alone leaves few enough rows that the rest of each
+				# filter costs nothing to apply.
+				"search_index": 1,
 			},
 			{
 				"fieldname": "custom_microsoft_calendar_column",

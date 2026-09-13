@@ -32,9 +32,21 @@ read-only Event fields so an Outlook invitation is legible from Frappe; replying
 Third-party meeting links (Zoom, Google Meet) are *not* extracted: Microsoft only populates
 ``onlineMeeting`` for its own providers, and everything else sits as free text in the body.
 
+What waits for Graph, and what does not
+--------------------------------------
+Saving an Event that Microsoft has never seen calls Graph inside the save: the join link Graph
+hands back is written onto the very document the browser is waiting for, and a link that turns
+up "in a minute" is not one anybody can paste into the invitation they are writing. Every other
+Graph call a save triggers — patching an event that already exists, deleting one — is queued
+instead, because nothing on screen depends on the answer and a throttled Graph can otherwise
+hold a save open for ten seconds. The scheduled pass queues as well, one job per calendar, so
+that a slow calendar cannot spend the budget of the calendars behind it in the list.
+
 All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors).
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.
 """
+
+import time
 
 import frappe
 from frappe import _
@@ -45,6 +57,7 @@ from frappe.utils import (
 	now_datetime,
 )
 
+from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired
 
@@ -62,6 +75,27 @@ EVENT_SELECT = (
 WINDOW_PAST_DAYS = 30
 WINDOW_FUTURE_DAYS = 180
 WINDOW_REFRESH_MARGIN_DAYS = 14
+
+#: How many Microsoft ids go into one prefetch query. A delta page can carry thousands of them,
+#: and at that size an ``IN`` clause stops behaving like a lookup: the statement grows past what
+#: the server wants to parse and the optimiser gives up on the index. Chunking keeps every
+#: prefetch a short indexed read, and still costs one query per 500 events rather than one each.
+PREFETCH_CHUNK = 500
+
+#: The scheduled pass puts one job per calendar on the long queue. A first sync reads a 210-day
+#: window page by page and pushes whatever is waiting, which does not fit the default queue's
+#: 300 seconds; 1500 is the long queue's own budget.
+SYNC_QUEUE = "long"
+SYNC_JOB_TIMEOUT = 1500
+
+#: Past this, a sync is no longer something to make a person sit and watch, so ``Sync Now`` sends
+#: it to a worker instead. Chosen well above a warm incremental run (a second or two) and below
+#: the point where a browser request starts to look hung rather than slow.
+SLOW_SYNC_SECONDS = 20
+
+#: Every event in the push backlog is its own Graph round trip, so a backlog of this size means
+#: the run is measured in tens of seconds before it has even started.
+LARGE_PUSH_BACKLOG = 25
 
 #: Ask Graph to hand back UTC so we never have to interpret a Windows timezone name.
 UTC_PREFER = {"Prefer": 'odata.maxpagesize=50, outlook.timezone="UTC"'}
@@ -188,7 +222,19 @@ def _calendar_lock(calendar_name):
 # --- entrypoints ---------------------------------------------------------------------
 
 def sync_all():
-	"""Scheduled entry: sync every enabled+authorized Microsoft Calendar. Never raises."""
+	"""Scheduled entry: queue a sync for every enabled+authorized Microsoft Calendar.
+
+	This used to sync them one after another inside the scheduler's own job. The scheduler
+	hands a cron hook the default queue's 300 second timeout and skips the tick entirely while
+	the previous run is still in flight, so at roughly fifteen seconds a calendar the twentieth
+	one is already past the budget and RQ kills the job part-way down the list. The list order
+	is stable, which makes it the same calendars at the tail that are cut off every single time
+	— they would never sync at all. A job per calendar gives each one its own timeout and lets
+	the workers run them in parallel.
+
+	Returns what it queued and what it left alone. Never raises: this is a scheduled hook, and
+	redis being unreachable is not a reason to take the whole pass down.
+	"""
 	try:
 		settings = frappe.get_cached_doc("Microsoft Settings")
 		if not settings.enabled:
@@ -201,13 +247,159 @@ def sync_all():
 		filters={"enabled": 1, "authorized": 1},
 		pluck="name",
 	)
-	results = []
+	queued, skipped = [], []
 	for name in names:
-		try:
-			results.append(sync_calendar(name))
-		except Exception:
-			frappe.log_error(title=f"MS Calendar sync failed: {name}")
-	return results
+		if enqueue_sync(name)["queued"]:
+			queued.append(name)
+		else:
+			# Already in flight from a previous tick, or the queue would not take it. Either
+			# way this calendar is somebody else's problem for the next fifteen minutes.
+			skipped.append(name)
+	return {"queued": queued, "skipped": skipped}
+
+
+def enqueue_sync(calendar_name):
+	"""Queue a full sync for this calendar; returns {"queued": bool, "job_id": str}.
+
+	The job id is per calendar and deduplicated, so "sync this one now" arriving five times —
+	a scheduled tick plus somebody pressing the button four times — is one sync rather than
+	five jobs racing each other for the same filelock.
+
+	Deliberately not whitelisted: it takes a calendar name and no owner check, and the callers
+	that face a browser (the Sync Now button) already do that check on the doc first.
+	"""
+	job_id = f"m365-sync-{calendar_name}"
+	# Who hears about the result: the person who pressed the button, when a person pressed one.
+	# The scheduled pass has nobody waiting on it, so its result is addressed to the calendar's
+	# owner instead of to whichever account the scheduler happens to run as.
+	notify_user = frappe.session.user if getattr(frappe.local, "request", None) else None
+
+	try:
+		if _sync_job_running(job_id):
+			return {"queued": False, "job_id": job_id}
+		frappe.enqueue(
+			"frappe_microsoft365.microsoft_calendar_sync.run_sync_job",
+			queue=SYNC_QUEUE,
+			timeout=SYNC_JOB_TIMEOUT,
+			job_id=job_id,
+			deduplicate=True,
+			calendar_name=calendar_name,
+			notify_user=notify_user,
+		)
+	except Exception:
+		# A queue that is full, a redis that is down, a site with no workers at all: none of
+		# those are worth an exception in a scheduled pass or under somebody's button.
+		frappe.log_error(title=f"MS Calendar sync could not be queued: {calendar_name}")
+		return {"queued": False, "job_id": job_id}
+
+	return {"queued": True, "job_id": job_id}
+
+
+def _queue_or_do_it_after_commit(method, *, job_id, queue, timeout=None, **kwargs):
+	"""Queue this, or — when nothing would ever run it — do it once the transaction commits.
+
+	The commit matters as much as the fallback. These jobs exist because ``on_update`` fires
+	*before* the row is written, so running the work inline right here would read the record as
+	it was before the save and push that to Microsoft. ``enqueue_after_commit`` is what the
+	queued path uses for exactly this reason, and the inline path has to honour it too.
+
+	Silence is the failure this guards. ``frappe.enqueue`` succeeds perfectly well against a
+	Redis with no workers behind it: the save returns, the queue grows, and Outlook quietly
+	stops matching Frappe until somebody notices months of drift.
+	"""
+	if background.is_available():
+		frappe.enqueue(
+			method, queue=queue, timeout=timeout, job_id=job_id, deduplicate=True,
+			enqueue_after_commit=True, **kwargs
+		)
+		return
+
+	# Same call the worker would have made, just later in this request. Dropped automatically
+	# if the transaction rolls back, because the callback registry is reset with it.
+	frappe.db.after_commit.add(
+		lambda: background.enqueue_or_run(method, job_id=job_id, queue=queue, timeout=timeout, **kwargs)
+	)
+
+
+def sync_blocked_by_dead_queue():
+	"""Why a queued sync would never run, or None when the queue is fine.
+
+	Only for the paths with a person waiting on the answer. The scheduled pass is already
+	executing inside a worker when it queues, so the question is answered by the fact that it
+	is running at all — and refusing there would turn a slow sync into no sync.
+
+	A sync is also the one job that must never quietly fall back to running inline: it is
+	queued precisely because it was judged too slow to hold a request open, so doing it here
+	anyway would trade a silent failure for a certain gateway timeout. The caller reports this
+	and offers to run it anyway, which is the person's decision to make, not ours.
+	"""
+	state = background.health()
+	if state["ok"]:
+		return None
+	return {"reasons": state["reasons"], "fixes": state["fixes"], "message": state["message"]}
+
+
+def _sync_job_running(job_id):
+	"""True when this calendar's sync job is already queued or running.
+
+	Its own function, and deliberately forgiving: a redis we cannot reach should answer "not
+	running" and let ``enqueue_sync`` report the real failure, rather than raise from a check
+	that only exists to avoid queueing a duplicate.
+	"""
+	try:
+		from frappe.utils.background_jobs import is_job_enqueued
+
+		return bool(is_job_enqueued(job_id))
+	except Exception:
+		return False
+
+
+def run_sync_job(calendar_name, notify_user=None):
+	"""Background entry: sync one calendar, then tell whoever is waiting that it finished."""
+	try:
+		result = sync_calendar(calendar_name)
+	except Exception as e:
+		frappe.log_error(title=f"MS Calendar sync job failed: {calendar_name}")
+		result = {
+			"ok": False,
+			"pulled": 0,
+			"deleted": 0,
+			"pushed": 0,
+			"message": _("Sync failed: {0}").format(str(e)),
+		}
+
+	_publish_sync_done(calendar_name, result, notify_user)
+	return result
+
+
+def _publish_sync_done(calendar_name, result, notify_user=None):
+	"""Tell one person their queued sync is done, so an open form can stop saying "queued".
+
+	Addressed to a user rather than broadcast: this says what happened to one person's mailbox,
+	and every other browser on the site has no use for it. The recipient is whoever asked, and
+	failing that the calendar's own owner — the only user with a reason to have that form open
+	when the scheduler is what started the run.
+	"""
+	user = notify_user or frappe.db.get_value("Microsoft Calendar", calendar_name, "user")
+	if not user:
+		return
+
+	try:
+		frappe.publish_realtime(
+			"microsoft365_sync_done",
+			{
+				"calendar": calendar_name,
+				"pulled": result.get("pulled") or 0,
+				"deleted": result.get("deleted") or 0,
+				"pushed": result.get("pushed") or 0,
+				"message": result.get("message") or "",
+			},
+			user=user,
+		)
+	except Exception:
+		# The sync itself has already been done and committed. Failing to announce it is a
+		# missing toast, not a failed sync, and must not be reported as one.
+		frappe.log_error(title=f"MS Calendar sync result could not be published: {calendar_name}")
 
 
 def sync_calendar(calendar_name=None):
@@ -242,6 +434,7 @@ def sync_calendar(calendar_name=None):
 
 def _sync_locked(doc):
 	calendar_name = doc.name
+	started = time.monotonic()
 	pulled = deleted = pushed = 0
 	messages = []
 	pull_ok = True
@@ -266,9 +459,21 @@ def _sync_locked(doc):
 	updates = {"last_error": "; ".join(messages)[:500] or ""}
 	if pull_ok:
 		updates["last_sync"] = now_datetime()
+
+	# The wall clock, because that is the question being asked: can somebody sit and watch the
+	# next one of these. Almost all of it is Graph's latency rather than ours, so counting our
+	# own work would answer a different question. Monotonic, so an NTP step mid-sync cannot
+	# record a negative run. Written only when the column is there: the field arrived after the
+	# rest of this doctype, and on a site that has the app but not yet the migration the
+	# watermark still has to land — that part is not optional, a duration for a hint is.
+	if frappe.get_meta("Microsoft Calendar").has_field("last_sync_seconds"):
+		updates["last_sync_seconds"] = round(time.monotonic() - started, 2)
+
 	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
-	# sync_all loops over every calendar in one job: committing here keeps this calendar's
-	# watermark even if a later calendar raises, so its window is not re-fetched forever.
+	# Committed here rather than left to the end of the job. The run above may have created
+	# meetings in Outlook and stored their ids, and if this job dies after that point — a
+	# timeout, a worker restart — an id that never committed makes the next run create the
+	# meeting all over again. The watermark belongs with them.
 	frappe.db.commit()  # nosemgrep
 
 	return {
@@ -278,6 +483,64 @@ def _sync_locked(doc):
 		"pushed": pushed,
 		"message": "; ".join(messages) or f"Pulled {pulled}, deleted {deleted}, pushed {pushed}.",
 	}
+
+
+# --- inline, or in the background? ----------------------------------------------------
+
+def background_reasons(doc):
+	"""Human-readable reasons this sync is likely to be slow, empty if it should run inline.
+
+	Reasons rather than a boolean because the caller puts them on screen: "this will take a
+	while" is a far easier thing to accept when it says which of these is true. An empty list
+	means an ordinary incremental run, which a person can sit and wait for.
+	"""
+	if isinstance(doc, str):
+		doc = frappe.get_doc("Microsoft Calendar", doc)
+
+	reasons = []
+	if doc.pull_from_microsoft_calendar:
+		if not doc.delta_link:
+			reasons.append(_("This is a first sync, so the whole calendar window is read."))
+		elif _delta_window_is_stale(doc):
+			reasons.append(_("The sync window has run out, so the calendar is read again in full."))
+
+	if doc.push_to_microsoft_calendar:
+		pending = _pending_push_count(doc)
+		if pending >= LARGE_PUSH_BACKLOG:
+			reasons.append(_("{0} events are waiting to be sent to Microsoft.").format(pending))
+
+	# Measured rather than guessed. How long a sync takes is decided by the mailbox at the other
+	# end — its size, and how hard Microsoft is throttling this tenant today — and the last run
+	# is the only evidence anyone has about that.
+	last_run = doc.get("last_sync_seconds")
+	if last_run and last_run >= SLOW_SYNC_SECONDS:
+		reasons.append(_("The last sync took {0} seconds.").format(int(last_run)))
+
+	return reasons
+
+
+def _pending_push_count(doc):
+	"""How many Events the next push would send to Graph.
+
+	The same filters as ``_push``, on purpose: an estimate that counts something other than what
+	the push actually does is worse than having no estimate at all.
+	"""
+	base_filters = {
+		"custom_sync_with_microsoft_calendar": 1,
+		"custom_microsoft_calendar": doc.name,
+		"custom_pulled_from_microsoft": 0,
+	}
+	pending = frappe.db.count("Event", {**base_filters, "custom_microsoft_event_id": ["is", "not set"]})
+	if doc.last_sync:
+		pending += frappe.db.count(
+			"Event",
+			{
+				**base_filters,
+				"custom_microsoft_event_id": ["is", "set"],
+				"modified": [">", doc.last_sync],
+			},
+		)
+	return pending
 
 
 # --- pull (Graph -> Frappe) ----------------------------------------------------------
@@ -311,12 +574,17 @@ def _pull(doc):
 		items, delta_link = graph.graph_delta(_initial_delta_path(), doc.name, headers=UTC_PREFER)
 		reuse_delta = False
 
+	# One query per 500 events instead of one per event. Asking "do I already have this one?"
+	# separately for every incoming event meant 500 round trips for a 500-event page, all of
+	# them answering a question the database can answer in a single indexed read.
+	existing_map = _existing_event_map(ev.get("id") for ev in items)
+
 	frappe.flags.in_microsoft_sync = True
 	upserted = removed = 0
 	try:
 		for ev in items:
 			try:
-				outcome = _upsert_event(doc, ev)
+				outcome = _upsert_event(doc, ev, existing_map)
 				if outcome == "deleted":
 					removed += 1
 				elif outcome in ("created", "updated"):
@@ -339,6 +607,33 @@ def _pull(doc):
 
 def _is_removed(ev):
 	return bool(ev.get("@removed")) or bool(ev.get("isCancelled"))
+
+
+def _existing_event_map(ms_ids):
+	"""Microsoft event id -> Frappe Event name, for the ids of one delta page.
+
+	Chunked rather than one enormous ``IN``: see PREFETCH_CHUNK. Ids that have no Frappe Event
+	are simply absent from the map, which is the same answer the per-event lookup gave.
+	"""
+	mapping = {}
+	# dict.fromkeys and not set(): a delta page is normally in a meaningful order, and keeping
+	# it makes the chunk boundaries reproducible when this has to be debugged against a log.
+	ids = [ms_id for ms_id in dict.fromkeys(ms_ids) if ms_id]
+
+	for start in range(0, len(ids), PREFETCH_CHUNK):
+		rows = frappe.get_all(
+			"Event",
+			filters={"custom_microsoft_event_id": ["in", ids[start : start + PREFETCH_CHUNK]]},
+			fields=["name", "custom_microsoft_event_id"],
+			# Spelled out rather than relying on get_all's default, because a page capped at 20
+			# rows would not fail: the events past the cap would read as new and be created a
+			# second time. This is the one argument here that must not be wrong.
+			limit_page_length=0,
+		)
+		for row in rows:
+			mapping[row.custom_microsoft_event_id] = row.name
+
+	return mapping
 
 
 # --- attendees (Graph -> Frappe) -----------------------------------------------------
@@ -475,8 +770,13 @@ def _target_values(doc, ev, locally_originated):
 	return values
 
 
-def _upsert_event(doc, ev):
+def _upsert_event(doc, ev, existing_map=None):
 	"""Create/update/delete the Frappe mirror of one Microsoft event.
+
+	``existing_map`` is the pull's prefetched id -> Event name map. Called without one — the
+	single-event paths, and the tests — the original per-event lookup still answers, because an
+	optimisation that only works when it is handed the right argument is a trap for the next
+	caller rather than a speed-up.
 
 	Returns "deleted", "updated", "created" or "skipped".
 	"""
@@ -484,11 +784,20 @@ def _upsert_event(doc, ev):
 	if not ms_id:
 		return "skipped"
 
-	existing = frappe.db.get_value("Event", {"custom_microsoft_event_id": ms_id}, "name")
+	if existing_map is None:
+		existing = frappe.db.get_value("Event", {"custom_microsoft_event_id": ms_id}, "name")
+	else:
+		existing = existing_map.get(ms_id)
 
 	if _is_removed(ev):
 		if existing:
 			frappe.delete_doc("Event", existing, ignore_permissions=True, force=True)
+			# The map is this page's picture of what exists, so it has to follow what the page
+			# does to it. One delta page can carry the same id twice — an event changed twice
+			# between runs — and a stale entry would then have the second copy update an Event
+			# that has just been deleted.
+			if existing_map is not None:
+				existing_map.pop(ms_id, None)
 			return "deleted"
 		return "skipped"
 
@@ -518,7 +827,15 @@ def _upsert_event(doc, ev):
 	event.flags.ignore_permissions = True
 	event.flags.ignore_mandatory = True
 	event.save()
-	return "updated" if existing else "created"
+
+	if existing:
+		return "updated"
+
+	# Same reason as the delete above: a second copy of this id later in the page must update
+	# the Event this call just created instead of creating another one beside it.
+	if existing_map is not None:
+		existing_map[ms_id] = event.name
+	return "created"
 
 
 def _apply(doc, values):
@@ -842,7 +1159,15 @@ def event_validate(doc, method=None):
 
 
 def event_on_update(doc, method=None):
-	"""Push/patch a single Event to Graph on save. Best-effort, never blocks the save."""
+	"""Create in Graph inside the save; queue the patch for an event that already exists.
+
+	A creation is the one Graph call somebody is genuinely waiting for: the id and the Teams
+	join link come back in its response and are written onto the document the browser is about
+	to be handed, so doing it later would mean saving a Teams meeting whose link is not there
+	yet. A patch answers with nothing anyone can see, and paying 300-900 milliseconds of Graph
+	latency for it on every save — up to ten seconds when Microsoft throttles and the retry
+	sleeps — is a cost with no buyer.
+	"""
 	if frappe.flags.in_microsoft_sync:
 		return
 	if not getattr(doc, "custom_sync_with_microsoft_calendar", 0):
@@ -858,34 +1183,113 @@ def event_on_update(doc, method=None):
 			return
 
 		if doc.custom_microsoft_event_id:
-			patched = graph.graph_request(
-				"PATCH",
-				f"/me/events/{doc.custom_microsoft_event_id}",
-				cal.name,
-				json=_event_to_graph_body(doc),
+			_queue_or_do_it_after_commit(
+				"frappe_microsoft365.microsoft_calendar_sync.patch_event_in_graph",
+				queue="short",
+				# Ten rapid saves are ten requests, each queueing after its own commit, so
+				# without an id per Event they would be ten patches sending increasingly stale
+				# bodies. One job per Event, and it reads the record when it runs.
+				job_id=f"m365-event-patch-{doc.name}",
+				# on_update runs before this transaction commits. A worker that started now
+				# could read the row as it was before the save — or, on a brand new Event, not
+				# find it at all — and would then patch Outlook back to the old text.
+				event_name=doc.name,
 			)
-			_store_graph_response(doc.name, patched or {}, cal.name, live_doc=doc)
 		else:
 			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name, live_doc=doc)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
 
 
+def patch_event_in_graph(event_name):
+	"""Send a Frappe Event's current state to Graph. Runs in a background job.
+
+	Everything is read here rather than carried in the job's arguments. Between the save that
+	queued this and a worker picking it up the Event may have been edited again, moved to
+	another calendar, unticked, or deleted outright — so this is an instruction to sync the
+	record as it now stands, never a snapshot of how it looked when somebody pressed Ctrl+S.
+	"""
+	if not frappe.db.exists("Event", event_name):
+		return
+
+	doc = frappe.get_doc("Event", event_name)
+	if not doc.custom_sync_with_microsoft_calendar or not doc.custom_microsoft_calendar:
+		return
+	if doc.custom_pulled_from_microsoft or not doc.custom_microsoft_event_id:
+		return
+
+	# The guard on the doc_events side reads a flag that lives in the request that set it, and
+	# a worker has no such request: it starts with the flag unset. Setting it here keeps the
+	# guard's meaning true inside the job — "Frappe is talking to Microsoft right now, do not
+	# bounce anything back" — so no write this push makes can queue another patch behind it.
+	previous = frappe.flags.in_microsoft_sync
+	frappe.flags.in_microsoft_sync = True
+	try:
+		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
+		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
+			return
+		patched = graph.graph_request(
+			"PATCH",
+			f"/me/events/{doc.custom_microsoft_event_id}",
+			cal.name,
+			json=_event_to_graph_body(doc),
+		)
+		_store_graph_response(doc.name, patched or {}, cal.name)
+	except Exception:
+		frappe.log_error(title=f"MS Event patch failed: {event_name}")
+	finally:
+		frappe.flags.in_microsoft_sync = previous
+
+
 def event_on_trash(doc, method=None):
-	"""Delete the mirrored Microsoft event when the Frappe Event is deleted. Best-effort."""
+	"""Queue the removal of the mirrored Microsoft event. Best-effort, never blocks the delete."""
 	if frappe.flags.in_microsoft_sync:
 		return
 	ms_id = getattr(doc, "custom_microsoft_event_id", None)
 	cal_name = getattr(doc, "custom_microsoft_calendar", None)
 	if not ms_id or not cal_name:
 		return
+
 	try:
-		cal = frappe.get_cached_doc("Microsoft Calendar", cal_name)
-		if not cal.enabled or not cal.authorized:
-			return
-		graph.graph_request("DELETE", f"/me/events/{ms_id}", cal.name)
+		_queue_or_do_it_after_commit(
+			"frappe_microsoft365.microsoft_calendar_sync.delete_event_in_graph",
+			queue="short",
+			# Keyed on the Microsoft id, not the Event name: the Event is what is going away,
+			# and the id is the only half of this pair that still means something afterwards.
+			job_id=f"m365-event-delete-{ms_id}",
+			# A delete that is rolled back must not have already removed the meeting from
+			# somebody's Outlook, so this job only exists once the deletion is real.
+			calendar_name=cal_name,
+			ms_event_id=ms_id,
+		)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_trash sync failed: {doc.name}")
+
+
+def delete_event_in_graph(calendar_name, ms_event_id):
+	"""Remove an event from Microsoft after its Frappe Event has been deleted.
+
+	Takes two plain ids and no document reference, because by the time a worker runs this the
+	Frappe Event is gone: there is nothing left to load, and a job that tried would find
+	nothing and quietly leave the meeting sitting in the calendar forever.
+
+	What can still be re-checked is re-checked. The connection may have been disconnected in
+	the meantime, and some other Event may have come to carry this same Microsoft id — deleting
+	it then would strand that mirror, and the next pull would delete it locally too, taking a
+	live meeting off both sides.
+	"""
+	if not calendar_name or not ms_event_id:
+		return
+
+	try:
+		if frappe.db.exists("Event", {"custom_microsoft_event_id": ms_event_id}):
+			return
+		cal = frappe.get_cached_doc("Microsoft Calendar", calendar_name)
+		if not cal.enabled or not cal.authorized:
+			return
+		graph.graph_request("DELETE", f"/me/events/{ms_event_id}", cal.name)
+	except Exception:
+		frappe.log_error(title=f"MS Event delete failed: {ms_event_id}")
 
 
 # --- read-only fetch for external consumers (e.g. Bizmap CRM) ------------------------

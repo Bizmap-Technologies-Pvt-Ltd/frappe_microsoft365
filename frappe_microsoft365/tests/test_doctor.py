@@ -4,7 +4,7 @@ Every rule is exercised against plain config dicts — no tenant, no network, no
 That is deliberate: the doctor has to be trustworthy before anyone has a tenant to try it on.
 """
 
-from frappe_microsoft365 import doctor
+from frappe_microsoft365 import background, doctor
 from frappe_microsoft365.doctor import (
 	APP_ONLY_SCOPE,
 	DELEGATED_SCOPES,
@@ -356,6 +356,139 @@ class TestMissingCustomFields(BaseTestCase):
 
 		self.assertTrue(result["matched"])
 		self.assertIn("migrate", result["detail"].lower())
+
+
+def background_state(*problems, **overrides):
+	"""A dict shaped like ``background.health()`` output, with nothing wrong by default."""
+	values = {
+		"ok": not problems,
+		"problems": list(problems),
+		"reasons": [p["reason"] for p in problems],
+		"fixes": [p["fix"] for p in problems],
+		"scheduler_inactive": False,
+		"redis": True,
+		"workers": 2,
+		"queued": 0,
+		"queues": {"default": 0},
+		"jobs": [
+			{
+				"name": "frappe_microsoft365.microsoft_calendar_sync.sync_all",
+				"method": "frappe_microsoft365.microsoft_calendar_sync.sync_all",
+				"last_execution": "2026-09-13 10:00:00",
+				"minutes_ago": 5,
+				"stale": False,
+			}
+		],
+		"backlog": False,
+		"message": "",
+	}
+	values.update(overrides)
+	return values
+
+
+def problem(code, reason="something is wrong", fix="run something"):
+	return {"code": code, "reason": reason, "fix": fix}
+
+
+class TestBackgroundJobsCheck(BaseTestCase):
+	"""Queued work that never runs is the one fault in this app that produces no error at all.
+
+	No traceback, no log line, no wrong answer — just a calendar that quietly stops moving. If
+	the doctor does not say it, nothing does.
+	"""
+
+	def test_a_working_queue_says_nothing(self):
+		self.assertEqual(doctor.check_background_jobs(background_state()), [])
+
+	def test_a_dead_scheduler_carries_the_command_that_revives_it(self):
+		found = doctor.check_background_jobs(
+			background_state(
+				problem(background.SCHEDULER_OFF, fix="Run `bench --site x enable-scheduler`."),
+				scheduler_inactive=True,
+			)
+		)
+
+		self.assertIn("background.scheduler_off", ids(found, FAIL))
+		self.assertIn("enable-scheduler", found[0]["fix"])
+
+	def test_zero_workers_with_redis_up_is_a_failure_not_a_warning(self):
+		"""It looks like success from every other angle, which is what makes it worth a FAIL."""
+		found = doctor.check_background_jobs(
+			background_state(
+				problem(background.NO_WORKER, fix="Start one with `bench worker --queue default`."),
+				workers=0,
+			)
+		)
+
+		self.assertIn("background.no_worker", ids(found, FAIL))
+		self.assertIn("bench worker", found[0]["fix"])
+		self.assertIn("sit in the queue forever", found[0]["detail"])
+
+	def test_an_unreadable_worker_count_is_only_a_warning(self):
+		found = doctor.check_background_jobs(
+			background_state(problem(background.WORKERS_UNKNOWN), workers=None)
+		)
+
+		self.assertIn("background.workers_unknown", ids(found, WARN))
+
+	def test_stale_jobs_are_reported_even_when_everything_else_looks_fine(self):
+		"""The scheduler process not running is invisible to the other four readings."""
+		found = doctor.check_background_jobs(
+			background_state(
+				problem(background.JOBS_STALE, fix="Check `bench doctor`."),
+				jobs=[
+					{
+						"name": "sync_all",
+						"method": "frappe_microsoft365.microsoft_calendar_sync.sync_all",
+						"last_execution": None,
+						"minutes_ago": None,
+						"stale": True,
+					}
+				],
+			)
+		)
+
+		self.assertIn("background.jobs_stale", ids(found, FAIL))
+		self.assertIn("has never run", found[0]["detail"])
+
+	def test_every_finding_carries_all_five_readings(self):
+		"""'No worker' and '203 waiting' and 'last ran never' are one sentence told three ways;
+		an admin shown one without the others tends to fix the wrong end of it."""
+		detail = doctor.check_background_jobs(
+			background_state(problem(background.NO_WORKER), workers=0, queued=203)
+		)[0]["detail"]
+
+		for expected in ("Scheduler", "Redis", "Workers", "203", "sync_all"):
+			self.assertIn(expected, detail)
+
+	def test_two_faults_get_two_commands(self):
+		found = doctor.check_background_jobs(
+			background_state(
+				problem(background.SCHEDULER_OFF, fix="enable-scheduler"),
+				problem(background.NO_WORKER, fix="bench worker"),
+				scheduler_inactive=True,
+				workers=0,
+			)
+		)
+
+		self.assertEqual(len(found), 2)
+		self.assertEqual({f["fix"] for f in found}, {"enable-scheduler", "bench worker"})
+
+	def test_a_backlog_is_worth_saying_even_on_an_otherwise_healthy_bench(self):
+		"""203 jobs deep is not a fault, but it is why the sync someone is staring at has not
+		happened yet."""
+		found = doctor.check_background_jobs(background_state(queued=203, backlog=True))
+
+		self.assertIn("background.backlog", ids(found, WARN))
+		self.assertIn("203", found[0]["title"])
+
+	def test_the_real_probe_and_this_check_agree_on_shape(self):
+		"""A renamed key must fail here rather than in production at the moment a queue dies."""
+		for item in doctor.check_background_jobs(background.health(refresh=True)):
+			self.assertIn(item["status"], (WARN, FAIL))
+			self.assertTrue(item["title"])
+			self.assertTrue(item["fix"])
+			self.assertTrue(item["detail"])
 
 
 class TestErrorDecoder(BaseTestCase):

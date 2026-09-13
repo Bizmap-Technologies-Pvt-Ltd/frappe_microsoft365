@@ -11,7 +11,10 @@ The two are treated differently on purpose:
 
 Why the recording cannot simply be a link: ``recordingContentUrl`` is a Graph endpoint that
 requires a bearer token, so a browser given that URL gets 401, not a video. The download below
-streams it through Frappe instead, authorised by Frappe's own permissions.
+proxies it through Frappe instead, authorised by Frappe's own permissions — chunk by chunk and
+never whole. A single recording runs to 1.5 GB (see below), so holding one in a web worker
+would cost that much resident memory per concurrent download and make the browser wait for the
+last byte before it sees the first, which is past the default 120-second worker timeout.
 
 Nothing is ready the moment a meeting ends
 ------------------------------------------
@@ -47,7 +50,9 @@ import json
 import frappe
 from frappe import _
 from frappe.utils import add_to_date, cint, get_datetime, now_datetime
+from werkzeug.wrappers import Response
 
+from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.microsoft_calendar_sync import _check_owner
 from frappe_microsoft365.microsoft_graph import MsGraphError
@@ -68,6 +73,14 @@ RETRY_MINUTES = (10, 25, 45, 75, 120, 180, 270, 360, 480, 600, 720, 960, 1200, 1
 #: or an edit pushes it out by another 60 days, so this is the earliest it can go, not a
 #: promise that it has.
 MEETING_EXPIRY_DAYS = 60
+
+#: Bytes read from Graph, and written to the browser, per step of a recording download.
+#:
+#: The number only has to be big enough that per-chunk overhead disappears and small enough that
+#: a worker's memory stays flat: at 256 KB a worst-case 1.5 GB part is ~6,000 reads holding a
+#: quarter of a megabyte at a time, where 8 KB would be ~200,000 reads for no benefit and 16 MB
+#: would put a visible sawtooth back into the worker's resident size.
+RECORDING_CHUNK_BYTES = 256 * 1024
 
 
 def _processing_note():
@@ -207,6 +220,17 @@ def _next_step(state):
 			"Nothing is checking automatically: use Get Transcript & Recording, or tick Fetch "
 			"transcripts after meetings on this Microsoft Calendar."
 		)
+
+	# The tickbox only decides whether the catch-up job *would* ask; something still has to run
+	# it. On a bench with no scheduler or no worker it never runs, and "Checking again around
+	# 14:48" is then exactly the same class of lie as the tickbox being off — worse, in fact,
+	# because it names a time. Say what is wrong and how to end it, in the same breath.
+	queue = background.health()
+	if not queue["ok"]:
+		return _(
+			"Nothing is checking automatically: {0} {1} Use Get Transcript & Recording in the meantime."
+		).format(queue["reasons"][0], queue["fixes"][0])
+
 	if state["next_check"] and state["next_check"] > now_datetime():
 		return _("Checking again around {0}.").format(
 			frappe.utils.format_datetime(state["next_check"])
@@ -504,8 +528,17 @@ def _due_events(calendars):
 def download_recording(event: str, recording_id: str | None = None):
 	"""Stream one recording from Microsoft through Frappe.
 
-	Not stored: the bytes pass through and are handed to the browser. Graph's own URL cannot be
-	given to a browser because it needs a bearer token.
+	Not stored, and not buffered either: the bytes are pulled from Graph and pushed to the
+	browser a chunk at a time. Graph's own URL cannot be given to a browser because it needs a
+	bearer token, so this worker has to sit in the middle — but a Teams part reaches 1.5 GB, and
+	reading ``resp.content`` would put all of that in the worker's memory before the download
+	even began.
+
+	Hence a werkzeug Response returned rather than ``frappe.local.response``: the response
+	builder assigns the body to ``response.data`` (frappe/utils/response.py, ``as_raw``), which
+	is a second full copy and cannot stream by construction. A whitelisted method that returns a
+	Response instead has it passed through untouched — frappe/handler.py and
+	frappe/api/__init__.py both check ``isinstance(data, Response)`` before doing anything else.
 	"""
 	doc, calendar_name, meeting_id = _event_for_artifacts(event)
 	stored = _stored_recordings(doc)
@@ -522,11 +555,16 @@ def download_recording(event: str, recording_id: str | None = None):
 	part = next((i for i, r in enumerate(stored, start=1) if r.get("id") == recording_id), 1)
 
 	try:
+		# stream=True defers only the body: the status line and headers have already arrived, so
+		# graph_request still raises MsGraphError on a 4xx here, before any video is touched.
+		# That is why this try/except is the whole of the error handling — once the Response is
+		# returned there is no longer a request to fail.
 		resp = graph.graph_request(
 			"GET",
 			f"/me/onlineMeetings/{meeting_id}/recordings/{recording_id}/content",
 			calendar_name,
 			raw=True,
+			stream=True,
 		)
 	except MsGraphError as e:
 		frappe.throw(
@@ -534,6 +572,29 @@ def download_recording(event: str, recording_id: str | None = None):
 		)
 
 	suffix = f"-part-{part}" if len(stored) > 1 else ""
-	frappe.local.response.filename = f"teams-recording-{doc.name}{suffix}.mp4"
-	frappe.local.response.filecontent = resp.content
-	frappe.local.response.type = "download"
+	headers = resp.headers or {}
+
+	response = Response(
+		resp.iter_content(chunk_size=RECORDING_CHUNK_BYTES),
+		# Without direct_passthrough werkzeug consumes the iterator into one buffer to measure
+		# it, which is the whole thing this function exists to avoid.
+		direct_passthrough=True,
+		# Microsoft's own type first: it knows what it encoded. mp4 is the documented format and
+		# the only one Teams has ever returned, so it is the fallback rather than a guess.
+		content_type=headers.get("Content-Type") or "video/mp4",
+	)
+	response.headers.add(
+		"Content-Disposition", "attachment", filename=f"teams-recording-{doc.name}{suffix}.mp4"
+	)
+
+	# Passed on only when Graph states it. A browser with a length draws a real progress bar for
+	# what may be a twenty-minute download; a browser given a wrong one truncates the file, so
+	# there is nothing sensible to invent when the header is absent.
+	if headers.get("Content-Length"):
+		response.headers["Content-Length"] = headers["Content-Length"]
+
+	# The socket is ours to release: if the person cancels halfway, closing the response returns
+	# the connection to the pool instead of leaving it pinned until the request times out.
+	response.call_on_close(resp.close)
+
+	return response

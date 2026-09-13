@@ -26,6 +26,7 @@ import frappe
 from frappe import _
 from frappe.utils.password import get_decrypted_password
 
+from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
 
 # microsoft_graph does not import this module, so this direction is safe.
@@ -703,6 +704,102 @@ def check_event_custom_fields(missing):
 	]
 
 
+# --- background jobs ------------------------------------------------------------------
+
+def _background_summary(state):
+	"""The five readings, in one line, attached to whichever finding fires.
+
+	They travel together on purpose: "no worker" and "203 jobs waiting" and "last ran never"
+	are the same sentence told three ways, and an admin who sees one of them without the
+	others tends to fix the wrong end of it.
+	"""
+	workers = state.get("workers")
+	scheduler = state.get("scheduler_inactive")
+	redis = state.get("redis")
+	jobs = [
+		_("{0} last ran {1} minutes ago").format(job["method"], job["minutes_ago"])
+		if job["minutes_ago"] is not None
+		else _("{0} has never run").format(job["method"])
+		for job in state.get("jobs") or []
+	]
+	# None means the probe could not find out, which is a third answer and not a quiet yes.
+	return _("Scheduler: {0}. Redis: {1}. Workers: {2}. Jobs waiting: {3}.{4}").format(
+		_("unknown") if scheduler is None else (_("inactive") if scheduler else _("active")),
+		_("unknown") if redis is None else (_("reachable") if redis else _("unreachable")),
+		_("unknown") if workers is None else workers,
+		state.get("queued", 0),
+		(" " + "; ".join(jobs) + ".") if jobs else "",
+	)
+
+
+def check_background_jobs(state):
+	"""``state``: the dict from ``background.health()``.
+
+	Queued work that never runs is the one fault in this app that produces no error at all —
+	no traceback, no log line, no wrong answer, just a calendar that quietly stops moving. The
+	doctor exists to name the failing step instead of leaving people with a bare error, and
+	this step does not even manage a bare error.
+
+	Returns nothing on a healthy bench, like every other check here. The backlog line is the
+	one thing it can say while ``ok`` is still True — a deep queue is not a fault, but it is
+	worth knowing about before someone concludes their sync is broken.
+	"""
+	out = []
+	detail = _background_summary(state)
+	# Each finding carries the fix for its own cause, so a site with two faults gets two
+	# commands rather than one paragraph containing both. Looked up by code, never by the
+	# wording: the reasons are translated and the codes are not.
+	fixes = {problem["code"]: problem["fix"] for problem in state.get("problems") or []}
+
+	titles = {
+		background.SCHEDULER_OFF: _("The scheduler is off, so nothing runs on a schedule"),
+		background.REDIS_DOWN: _("Redis cannot be reached, so no job can be queued at all"),
+		background.NO_WORKER: _("No background worker is running"),
+		background.WORKERS_UNKNOWN: _("The number of running workers could not be read"),
+		background.JOBS_MISSING: _("This app's scheduled jobs are not registered"),
+		background.JOBS_STALE: _("This app's scheduled jobs have stopped running"),
+		background.CHECK_FAILED: _("Whether background jobs run could not be established"),
+	}
+	details = {
+		# Spelled out because this is the failure that looks like success: the queue accepts
+		# everything and starts nothing.
+		background.NO_WORKER: _("{0} Jobs are accepted and then sit in the queue forever.").format(detail),
+		background.JOBS_STALE: _(
+			"{0} They are registered to run every 15 minutes, so this is the evidence that survives "
+			"when every other check looks fine."
+		).format(detail),
+	}
+	# "could not be established" is not the same as "broken", and a FAIL for it would teach
+	# people that this section cries wolf.
+	severity = {background.WORKERS_UNKNOWN: WARN, background.CHECK_FAILED: WARN}
+
+	for code, fix in fixes.items():
+		out.append(
+			finding(
+				f"background.{code}",
+				severity.get(code, FAIL),
+				titles.get(code, _("Background jobs are not running")),
+				details.get(code, detail),
+				fix,
+			)
+		)
+
+	if state.get("backlog"):
+		out.append(
+			finding(
+				"background.backlog",
+				WARN,
+				_("{0} jobs are waiting in the queue").format(state.get("queued", 0)),
+				detail,
+				# purge-jobs takes its own --site rather than bench's, and without one it empties
+				# the queue for every site on the bench.
+				_("They drain once a worker runs. `bench purge-jobs --site <site>` drops them instead."),
+			)
+		)
+
+	return out
+
+
 # --- error decoder --------------------------------------------------------------------
 
 def error_patterns():
@@ -982,6 +1079,12 @@ def run_diagnostics():
 		findings += check_event_custom_fields(
 			[f for f in EVENT_CUSTOM_FIELDS if not frappe.db.has_column("Event", f)]
 		)
+
+	# Only where something actually depends on the queue. refresh=True because this is the one
+	# place a person looks *after* starting a worker to find out whether it worked, and a
+	# minute-old "no workers" would send them round the loop again.
+	if settings.get("use_calendar") or settings.get("use_transcripts"):
+		findings += check_background_jobs(background.health(refresh=True))
 
 	wants_mail = bool(settings.get("use_mail"))
 	wants_sso = bool(settings.get("use_sso"))
