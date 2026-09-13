@@ -1026,9 +1026,22 @@ def _event_to_graph_body(event):
 	if getattr(event, "location", None):
 		body["location"] = {"displayName": event.location}
 
-	# Only ever sent as True. Microsoft does not support turning an existing online meeting
-	# back into a plain event, so sending False would silently do nothing and imply otherwise.
-	if getattr(event, "custom_add_teams_meeting", 0):
+	# Sent only while the event does not yet have a meeting — never again afterwards.
+	#
+	# Microsoft treats isOnlineMeeting on a PATCH as "make one", not "keep one": it mints a
+	# fresh Teams meeting and throws the old one away, with a new join URL and a new online
+	# meeting id. Re-asserting it on every save therefore did two silent kinds of damage —
+	# everybody holding the invitation's join link was left with a dead one, and the meeting
+	# that was actually held, with its transcript and its recording, was orphaned where nothing
+	# could find it again. Observed on a real meeting: three saves, three different meetings,
+	# and a recording sitting in Teams that Graph could not match to any of them.
+	#
+	# The condition is the join URL rather than the tickbox, because that is the thing that
+	# answers "does a meeting already exist" — true on create, true when somebody ticks the box
+	# on an event Outlook already knows about, false on every ordinary edit thereafter.
+	# Microsoft does not support turning an online meeting back into a plain event either, so
+	# there is nothing to send in the other direction.
+	if getattr(event, "custom_add_teams_meeting", 0) and not getattr(event, "custom_teams_join_url", None):
 		body["isOnlineMeeting"] = True
 		body["onlineMeetingProvider"] = "teamsForBusiness"
 

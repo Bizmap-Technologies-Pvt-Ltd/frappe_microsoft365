@@ -1452,3 +1452,65 @@ class TestSyncNowRefusesToLie(SyncTestCase):
 
 		self.assertTrue(result["queued"])
 		self.assertNotIn("blocked", result)
+
+
+class TestEditingDoesNotReplaceTheMeeting(SyncTestCase):
+	"""Microsoft reads isOnlineMeeting on a PATCH as "make one", not "keep one".
+
+	Found on a real meeting: it was recorded, then the Event was edited a couple of times, and
+	each save minted a fresh Teams meeting with a new join URL and a new online meeting id. The
+	recording stayed with the meeting that was actually held, which nothing could name any
+	more — and everyone holding the original invitation had a dead link.
+	"""
+
+	def test_creating_asks_for_a_meeting(self):
+		event = frappe._dict(
+			subject="Kickoff",
+			starts_on=add_to_date(now_datetime(), hours=1),
+			ends_on=add_to_date(now_datetime(), hours=2),
+			custom_add_teams_meeting=1,
+			custom_teams_join_url=None,
+		)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertTrue(body["isOnlineMeeting"])
+		self.assertEqual(body["onlineMeetingProvider"], "teamsForBusiness")
+
+	def test_editing_an_event_that_already_has_one_does_not_ask_again(self):
+		event = frappe._dict(
+			subject="Kickoff, moved",
+			starts_on=add_to_date(now_datetime(), hours=1),
+			ends_on=add_to_date(now_datetime(), hours=2),
+			custom_add_teams_meeting=1,
+			custom_teams_join_url="https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc/0",
+		)
+
+		body = sync._event_to_graph_body(event)
+
+		self.assertNotIn("isOnlineMeeting", body, "re-asserting it mints a replacement meeting")
+		self.assertNotIn("onlineMeetingProvider", body)
+
+	def test_ticking_the_box_later_still_creates_one(self):
+		"""An event Outlook already knows about, with the box ticked after the fact."""
+		event = frappe._dict(
+			subject="Kickoff",
+			starts_on=add_to_date(now_datetime(), hours=1),
+			ends_on=add_to_date(now_datetime(), hours=2),
+			custom_add_teams_meeting=1,
+			custom_teams_join_url="",
+			custom_microsoft_event_id="AAMk-existing",
+		)
+
+		self.assertTrue(sync._event_to_graph_body(event)["isOnlineMeeting"])
+
+	def test_an_ordinary_event_never_asks_for_one(self):
+		event = frappe._dict(
+			subject="Lunch",
+			starts_on=add_to_date(now_datetime(), hours=1),
+			ends_on=add_to_date(now_datetime(), hours=2),
+			custom_add_teams_meeting=0,
+			custom_teams_join_url=None,
+		)
+
+		self.assertNotIn("isOnlineMeeting", sync._event_to_graph_body(event))
