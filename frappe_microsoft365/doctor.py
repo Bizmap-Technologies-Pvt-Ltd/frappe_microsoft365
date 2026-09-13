@@ -847,6 +847,20 @@ def error_patterns():
 		),
 	),
 	(
+		# Second, behind the tenant switch only. This 403 comes back from the CONTENT call while
+		# listing succeeds — the switch is already on — so every generic transcript rule below
+		# would send somebody to fix something that is not broken. A literal code, so unlike
+		# those it can never swallow a match that belongs to the rule above it.
+		r"SpeakerAttributionNotAllowed",
+		_("Speaker attribution is off for this tenant"),
+		_(
+			"The transcript is fetched in the attributed format, which this tenant does not "
+			"allow. Teams admin center > Meetings > Meeting settings > Transcript API access > "
+			"Configure > Include speaker attribution On. Listing transcripts keeps working "
+			"without it; only fetching the text fails."
+		),
+	),
+	(
 		# Three of this app's 403s read identically and have three different fixes, so all three
 		# are decoded before the generic consent pattern below — which would otherwise claim
 		# every one of them on the word "consented" inside their own hint text.

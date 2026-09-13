@@ -1073,3 +1073,36 @@ class TestSomebodyElsesFileHook(ArtifactsTestCase):
 				self._fetch(event, transcripts=[{"id": "t1", "created_date_time": "2026-09-13T11:00:00Z"}])
 
 		self.assertIn("Microsoft gave us the transcript", str(ctx.exception))
+
+
+class TestSpeakerAttribution(ArtifactsTestCase):
+	"""This app asks for the attributed VTT, so a tenant that disallows attribution refuses the
+	content call while the list call succeeds.
+
+	Found while documenting the error catalogue: Graph access to transcripts is already ON in
+	that situation, so the generic "grant the transcript permission" advice sends somebody to
+	fix something that is not broken.
+	"""
+
+	REFUSAL = (
+		"Microsoft Graph GET /me/onlineMeetings/x/transcripts/t1/content failed (403): "
+		"Forbidden: SpeakerAttributionNotAllowed"
+	)
+
+	def test_it_names_the_attribution_setting_not_the_permission(self):
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			ms._wrap_403(MsGraphError(self.REFUSAL), ms._PERM_HINT if hasattr(ms, "_PERM_HINT") else ms._transcript_perm_hint())
+
+		said = str(ctx.exception)
+		self.assertIn("Include speaker attribution", said)
+		self.assertNotIn("OnlineMeetingTranscript.Read.All", said, "the permission is not the problem")
+
+	def test_the_doctor_ranks_it_above_the_generic_transcript_403(self):
+		from frappe_microsoft365 import doctor
+
+		explained = doctor.explain_error(self.REFUSAL)
+
+		self.assertTrue(explained["matched"])
+		self.assertIn("speaker attribution", explained["detail"].lower())

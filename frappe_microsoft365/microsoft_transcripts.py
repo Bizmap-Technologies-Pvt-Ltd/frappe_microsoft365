@@ -79,8 +79,26 @@ def _tenant_switch_hint():
 	)
 
 
+#: Asking for the attributed VTT from a tenant that does not allow attribution. Distinct from
+#: the tenant switch above: Graph access to transcripts is ON, the list call works, and only
+#: fetching the content fails — so the generic permission advice sends people nowhere.
+SPEAKER_ATTRIBUTION = "SpeakerAttributionNotAllowed"
+
+
+def _speaker_attribution_hint():
+	return _(
+		"This tenant does not allow speaker attribution, and the transcript is being requested "
+		"in the attributed format. In the Teams admin center: Meetings > Meeting settings > "
+		"Transcript API access > Configure > Include speaker attribution On."
+	)
+
+
 def _wrap_403(e, hint):
 	msg = str(e)
+	if SPEAKER_ATTRIBUTION in msg:
+		frappe.throw(
+			_speaker_attribution_hint(), MsGraphError, title=_("Speaker names are not allowed here")
+		)
 	if TENANT_SWITCH in msg or TENANT_SWITCH_TEXT in msg:
 		# Named cause, so say the named cause. The generic permission hint below is actively
 		# misleading here — it asks for consent that is already granted.

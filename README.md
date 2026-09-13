@@ -1,30 +1,37 @@
 <div align="center">
 	<img src=".github/logo.png" height="110" alt="Frappe Microsoft 365">
-	<h2>Frappe Microsoft 365</h2>
-	<p><b>Outlook calendar, Teams meetings and Microsoft setup that actually explains itself</b></p>
+	<h1>Frappe Microsoft 365</h1>
+	<p><b>Outlook calendar sync, Teams meetings and Microsoft sign-in for Frappe and ERPNext — with setup that explains itself</b></p>
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
-![Tests](https://img.shields.io/badge/tests-191-2b3a8c)
+[![CI](https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365/actions/workflows/ci.yml/badge.svg)](https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365/actions/workflows/ci.yml)
 
 </div>
 
-Generic **Microsoft 365 integration for any Frappe / ERPNext site** — the Microsoft counterpart to
-Frappe's built-in Google Calendar integration. Register one Azure application, tick the
-capabilities you actually want in **Microsoft Settings**, and let each user authorize their own
-**Microsoft Calendar**.
+**Microsoft 365 integration for any Frappe or ERPNext site** — Outlook calendar sync, Teams
+meetings, meeting transcripts and recordings, Outlook mail over OAuth, and sign in with
+Microsoft. Register one Azure application, tick the capabilities you actually want in
+**Microsoft Settings**, and let each user authorize their own **Microsoft Calendar**.
 
-You get Outlook calendar sync in both directions, Teams meetings created from a Frappe Event,
-invitations you can reply to without leaving Frappe, and meeting transcripts — plus a
-diagnostics tool for the part everyone loses time on, which is getting the connection to work
-in the first place.
+Calendar sync runs in both directions, invitations can be answered without leaving Frappe, and
+transcripts land on the Event once a meeting finishes. There is also a diagnostics tool for the
+part everyone loses time on, which is getting the connection to work in the first place.
+
+It follows the same model as Frappe's built-in Google Calendar integration — one app
+registration, one connection per user, two-way `Event` sync — against Microsoft Graph instead of
+Google; transcripts, recordings, Outlook mail and Microsoft sign-in have no counterpart there.
+
+[Setup steps](#connect-frappe-to-microsoft-365-in-order) ·
+[Troubleshooting Microsoft errors](docs/troubleshooting.md) ·
+[Frequently asked questions](docs/faq.md)
 
 ## Features
 
 - **Outlook calendar, two ways** — Microsoft events ↔ Frappe `Event`. Delta pull on a schedule,
   push on save and delete. Recurring series arrive as individual occurrences without
   duplicating, deletions propagate, and a failed pull never silently skips a window.
-  See *How the sync behaves*.
+  See *How Outlook calendar sync behaves*.
 - **Teams meetings from a Frappe Event** — an **Add Teams meeting** tickbox, the same idea as
   Outlook's own. The join link comes back onto the Event, and a meeting organised in Outlook
   keeps its link when it syncs in, so people can join from either side. No extra Azure
@@ -37,7 +44,7 @@ in the first place.
   rather than filling your file store. Microsoft takes minutes to hours to produce them, so the
   app keeps asking on a backoff for a day instead of reporting an empty answer as *nothing was
   recorded* — and a five-hour meeting's two recording parts both arrive, because Teams splits at
-  four hours. See *Transcripts and recordings*.
+  four hours. See *Teams meeting transcripts and recordings*.
 - **Take only the parts you want** — calendar, Teams meetings, transcripts, mail and sign-in are
   independent. The Azure scopes are **derived from what you tick** and shown before you
   authorise, so the permissions you grant in Azure and the ones the app requests cannot drift
@@ -142,7 +149,7 @@ bench --site m365.localhost migrate
 bench start          # then open http://m365.localhost:8000/app
 ```
 
-Now do the Microsoft side — *Set it up, in order*, below. The one value Entra needs from you is
+Now do the Microsoft side — *Connect Frappe to Microsoft 365, in order*, below. The one value Entra needs from you is
 the **Redirect URI**:
 
 ```
@@ -165,17 +172,25 @@ sees anybody else's calendar.
 Ticking **Sync with Microsoft Calendar** on an Event when you have no connection offers to make
 one there and then, which is where most people meet this for the first time.
 
-**What is separated, and enforced rather than assumed:** a person sees only their own connection
-in the list and can only authorize, sync or disconnect their own. An event pulled from someone's
-calendar is created Private and **owned by them**, so it appears on their calendar and on nobody
-else's — that ownership is set explicitly, because the scheduled sync runs as Administrator and
-would otherwise leave everyone's events owned by the scheduler.
+**What is separated, and enforced rather than assumed:** an ordinary user sees only their own
+connection in the list and can only authorize, sync or disconnect their own. An event pulled from
+someone's calendar is created Private and **owned by them**, so it appears on their calendar and
+on nobody else's — that ownership is set explicitly, because the scheduled sync runs as
+Administrator and would otherwise leave everyone's events owned by the scheduler.
 
-**One thing it does not do:** it syncs the signed-in person's own calendar (`/me/calendarView`).
-A shared mailbox's calendar, or a room calendar, is not covered — that needs delegated access to
-the shared mailbox or the application-permission path, neither of which this app sets up today.
+**A System Manager is the exception, deliberately.** Administrators and System Managers see every
+connection and can sync or disconnect any of them — somebody has to be able to fix a colleague's
+broken connection. It is worth knowing that the separation is between ordinary users, not from
+your administrators.
 
-## Set it up, in order
+**What it does not cover.** It syncs the signed-in person's **default** calendar
+(`/me/calendarView`) — a second calendar in the same mailbox is neither read nor written, and
+there is no picker. A shared mailbox's calendar or a room calendar is not covered either; that
+needs delegated access to the shared mailbox or the application-permission path, neither of which
+this app sets up today. Recurrence travels one way: a recurring Outlook meeting arrives as its
+individual occurrences, but a repeating Frappe Event is pushed to Outlook as a single one-off.
+
+## Connect Frappe to Microsoft 365, in order
 
 Setup spans **two Microsoft portals and Frappe**, and the order is not decoration. The permission
 list depends on what you ticked in Frappe; the tenant switch in step 7 lives in a portal most
@@ -354,13 +369,13 @@ actually asked for, and Run Diagnostics compares it against what is requested no
 - **Transcripts:** open an Event whose Teams meeting has finished and click **Get Transcript &
   Recording**. Working looks like a `.vtt` attached to the Event and the recordings listed on it.
   *Microsoft has not finished processing this meeting* is a normal answer in the first half hour —
-  see *Transcripts and recordings*. A 403 naming the tenant is step 7; a 403 naming permissions is
+  see *Teams meeting transcripts and recordings*. A 403 naming the tenant is step 7; a 403 naming permissions is
   step 5 or 6.
 
 Azure-side detail beyond this, including the app-only path for shared mailboxes:
 [`docs/azure-setup.md`](docs/azure-setup.md).
 
-## How the sync behaves
+## How Outlook calendar sync behaves
 
 Worth knowing before you trust it with a real calendar:
 
@@ -409,7 +424,7 @@ permissions each capability needs, and only then offers to apply it.
 | Outlook mail | A `Connected App` for Frappe's Email Account | Exchange delegated: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` — or the `.default` app-only scope for shared mailboxes |
 | Sign in with Microsoft | A `Social Login Key` | Graph delegated: `openid`, `email`, `profile` |
 
-### The scopes follow the tickboxes
+### The Azure scopes follow the tickboxes
 
 **You do not write a scope list.** Microsoft Settings derives the delegated scopes from the
 capabilities above and shows the exact result under **Delegated Scopes**, so what you grant in
@@ -453,7 +468,7 @@ Two details it gets right that are easy to miss by hand:
   Azure needs **both** registered; the doctor prints the exact URI to add. A missing one shows
   up later as `AADSTS50011`.
 
-## Connection doctor
+## Diagnostics and the connection doctor
 
 Connecting Frappe to Microsoft 365 has roughly fifteen steps across Azure, Exchange and
 Frappe, and almost every mistake surfaces as the same unhelpful string — `AUTHENTICATE
@@ -488,7 +503,7 @@ time — which is why "SMTP works but IMAP doesn't" recurs on the forum. The doc
 configuration and suggests the two ways out: split incoming and outgoing into separate Email
 Accounts, or use the app-only flow, where no user identity is involved.
 
-### Teams meetings from a Frappe Event
+## Teams meetings from a Frappe Event
 
 An Event carries an **Add Teams meeting** tickbox, the same idea as Outlook's own toggle.
 Tick it, save, and the event is created in Outlook as a Teams meeting. A **Join Meeting**
@@ -507,7 +522,7 @@ online meeting back into a plain event. So the tickbox **locks itself once the m
 rather than sitting there doing nothing when you untick it. To remove a meeting, delete the
 event and create it again. The app only ever sends `isOnlineMeeting: true`.
 
-### Attendees and RSVP
+## Attendees and RSVP
 
 An invitation that lands in someone's Outlook is usable from Frappe. Each synced Event
 carries three read-only fields, refreshed by every sync:
@@ -542,7 +557,7 @@ in the structured `onlineMeeting` property for its own Teams meetings; a third-p
 is loose text in the event body, and guessing at it would produce wrong links more often
 than right ones. Open the event in Outlook for those.
 
-### Transcripts and recordings
+## Teams meeting transcripts and recordings
 
 Once a Teams meeting has finished, its transcript is **attached to the Event as a `.vtt` file**
 and its recordings are listed on the Event, ready to download.
@@ -597,7 +612,7 @@ kilobytes and is the part people search and quote, so that one *is* kept.
 **One tenant switch, and it ships off.** Microsoft added a tenant-level control for Graph
 access to transcripts in 2026 and **defaults it to off**, so a tenant with every permission
 consented still gets `403 Forbidden: Graph API access to transcripts is disabled for this
-tenant`. It lives in the Teams admin center, not Entra — step 7 of *Set it up, in order*. There
+tenant`. It lives in the Teams admin center, not Entra — step 7 of *Connect Frappe to Microsoft 365, in order*. There
 is no request-side workaround, and re-granting consent does nothing, which is why both the error
 message and the doctor name this switch specifically rather than blaming permissions.
 
@@ -616,7 +631,7 @@ per-meeting ones only notify if you subscribed *before the meeting started*, plu
 public HTTPS endpoint Microsoft can reach and renewal every few days. For a self-hosted Frappe
 that is a worse trade than fourteen polls.
 
-### Sensitive actions are called out before they happen
+## Sensitive actions are called out before they happen
 
 Three things have consequences outside Frappe, and none of them happen quietly:
 
@@ -636,14 +651,14 @@ Sync also refuses to be half-configured: ticking **Sync with Microsoft Calendar*
 choosing a connection, and enabling the integration requires the Azure credentials, so nothing
 saves in a state that silently does nothing.
 
-### What this does NOT do
+## What this app does not do
 
 It does not send or receive mail, replace `Email Account`, or touch the email queue. Frappe's
 own IMAP/SMTP + OAuth path is unchanged, several mail accounts keep working exactly as they
 did, and uninstalling this app leaves your mail setup working. The doctor only reads
 configuration and generates text.
 
-## How it's consumed (for app developers)
+## Python API for other Frappe apps
 
 Other apps depend on this app and call its utilities (they never re-implement Graph):
 
@@ -662,9 +677,9 @@ installed and Microsoft Settings is configured, and falls back to stubs otherwis
 See [`docs/graph-api-reference.md`](docs/graph-api-reference.md) for the verified Graph
 endpoint/permission contract, and [`docs/azure-setup.md`](docs/azure-setup.md) for Azure setup.
 
-## Troubleshooting
+## Troubleshooting common Microsoft errors
 
-Step numbers refer to *Set it up, in order*.
+Step numbers refer to *Connect Frappe to Microsoft 365, in order*.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -680,12 +695,17 @@ Step numbers refer to *Set it up, in order*.
 | `AADSTS65001` | Admin consent was never granted | Step 6 |
 | `AADSTS700016` | The application is not in this tenant | Wrong Tenant ID in step 8, or the app was never consented into the tenant |
 | `invalid_grant` | The refresh token expired, or consent or the password changed | **Re-authorize**. Recurring within hours means `offline_access` is missing |
-| Transcript list is empty on a meeting you know was transcribed | Processing lag, a standalone (not calendar-associated) meeting, or a meeting past its expiry | Wait — the app keeps asking for a day. See *Transcripts and recordings* |
+| Transcript list is empty on a meeting you know was transcribed | Processing lag, a standalone (not calendar-associated) meeting, or a meeting past its expiry | Wait — the app keeps asking for a day. See *Teams meeting transcripts and recordings* |
 | `AUTHENTICATE failed` / `535 5.7.3` on mail | A dozen unrelated causes, all rendered identically | **Explain an Error**, then Run Diagnostics — the shared-mailbox identity conflict is one of them |
 | `Unknown column 'custom_..._microsoft...'` | The app's custom fields are not on this site | `bench --site <site> migrate` |
 
 **Explain an Error** (Microsoft Settings → Troubleshoot) decodes any message from the Error Log
 into a cause and a next step, including ones not listed here.
+
+The [full troubleshooting reference](docs/troubleshooting.md) covers every Microsoft error string
+this app can surface, each with the cause behind it and the fix. Questions that come up before
+and during a rollout — what syncs, what does not, licensing, shared mailboxes — are answered in
+the [frequently asked questions](docs/faq.md).
 
 ## Contributing
 
