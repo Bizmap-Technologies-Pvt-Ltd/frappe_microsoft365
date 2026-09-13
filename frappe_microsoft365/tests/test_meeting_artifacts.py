@@ -1036,3 +1036,40 @@ class TestAFlappingTenantSwitch(ArtifactsTestCase):
 		message = self._fetch(event)["message"]
 
 		self.assertNotIn("just switched it on", message)
+
+
+class TestSomebodyElsesFileHook(ArtifactsTestCase):
+	"""Saving a File runs every after_insert hook any installed app put on File.
+
+	Seen live: frappe_s3_attachment was installed without AWS credentials, so the transcript —
+	which Microsoft had handed over perfectly — died in botocore on the way to disk, and Frappe
+	reported the failure as coming from this app. Hours of Microsoft debugging were spent on a
+	missing AWS key.
+	"""
+
+	def test_a_storage_failure_is_not_reported_as_a_microsoft_failure(self):
+		event = self._finished_meeting()
+
+		# Patched where the hook actually blows up — inside save_file — not on the function that
+		# carries the guard, which would replace the thing under test with the mock.
+		with patch(
+			"frappe.utils.file_manager.save_file",
+			side_effect=RuntimeError("Unable to locate credentials"),
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				self._fetch(event, transcripts=[{"id": "t1", "created_date_time": "2026-09-13T11:00:00Z"}])
+
+		said = str(ctx.exception)
+		self.assertIn("could not store the file", said)
+		self.assertIn("not a Microsoft one", said)
+		self.assertIn("Unable to locate credentials", said, "the real cause must survive")
+
+	def test_the_transcript_being_fetched_is_stated_not_implied(self):
+		"""The one fact that stops somebody debugging the wrong system."""
+		event = self._finished_meeting()
+
+		with patch("frappe.utils.file_manager.save_file", side_effect=RuntimeError("disk full")):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				self._fetch(event, transcripts=[{"id": "t1", "created_date_time": "2026-09-13T11:00:00Z"}])
+
+		self.assertIn("Microsoft gave us the transcript", str(ctx.exception))

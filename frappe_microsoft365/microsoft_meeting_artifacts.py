@@ -541,9 +541,32 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 
 
 def _save_transcript(filename, content, event_name):
+	"""Write the VTT as a File on the Event, and be clear about whose fault it is if that fails.
+
+	Saving a File runs every after_insert hook any installed app has put on File — an S3
+	offloader, a virus scanner, a storage quota. When one of those is misconfigured the upload
+	raises from inside this call stack, Frappe blames the app that happens to be on top of it,
+	and the person is handed a botocore traceback naming this integration for a missing AWS
+	credential. Seen live: the transcript had been fetched perfectly and the error read as
+	though Microsoft had failed.
+
+	The distinction is worth keeping because the two have nothing to do with each other and
+	fixing one never fixes the other.
+	"""
 	from frappe.utils.file_manager import save_file
 
-	return save_file(filename, content.encode("utf-8"), "Event", event_name, is_private=1)
+	try:
+		return save_file(filename, content.encode("utf-8"), "Event", event_name, is_private=1)
+	except Exception as e:
+		frappe.log_error(title=f"MS transcript could not be stored: {event_name}")
+		frappe.throw(
+			_(
+				"Microsoft gave us the transcript, but Frappe could not store the file: {0}. "
+				"That is a file-storage problem on this site, not a Microsoft one — check the "
+				"apps that handle attachments."
+			).format(str(e)),
+			title=_("The transcript arrived but could not be saved"),
+		)
 
 
 def _delete_previous_transcripts(doc):
