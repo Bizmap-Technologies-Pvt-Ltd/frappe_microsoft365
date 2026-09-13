@@ -111,8 +111,11 @@ frappe_microsoft365.stored_recordings = function (frm) {
 // never hides the manual check while Microsoft might still be processing.
 frappe_microsoft365.add_artifact_buttons = function (frm) {
 	const group = __("Microsoft");
-	const past = frm.doc.ends_on && frappe.datetime.now_datetime() > frm.doc.ends_on;
-	if (!past) return;
+	// Offered from the moment the meeting starts, not from the end of the slot it was booked
+	// into. A one-minute call inside an eighty-minute booking has its transcript ready long
+	// before the slot runs out, and hiding the button until then hides the feature.
+	const started = !frm.doc.starts_on || frappe.datetime.now_datetime() > frm.doc.starts_on;
+	if (!started) return;
 
 	const recordings = frappe_microsoft365.stored_recordings(frm);
 	const has_transcript = !!frm.doc.custom_microsoft_transcript_fetched_on;

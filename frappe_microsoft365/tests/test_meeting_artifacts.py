@@ -421,7 +421,7 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 
 
 class TestGuards(ArtifactsTestCase):
-	def test_a_meeting_that_has_not_finished_is_refused(self):
+	def test_a_meeting_that_has_not_started_is_refused(self):
 		event = self._finished_meeting(
 			starts_on=add_to_date(now_datetime(), hours=1),
 			ends_on=add_to_date(now_datetime(), hours=2),
@@ -430,7 +430,37 @@ class TestGuards(ArtifactsTestCase):
 		with self.assertRaises(frappe.ValidationError) as ctx:
 			artifacts.fetch_meeting_artifacts(event.name)
 
-		self.assertIn("not finished", str(ctx.exception))
+		self.assertIn("not started", str(ctx.exception))
+
+	def test_a_meeting_that_ended_early_can_be_fetched_inside_its_own_slot(self):
+		"""A calendar slot is a reservation, not a record.
+
+		An eighty-minute booking used for a one-minute call has its transcript ready within
+		minutes; gating on the booked end refused to look for another hour while the files sat
+		waiting in Teams. Reported from a real meeting.
+		"""
+		event = self._finished_meeting(
+			starts_on=add_to_date(now_datetime(), minutes=-10),
+			ends_on=add_to_date(now_datetime(), hours=1),
+		)
+
+		result = self._fetch(
+			event, transcripts=[{"id": "t1", "created_date_time": "2026-09-13T11:05:00Z"}]
+		)
+
+		self.assertEqual(len(result["transcripts"]), 1)
+
+	def test_an_empty_answer_inside_the_slot_does_not_claim_the_meeting_is_over(self):
+		"""Two things are true at once and it would be wrong to assert either."""
+		event = self._finished_meeting(
+			starts_on=add_to_date(now_datetime(), minutes=-10),
+			ends_on=add_to_date(now_datetime(), hours=1),
+		)
+
+		message = self._fetch(event)["message"]
+
+		self.assertIn("booked until", message)
+		self.assertIn("if it has already ended", message)
 
 	def test_an_event_without_a_teams_meeting_is_refused(self):
 		event = self._finished_meeting(custom_teams_join_url=None)

@@ -114,10 +114,15 @@ def _event_for_artifacts(event_name, resolve=True):
 	if not calendar.enabled or not calendar.authorized:
 		frappe.throw(_("The Microsoft Calendar for this event is disabled or not authorized."))
 
-	# Nothing exists until the meeting has actually happened, and saying so is kinder than a
-	# Graph call that returns an empty list for a reason the person cannot see.
-	if doc.ends_on and get_datetime(doc.ends_on) > now_datetime():
-		frappe.throw(_("This meeting has not finished yet."))
+	# Gated on the start, never on the booked end. A calendar slot is a reservation, not a
+	# record: people book an hour and talk for four minutes, and Microsoft has the transcript
+	# ready minutes after the call actually ends — not after the slot they never used up. This
+	# check once refused to look for another hour while the files sat waiting in Teams.
+	#
+	# Before the start there is genuinely nothing, and saying so is kinder than a Graph call
+	# that comes back empty for a reason the person cannot see.
+	if doc.starts_on and get_datetime(doc.starts_on) > now_datetime():
+		frappe.throw(_("This meeting has not started yet."))
 
 	meeting_id = doc.get("custom_microsoft_online_meeting_id")
 	if not meeting_id and resolve:
@@ -150,6 +155,7 @@ def artifact_state(event: str):
 
 
 def _state(doc):
+	starts_on = get_datetime(doc.starts_on) if doc.starts_on else None
 	ends_on = get_datetime(doc.ends_on) if doc.ends_on else None
 	now = now_datetime()
 	attempts = cint(doc.get("custom_microsoft_artifacts_attempts"))
@@ -163,12 +169,16 @@ def _state(doc):
 		"expires_on": add_to_date(ends_on, days=MEETING_EXPIRY_DAYS) if ends_on else None,
 		"next_check": None,
 		"auto": _auto_enabled(doc),
+		# A meeting can be over long before its slot is. Kept apart from the states below so a
+		# message can mention it without any of them having to branch on it.
+		"still_booked": bool(ends_on and ends_on > now),
+		"booked_until": ends_on,
 	}
 
 	if not doc.get("custom_teams_join_url"):
 		return {**state, "state": "no_meeting"}
-	if ends_on and ends_on > now:
-		return {**state, "state": "not_finished"}
+	if starts_on and starts_on > now:
+		return {**state, "state": "not_started"}
 
 	if has_transcript and recordings:
 		return {**state, "state": "complete"}
@@ -242,8 +252,8 @@ def describe_state(state):
 	"""The sentence a person reads. Every branch says something different, on purpose."""
 	kind = state["state"]
 
-	if kind == "not_finished":
-		return _("This meeting has not finished yet.")
+	if kind == "not_started":
+		return _("This meeting has not started yet.")
 
 	if kind == "complete":
 		if state["has_transcript"] and state["recordings"]:
@@ -265,6 +275,14 @@ def describe_state(state):
 		)
 
 	if kind == "processing":
+		if state.get("still_booked"):
+			# The slot has not run out, but the call may well be over — Teams produces nothing
+			# until it actually ends, so "nothing yet" here means one of two things and it
+			# would be wrong to claim either.
+			return _(
+				"Nothing from Microsoft yet. This meeting is booked until {0}; if it has already "
+				"ended, the files usually appear a few minutes later. {1}"
+			).format(frappe.utils.format_datetime(state["booked_until"]), _next_step(state))
 		return _("Microsoft has not finished processing this meeting. {0} {1}").format(
 			_next_step(state), _processing_note()
 		)
