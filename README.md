@@ -399,6 +399,15 @@ server. The bytes are not stored: a Teams recording routinely runs to hundreds o
 copying one into the site's file store per meeting is a bad trade. A transcript is a few
 kilobytes and is the part people search and quote, so that one *is* kept.
 
+**One tenant switch, and it ships off.** Microsoft added a tenant-level control for Graph
+access to transcripts in 2026 and **defaults it to off**, so a tenant with every permission
+consented still gets `403 Forbidden: Graph API access to transcripts is disabled for this
+tenant`. In the **Teams admin center**: *Meetings > Meeting settings > Transcript API access*,
+turn **Microsoft Graph access** On (and *Configure > Include speaker attribution* On if you want
+speaker names in the VTT). There is no request-side workaround, and re-granting consent does
+nothing — which is why both the error message and the doctor name this switch specifically
+rather than blaming permissions.
+
 **Requirements.** This is the **Transcripts** capability, which needs
 `OnlineMeetingTranscript.Read.All`; recordings additionally need
 `OnlineMeetingRecording.Read.All` and a Teams licence that records. Microsoft consents to reading

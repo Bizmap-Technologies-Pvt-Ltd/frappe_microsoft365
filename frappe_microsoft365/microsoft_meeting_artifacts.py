@@ -309,11 +309,12 @@ def fetch_meeting_artifacts(event: str):
 	result = _fetch_into(doc, calendar_name, meeting_id)
 
 	if result["error"]:
-		# Microsoft said something; repeating it verbatim beats a guess about why.
-		frappe.throw(
-			_("Microsoft could not be asked for this meeting: {0}").format(result["error"]),
-			title=_("Microsoft returned an error"),
-		)
+		# Each layer that caught this on the way up added its own line to the message log, so
+		# the dialog was showing the same 403 three times over, each copy slightly longer than
+		# the last. Clear those and say it once — one error is a diagnosis, three stacked is
+		# noise a person has to read past to find the sentence that helps.
+		frappe.clear_messages()
+		frappe.throw(result["error"], title=_("Microsoft returned an error"))
 
 	doc.reload()
 	state = _state(doc)

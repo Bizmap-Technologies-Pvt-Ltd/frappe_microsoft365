@@ -811,6 +811,19 @@ def error_patterns():
 	"""
 	return [
 	(
+		# Before the consent patterns: this one also says "Forbidden", and whichever matches
+		# first wins. A tenant with every permission granted still gets a 403 until the switch
+		# below is on, so guessing "consent" here would send people round a loop.
+		r"GraphAccessToTranscriptsDisabled|access to transcripts is disabled",
+		_("Graph access to transcripts is switched off for this tenant"),
+		_(
+			"Not a permission problem — Microsoft added a tenant switch in 2026 and ships it "
+			"off. In the Teams admin center: Meetings > Meeting settings > Transcript API "
+			"access > turn Microsoft Graph access On. Speaker names need Configure > Include "
+			"speaker attribution On as well."
+		),
+	),
+	(
 		r"AADSTS50011",
 		_("Redirect URI mismatch"),
 		_(

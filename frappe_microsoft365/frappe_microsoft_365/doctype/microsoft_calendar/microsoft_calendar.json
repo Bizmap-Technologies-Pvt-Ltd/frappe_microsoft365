@@ -125,7 +125,9 @@
    "fieldname": "ms_calendar_id",
    "fieldtype": "Data",
    "label": "Microsoft Calendar ID",
-   "read_only": 1
+   "read_only": 1,
+   "length": 768,
+   "description": "Graph's own id for the calendar. Long by nature."
   },
   {
    "fieldname": "ms_calendar_name",

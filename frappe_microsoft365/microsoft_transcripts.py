@@ -29,8 +29,28 @@ _REC_PERM_HINT = (
 )
 
 
+#: Microsoft added a tenant switch for this in 2026 and shipped it OFF. Every tenant now has
+#: to turn it on explicitly, so a 403 here is far more often this than a missing permission —
+#: and telling someone to grant consent they already granted sends them in a circle.
+TENANT_SWITCH = "GraphAccessToTranscriptsDisabled"
+TENANT_SWITCH_TEXT = "access to transcripts is disabled"
+
+
+def _tenant_switch_hint():
+	return _(
+		"This is a tenant setting, not a permission: in the Teams admin center, go to "
+		"Meetings > Meeting settings > Transcript API access and turn Microsoft Graph access "
+		"On. Microsoft ships it off, so it has to be turned on once per tenant even when every "
+		"permission is already consented."
+	)
+
+
 def _wrap_403(e, hint):
 	msg = str(e)
+	if TENANT_SWITCH in msg or TENANT_SWITCH_TEXT in msg:
+		# Named cause, so say the named cause. The generic permission hint below is actively
+		# misleading here — it asks for consent that is already granted.
+		frappe.throw(_tenant_switch_hint(), MsGraphError, title=_("Transcripts are switched off for this tenant"))
 	if "403" in msg or "Forbidden" in msg or "Authorization" in msg:
 		frappe.throw(f"{msg}\n{hint}", MsGraphError)
 	raise e

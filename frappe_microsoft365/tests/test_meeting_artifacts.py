@@ -631,3 +631,73 @@ class TestDownloadingARecording(ArtifactsTestCase):
 
 		self.assertIn("itemNotFound", str(ctx.exception))
 		self.assertIn("60 days", str(ctx.exception))
+
+
+class TestTheTenantSwitch(ArtifactsTestCase):
+	"""Microsoft added a tenant control for Graph access to transcripts in 2026, shipped OFF.
+
+	A tenant with every permission consented still gets 403 until an admin turns it on, so the
+	old hint — "grant OnlineMeetingTranscript.Read.All with tenant-admin consent" — sent people
+	to re-grant consent they already had. Reported from a live tenant.
+	"""
+
+	GRAPH_403 = (
+		"Microsoft Graph GET /me/onlineMeetings/x/transcripts failed (403): "
+		"Forbidden: Graph API access to transcripts is disabled for this tenant."
+	)
+
+	def test_the_tenant_switch_is_named_instead_of_consent(self):
+		"""Tested where the translation happens — inside the transcripts module, not through a
+		mock of the very function that does it."""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			ms._wrap_403(MsGraphError(self.GRAPH_403), ms._PERM_HINT)
+
+		said = str(ctx.exception)
+		self.assertIn("Teams admin center", said)
+		self.assertIn("Transcript API access", said)
+		# The point is not that the word never appears — the message explains that consent is
+		# already in place. It is that nobody is told to go and grant anything.
+		self.assertNotIn("grant", said.lower(), "sending them to grant consent they have is a loop")
+
+	def test_an_ordinary_403_still_gets_the_permission_hint(self):
+		"""The carve-out must not swallow the case it was carved out of."""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			ms._wrap_403(MsGraphError("Graph GET /x failed (403): Forbidden"), ms._PERM_HINT)
+
+		self.assertIn("OnlineMeetingTranscript.Read.All", str(ctx.exception))
+
+	def test_what_microsoft_said_reaches_the_user_unrewritten(self):
+		"""Whatever the layers below decided to say, the dialog shows exactly that — once."""
+		from frappe_microsoft365.microsoft_graph import MsGraphError
+
+		event = self._finished_meeting()
+
+		with patch.object(ms, "list_transcripts", side_effect=MsGraphError(self.GRAPH_403)), patch.object(
+			ms, "list_recordings", return_value=[]
+		):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				artifacts.fetch_meeting_artifacts(event.name)
+
+		said = str(ctx.exception)
+		self.assertIn("disabled for this tenant", said)
+		self.assertEqual(said.count("disabled for this tenant"), 1, "said once, not stacked")
+
+	def test_the_doctor_recognises_it_too(self):
+		from frappe_microsoft365 import doctor
+
+		explained = doctor.explain_error(self.GRAPH_403)
+
+		self.assertTrue(explained["matched"])
+		self.assertIn("Transcript API access", explained["detail"])
+
+	def test_a_real_permission_403_still_says_permission(self):
+		"""The new pattern must not swallow the case it was carved out of."""
+		from frappe_microsoft365 import doctor
+
+		explained = doctor.explain_error("Microsoft Graph GET /me/events failed (403): Forbidden")
+
+		self.assertNotIn("Transcript API access", explained.get("detail") or "")
