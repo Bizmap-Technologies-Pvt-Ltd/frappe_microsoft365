@@ -832,8 +832,19 @@ class TestSetupGuideEndpoint(BaseTestCase):
 		self.assertEqual(doctor._capability_summary({}), [])
 
 	def test_it_is_system_manager_only(self):
-		"""It names tenants, portals and what is not yet granted; that is not for every user."""
+		"""It names tenants, portals and what is not yet granted; that is not for every user.
+
+		Frappe 15's ``only_for`` returns early whenever ``frappe.flags.in_test`` is set, so on
+		that version the guard cannot fire under a test runner at all — the assertion below
+		would pass on 16 and fail on 15 while the code was identical and correct. The flag is
+		dropped for the length of the call so both versions actually exercise the guard, rather
+		than skipping the test on the version that cannot demonstrate it.
+		"""
 		import frappe
+
+		in_test = frappe.flags.in_test
+		frappe.flags.in_test = False
+		self.addCleanup(setattr, frappe.flags, "in_test", in_test)
 
 		frappe.set_user("Guest")
 		self.addCleanup(frappe.set_user, "Administrator")
