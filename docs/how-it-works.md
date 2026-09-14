@@ -1,0 +1,276 @@
+# How it behaves
+
+What this app does once it is connected: which way data flows, what it will not overwrite, and
+where it deliberately stops. For getting it connected in the first place, see [Setup](setup.md).
+
+# How it works for a whole company
+
+One tenant, one app registration, one connection per person — nobody shares a token and nobody
+sees anybody else's calendar.
+
+| | |
+| --- | --- |
+| **The admin, once** | Registers the Azure app, grants admin consent, turns on the Teams transcript switch, fills in Microsoft Settings. The walkthrough below. |
+| **Each employee, once** | Creates their own **Microsoft Calendar** and clicks **Authorize**. Roughly twenty seconds, no admin involvement. |
+| **After that** | Their events sync both ways, their Teams meetings, their transcripts and recordings — all under their own delegated token. |
+
+Ticking **Sync with Microsoft Calendar** on an Event when you have no connection offers to make
+one there and then, which is where most people meet this for the first time.
+
+**What is separated, and enforced rather than assumed:** an ordinary user sees only their own
+connection in the list and can only authorize, sync or disconnect their own. An event pulled from
+someone's calendar is created Private and **owned by them**, so it appears on their calendar and
+on nobody else's — that ownership is set explicitly, because the scheduled sync runs as
+Administrator and would otherwise leave everyone's events owned by the scheduler.
+
+**A System Manager is the exception, deliberately.** Administrators and System Managers see every
+connection and can sync or disconnect any of them — somebody has to be able to fix a colleague's
+broken connection. It is worth knowing that the separation is between ordinary users, not from
+your administrators.
+
+**Recurring events go both ways.** A recurring Outlook meeting arrives as its individual
+occurrences. A repeating Frappe Event is sent as a real Outlook series — daily, weekly (on the
+days you tick), monthly, quarterly, half-yearly or yearly, ending on **Repeat Till** or never.
+The occurrences Microsoft generates from it are not mirrored back as separate Events: the
+repeating Event already represents them, exactly as one Graph series master represents its own.
+A frequency this app cannot map is sent as a single event rather than as a wrong series.
+
+**What it does not cover.** It syncs the signed-in person's **default** calendar
+(`/me/calendarView`) — a second calendar in the same mailbox is neither read nor written, and
+there is no picker. A shared mailbox's calendar or a room calendar is not covered either; that
+needs delegated access to the shared mailbox or the application-permission path, neither of which
+this app sets up today.
+
+# How Outlook calendar sync behaves
+
+Worth knowing before you trust it with a real calendar:
+
+- **Delta queries, not "modified since".** The pull runs `/me/calendarView/delta`, so recurring
+  series arrive as individual occurrences with stable ids (no duplicates on later runs) and
+  deletions arrive as `@removed` entries (no orphaned Frappe Events). The delta link is stored
+  on the Microsoft Calendar and is the sync watermark.
+- **A failed pull never advances the watermark.** If Graph errors halfway, the next run repeats
+  that window instead of skipping it. The reason is written to **Last Sync Error** on the form.
+- **Every page is read.** Collection reads follow `@odata.nextLink` to the end, so a calendar
+  with hundreds of events in the window imports completely, not just the first page.
+- **Origin decides who wins.** An Event that originated in Frappe keeps
+  `custom_pulled_from_microsoft = 0` for life: the pull refreshes its subject, times and
+  location from Outlook but never overwrites its description (Graph only returns a truncated
+  plain-text preview) and never flips the flag, so later local edits keep syncing out.
+  Events that originated in Microsoft are mirrors and are fully overwritten.
+- **Nothing is saved when nothing changed**, so `modified` does not churn and the push step does
+  not patch the same event back to Graph on every run.
+- **The delta window** covers 30 days back and 180 days forward, and is re-initialised
+  automatically when its far edge gets within 14 days.
+- **Concurrency and throttling.** Each calendar syncs under a file lock, so a slow run is never
+  overlapped by the next cron. A `429` is retried once after a short `Retry-After`; longer
+  backoffs are left to the next scheduled run. A `410` (expired delta token) restarts a full
+  sync automatically.
+- **Timezones.** Graph is asked for UTC, and Windows timezone ids (`Pacific Standard Time`) are
+  mapped to IANA rather than silently assumed to be UTC.
+
+Access to `Microsoft Calendar` is granted to **System Manager** and **Desk User** (the same
+pattern Frappe's Google Calendar uses), and each user only sees their own connection.
+
+# Teams meetings from a Frappe Event
+
+An Event carries an **Add Teams meeting** tickbox, the same idea as Outlook's own toggle.
+Tick it, save, and the event is created in Outlook as a Teams meeting. A **Join Meeting**
+button then appears at the top of the Event, with **Open in Outlook** beside it.
+
+It works in both directions: a Teams meeting organised in Outlook keeps its join link when it
+syncs into Frappe, so people can join from either side.
+
+No extra Azure permission is needed. Microsoft creates the meeting as part of the event, so
+`Calendars.ReadWrite` covers it — the **Outlook calendar** capability on its own is enough.
+`OnlineMeetings.ReadWrite` is only required for standalone meetings and transcripts, which are
+separate tickboxes precisely so a calendar-only setup never has to ask for them.
+
+**One limitation, enforced rather than explained away:** Microsoft cannot turn an existing
+online meeting back into a plain event. So the tickbox **locks itself once the meeting exists**
+rather than sitting there doing nothing when you untick it. To remove a meeting, delete the
+event and create it again. The app only ever sends `isOnlineMeeting: true`.
+
+# Attendees and RSVP
+
+An invitation that lands in someone's Outlook is usable from Frappe. Each synced Event
+carries three read-only fields, refreshed by every sync:
+
+- **Organizer** — the Microsoft account that created the event.
+- **Attendees** — one line per invitee: `Asha Rao <asha@example.com> — accepted`. Rooms and
+  equipment are labelled with their type, because a room declining is a different problem
+  from a person declining.
+- **My Response** — your own reply, stored exactly as Microsoft words it (`accepted`,
+  `declined`, `tentativelyAccepted`, `notResponded`, `organizer`, `none`).
+
+On an event you were invited to, the Event form grows **Accept**, **Tentative** and
+**Decline** buttons under a *Microsoft* menu. Each one offers an optional comment for the
+organizer and a tickbox to reply without emailing anyone — the same choice Outlook gives
+you. The reply goes straight to Microsoft and the Event updates immediately rather than
+waiting for the next scheduled sync. The buttons stay hidden on events you organized
+yourself, because there is nothing to reply to.
+
+No new Azure permission is needed: `/me/events/{id}/accept`, `/decline` and
+`/tentativelyAccept` all run on the delegated `Calendars.ReadWrite` the calendar sync
+already holds.
+
+Going the other way, an Event's **participants** are sent to Outlook as attendees when the
+event is pushed. A participant whose email cannot be resolved — no address on the row and
+none on the record it links to — is left out rather than sent as something Microsoft would
+reject. If nobody resolves, the attendee list is omitted from the request entirely: Graph
+reads an empty list as *remove everyone*, and that would silently uninvite people who were
+added in Outlook.
+
+**One limitation.** Zoom and Google Meet links are **not** extracted. Microsoft only fills
+in the structured `onlineMeeting` property for its own Teams meetings; a third-party link
+is loose text in the event body, and guessing at it would produce wrong links more often
+than right ones. Open the event in Outlook for those.
+
+# Teams meeting transcripts and recordings
+
+Once a Teams meeting has finished, its transcript is **attached to the Event as a `.vtt` file**
+and its recordings are listed on the Event, ready to download.
+
+**Nothing is ready the moment a meeting ends.** Microsoft publishes no schedule for this: an
+ordinary meeting is usually ready in 5-30 minutes, a long or heavy one can take a few hours,
+and Graph lags the Teams UI — the transcript can be readable in Teams while the API still
+returns an empty list. So the app does not ask once and declare the meeting unrecorded:
+
+- **It keeps asking, on a widening backoff.** 10 minutes after the meeting, then 25, 45, 75
+  minutes, 2, 3, 4½, 6, 8, 10, 12, 16, 20 and 24 hours — fourteen attempts across a day. (Polling
+  every fifteen minutes for the same day would cost ninety-six calls and find it no sooner.)
+- **The manual button stays.** **Get Transcript & Recording** is always there while something is
+  still missing, for when you don't want to wait for the next step.
+- **The button disappears once there is nothing left to fetch.** With the transcript attached and
+  a recording listed, the Event offers only **Download Recording**. With one of the two still
+  missing it says exactly which — **Check for Recording**, **Check for Transcript**.
+
+This is **opt-in per connection**: tick **Fetch transcripts after meetings** on a Microsoft
+Calendar. Without it, nothing is fetched until someone presses the button.
+
+**An empty answer means four different things, and the Event says which:**
+
+| | What you are told |
+| --- | --- |
+| Minutes after the meeting | Microsoft has not finished processing this meeting. Checking again around *hh:mm*. |
+| Microsoft returned an error | Microsoft's own error, verbatim — `ErrorAccessDenied`, a 403, whatever it said |
+| A day later, still nothing | Most likely never recorded or transcribed. You can still check by hand. |
+| More than ~60 days later | This meeting is too old — see the two clocks below |
+
+**Long meetings come back in pieces.** A Teams recording stops and restarts at **4 hours or
+1.5 GB**, whichever comes first, so a five-hour meeting is *two* recordings. Transcription can be
+stopped and restarted too. Everything here is plural: every transcript is attached
+(`…-part-1.vtt`, `…-part-2.vtt`), every recording is listed as *Part 1 of 2*, and **Download
+Recording** asks which part you want.
+
+**Two clocks end it, and neither is guesswork:**
+
+- **The meeting expires.** Graph's list-recordings endpoint works only for a meeting that hasn't
+  expired — **60 days** after a one-off meeting, with another 60 added whenever someone joins or
+  edits it. After that these endpoints return nothing, whatever still sits in OneDrive.
+- **The file expires.** Teams deletes recordings and transcripts on your tenant's retention
+  policy — **120 days** by default, and an admin can set it from one day to never.
+
+**Why the recording isn't just a link.** Graph's `recordingContentUrl` is an API endpoint that
+requires a bearer token — paste it into a browser and you get `401`, not a video. So the download
+streams through Frappe, authorised by Frappe's own permissions, and the token never leaves the
+server. The bytes are not stored: a Teams recording routinely runs to hundreds of megabytes, and
+copying one into the site's file store per meeting is a bad trade. A transcript is a few
+kilobytes and is the part people search and quote, so that one *is* kept.
+
+**One tenant switch, and it ships off.** Microsoft added a tenant-level control for Graph
+access to transcripts in 2026 and **defaults it to off**, so a tenant with every permission
+consented still gets `403 Forbidden: Graph API access to transcripts is disabled for this
+tenant`. It lives in the Teams admin center, not Entra — step 7 of *Connect Frappe to Microsoft 365, in order*. There
+is no request-side workaround, and re-granting consent does nothing, which is why both the error
+message and the doctor name this switch specifically rather than blaming permissions.
+
+**Requirements.** Three delegated permissions, not one: `OnlineMeetings.ReadWrite` to turn a join
+link into the meeting the transcript belongs to, `OnlineMeetingTranscript.Read.All` to read the
+transcript, and `OnlineMeetingRecording.Read.All` for the recordings — which also need a Teams
+licence that records. Microsoft consents to reading the words and reading the video separately, so
+a tenant that refuses recordings still gets transcripts rather than losing both. Only meetings
+created **as calendar events** have transcripts at all — standalone Teams meetings do not, which
+is why this app creates them the calendar way.
+
+**Why not webhooks?** Graph can push a notification the moment a transcript appears, but the
+tenant-wide subscriptions (`getAllTranscripts`, `getAllRecordings`) are **application-permission
+only** — standing access to every meeting in the tenant with nobody signed in — and the
+per-meeting ones only notify if you subscribed *before the meeting started*, plus they need a
+public HTTPS endpoint Microsoft can reach and renewal every few days. For a self-hosted Frappe
+that is a worse trade than fourteen polls.
+
+# Sensitive actions are called out before they happen
+
+Three things have consequences outside Frappe, and none of them happen quietly:
+
+- **Writing into a real calendar is opt-in.** `Push Frappe events to Microsoft` is **off by
+  default**; pull is the safe direction. Turning push on asks you to confirm, and says plainly
+  that deleting a Frappe Event will delete the Microsoft one.
+- **The Exchange setup script** grants the application standing access to the mailboxes you
+  list, readable with nobody signed in. The dialog explains that and will not generate the
+  script until you confirm; the app never runs it, and **the script ends with the commands
+  that undo it**, commented out so nothing reverses by accident.
+- **A time range Microsoft would reject is caught on save**, not after the fact. Frappe does
+  not enforce that an Event ends after it starts and pre-fills both times from the current
+  moment, so an event saved without touching them can end before it begins. You are told while
+  you can still fix it. Data arriving *from* Outlook is never second-guessed this way.
+
+Sync also refuses to be half-configured: ticking **Sync with Microsoft Calendar** requires
+choosing a connection, and enabling the integration requires the Azure credentials, so nothing
+saves in a state that silently does nothing.
+
+# Diagnostics and the connection doctor
+
+Connecting Frappe to Microsoft 365 has roughly fifteen steps across Azure, Exchange and
+Frappe, and almost every mistake surfaces as the same unhelpful string — `AUTHENTICATE
+failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
+
+**Microsoft Settings → Troubleshoot** gives you three tools:
+
+- **Run Diagnostics** inspects Microsoft Settings, the Connected App and every Email Account
+  and reports what is actually wrong. It catches the failures people hit most: delegated
+  scopes on an app-only flow (or the reverse), a missing `offline_access` scope — the reason
+  a connection works for an hour then needs re-authorising forever — v1.0 endpoints, tenant
+  mismatches between settings and endpoints, redirect-URI drift, IMAP without a folder, a
+  scope override that leaves out something a ticked capability needs, scopes that changed
+  after connections were authorised (their tokens predate the change and have to be renewed),
+  and the shared-mailbox identity conflict described below.
+- **Explain an Error** turns a message from the Error Log into a cause and a next step.
+- **Wrong-box mistakes are caught as you type them.** Azure shows a secret's **Value** next to
+  its **Secret ID**, and only the Value works; pasting the ID is the commonest setup mistake
+  there is, and Microsoft only says so at sign-in, as `AADSTS7000215`. A secret that is a GUID
+  is refused on save, because a secret value never is one. The same shape checks cover the
+  client id, the tenant id and the redirect URI.
+- **Exchange Setup Script** generates the `New-ServicePrincipal` / `Add-MailboxPermission`
+  commands for app-only mailbox access, looking the service principal up by AppId rather
+  than asking you to copy an Object ID — Microsoft's own documentation warns that copying
+  the one from the App Registration page (instead of the Enterprise Application page) causes
+  authentication to fail with no useful error.
+
+**The shared-mailbox identity conflict.** Microsoft requires the *shared mailbox address* in
+the IMAP XOAUTH2 string but the *signing-in user* for SMTP. Frappe sends `login_id or
+email_id` to both, so a single account cannot get incoming and outgoing right at the same
+time — which is why "SMTP works but IMAP doesn't" recurs on the forum. The doctor flags the
+configuration and suggests the two ways out: split incoming and outgoing into separate Email
+Accounts, or use the app-only flow, where no user identity is involved.
+
+# Python API for other Frappe apps
+
+Other apps depend on this app and call its utilities (they never re-implement Graph):
+
+| Purpose | Function |
+| --- | --- |
+| Settings / liveness | `frappe_microsoft365.microsoft_graph.get_settings()` |
+| Authorize / callback / disconnect / test | `…doctype.microsoft_calendar.microsoft_calendar` → `authorize_access(calendar_name)`, `callback`, `test_connection(calendar_name)`, `disconnect(calendar_name)` |
+| Create a Teams meeting | `frappe_microsoft365.microsoft_meetings.create_meeting(calendar_name, subject, start_datetime, end_datetime, attendees=None, body=None, create_calendar_event=True)` → `{event_id, web_link, join_url, online_meeting_id}` |
+| Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt}` |
+| Read calendar events | `frappe_microsoft365.microsoft_calendar_sync.fetch_events(calendar_name, start_datetime, end_datetime)` |
+| Reply to an invitation | `frappe_microsoft365.microsoft_rsvp.respond_to_event(event, response, comment=None, send_response=1)` — `response` is `accept`, `decline` or `tentative` |
+
+Example: **Bizmap OS** delegates its meeting/calendar features to these functions when this app is
+installed and Microsoft Settings is configured, and falls back to stubs otherwise.
+
+See [`docs/graph-api-reference.md`](graph-api-reference.md) for the verified Graph
+endpoint/permission contract, and [`docs/azure-setup.md`](azure-setup.md) for Azure setup.
+
