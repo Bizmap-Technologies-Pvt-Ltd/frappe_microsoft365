@@ -68,6 +68,16 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - The fork's intermediate-DocType migration patches are not carried over: the DocTypes are
   created in their final form, and a site upgrading from the fork already has them.
 
+## 1.0.1 — fix
+
+### Fixed
+
+- **Pull-only connections no longer delete in Outlook.** With *Push Frappe events to Microsoft*
+  off, deleting an Event that had been pulled from Outlook still deleted the Outlook event —
+  and, when the connection's owner organised the meeting, Microsoft sent every attendee a
+  cancellation. Deleting is a write, so it now follows the push switch like creating and
+  updating already did, both when the delete happens and again when the queued job runs.
+
 ## Unreleased — modular setup
 
 ### Added
