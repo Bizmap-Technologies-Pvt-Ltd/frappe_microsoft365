@@ -47,7 +47,12 @@ def configure(test, **overrides):
 	"""Turn Document Storage on with ToDo mapped, restoring the previous settings afterwards.
 
 	Overrides for SharePoint Settings options (files_*) go there; the rest to Microsoft Settings.
+	Storage cannot be switched on before Frappe v16, so a test that needs it is skipped there.
 	"""
+	from frappe_microsoft365 import capabilities
+
+	if capabilities.unmet(capabilities.get("files"), {}):
+		test.skipTest("SharePoint document storage needs Frappe v16")
 	doc = frappe.get_doc("Microsoft Settings")
 	before = {k: doc.get(k) for k in ("enabled", "tenant_id", "client_id", "use_files")}
 	storage = frappe.get_doc("SharePoint Settings")
