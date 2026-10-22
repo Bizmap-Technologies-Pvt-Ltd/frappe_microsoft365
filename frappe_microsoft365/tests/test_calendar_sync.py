@@ -699,6 +699,25 @@ class TestEventSaveOffRequest(SyncTestCase):
 		self.assertEqual(mocked.call_args[0][0], "DELETE")
 		self.assertIn("ms-already-deleted", mocked.call_args[0][1])
 
+	def test_a_pull_only_connection_never_deletes_in_microsoft(self):
+		"""Push off means Outlook is read, never written — a delete is a write.
+
+		Deleting a pulled mirror used to remove the Outlook event, and for the organiser that
+		cancels the meeting for every attendee.
+		"""
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "push_to_microsoft_calendar", 0)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		event = self._linked_event("ms-pulled")
+
+		with patch.object(frappe, "enqueue") as enqueued, patch.object(
+			graph, "graph_request"
+		) as mocked:
+			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)
+			sync.delete_event_in_graph(CALENDAR, "ms-pulled")
+
+		self.assertEqual(self._jobs_for(enqueued, "delete_event_in_graph"), [])
+		mocked.assert_not_called()
+
 	def test_a_delete_is_abandoned_when_an_event_still_claims_that_id(self):
 		"""Removing it would strand that mirror, and the next pull would delete it locally too."""
 		self._linked_event("ms-still-here")
