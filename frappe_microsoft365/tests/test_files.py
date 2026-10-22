@@ -355,7 +355,7 @@ class TestAppOnly(BaseTestCase):
 		tokens, app, _cca = self._app_token(settings, minted=("SECRET-TOKEN", "UNUSED"))
 		self.assertEqual(tokens, ["SECRET-TOKEN", "SECRET-TOKEN"])
 		app.acquire_token_for_client.assert_called_once_with(scopes=[graph.APP_GRAPH_SCOPE])
-		self.assertNotIn("SECRET-TOKEN", str(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY)))
+		self.assertNotIn("SECRET-TOKEN", str(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY, expires=True)))
 
 	def test_separate_application_registration_is_used_when_set(self):
 		graph.clear_app_token_cache()
@@ -396,7 +396,7 @@ class TestAppOnly(BaseTestCase):
 	def test_saving_microsoft_settings_forgets_the_app_token(self):
 		frappe.cache().set_value(graph.APP_TOKEN_CACHE_KEY, {"owner": "x", "token": "y"})
 		configure(self)
-		self.assertIsNone(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY))
+		self.assertIsNone(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY, expires=True))
 
 	def test_large_uploads_send_ranges_without_a_bearer_token(self):
 		size = files.SIMPLE_UPLOAD_MAX_BYTES + 1

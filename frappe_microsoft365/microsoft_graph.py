@@ -436,7 +436,10 @@ def get_app_access_token():
 	tenant, client_id, secret = app_credentials()
 	owner = f"{tenant}/{client_id}"
 
-	cached = frappe.cache().get_value(APP_TOKEN_CACHE_KEY)
+	# expires=True: the entry is written with an expiry, which set_value keeps out of the
+	# request-local cache. Without it, v15 remembers a miss for the rest of the request, so
+	# every call in that request would mint a fresh token.
+	cached = frappe.cache().get_value(APP_TOKEN_CACHE_KEY, expires=True)
 	if cached and cached.get("owner") == owner:
 		try:
 			return decrypt(cached["token"])
