@@ -1376,6 +1376,12 @@ def event_on_trash(doc, method=None):
 		return
 
 	try:
+		# Deleting in Microsoft is a write like any other, so it follows the push switch too.
+		# Without this a pull-only connection — "bring Outlook in, never touch it" — removed the
+		# Outlook event, and cancelled the meeting for everyone when its owner was the organiser,
+		# whenever someone deleted the mirror in Frappe.
+		if not frappe.db.get_value("Microsoft Calendar", cal_name, "push_to_microsoft_calendar"):
+			return
 		_queue_or_do_it_after_commit(
 			"frappe_microsoft365.microsoft_calendar_sync.delete_event_in_graph",
 			queue="short",
@@ -1410,7 +1416,8 @@ def delete_event_in_graph(calendar_name, ms_event_id):
 		if frappe.db.exists("Event", {"custom_microsoft_event_id": ms_event_id}):
 			return
 		cal = frappe.get_cached_doc("Microsoft Calendar", calendar_name)
-		if not cal.enabled or not cal.authorized:
+		# Checked again here: push may have been switched off between the delete and this job.
+		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
 			return
 		graph.graph_request("DELETE", f"/me/events/{ms_event_id}", cal.name)
 	except Exception:
