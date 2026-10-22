@@ -43,8 +43,9 @@ from frappe import _
 from frappe.utils import add_to_date, cint, now_datetime
 from werkzeug.wrappers import Response
 
+from frappe_microsoft365 import capabilities
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import APP_ONLY, MsGraphConflict, MsGraphError, MsGraphNotFound
+from frappe_microsoft365.microsoft_graph import APP, MsGraphConflict, MsGraphError, MsGraphNotFound
 
 # --- constants ---------------------------------------------------------------------------
 
@@ -133,8 +134,13 @@ def storage_option(fieldname, doctype=None):
 
 
 def files_enabled(settings=None):
-	settings = settings or _settings()
-	return bool(settings.enabled and settings.get("use_files"))
+	return capabilities.is_enabled("files", settings or _settings())
+
+
+def has_file_fields():
+	"""Whether the File fields exist yet. They are created when storage is first switched on, so
+	code that can run on a site that never switched it on must ask before touching them."""
+	return frappe.get_meta("File").has_field("custom_microsoft_status")
 
 
 MAPPING_CACHE_KEY = "frappe_microsoft365:sharepoint_mappings"
@@ -360,7 +366,7 @@ def resolve_drive(row):
 	site = graph.graph_request(
 		"GET",
 		f"/sites/{host}:{path}" if path else f"/sites/{host}",
-		APP_ONLY,
+		APP,
 		params={"$select": "id,webUrl,displayName"},
 	)
 	site_id = site["id"]
@@ -376,7 +382,7 @@ def resolve_drive(row):
 
 def _find_drive(site_id, library):
 	library = (library or "").strip()
-	drives = graph.graph_paged(f"/sites/{site_id}/drives?$select=id,name,webUrl", APP_ONLY)
+	drives = graph.graph_paged(f"/sites/{site_id}/drives?$select=id,name,webUrl", APP)
 	wanted = library.lower()
 	for drive in drives:
 		if (drive.get("name") or "").lower() == wanted:
@@ -387,7 +393,7 @@ def _find_drive(site_id, library):
 		if web_tail and quote(library) == web_tail:
 			return drive["id"]
 	if wanted in ("", "documents", "shared documents"):
-		return graph.graph_request("GET", f"/sites/{site_id}/drive", APP_ONLY, params={"$select": "id"})["id"]
+		return graph.graph_request("GET", f"/sites/{site_id}/drive", APP, params={"$select": "id"})["id"]
 	names = ", ".join(sorted(d.get("name") or "?" for d in drives)) or _("none visible")
 	frappe.throw(
 		_("No document library named {0} on that site. Libraries the app can see: {1}").format(
@@ -403,7 +409,7 @@ def _get_by_path(drive_id, segments, parent_id=None):
 	path = f"{base}:/{encode_path(segments)}:" if segments else base
 	try:
 		return graph.graph_request(
-			"GET", path, APP_ONLY, params={"$select": "id,name,folder,webUrl,parentReference"}
+			"GET", path, APP, params={"$select": "id,name,folder,webUrl,parentReference"}
 		)
 	except MsGraphNotFound:
 		_forget_message()
@@ -417,7 +423,7 @@ def _create_folder(drive_id, parent_id, name):
 		return graph.graph_request(
 			"POST",
 			f"{parent}/children",
-			APP_ONLY,
+			APP,
 			json={
 				"name": name,
 				"folder": {},
@@ -556,7 +562,7 @@ def existing_folder_values(row, location):
 		parsed = urlparse(value)
 		ids = parse_qs(parsed.query).get("id")
 		path = unquote(ids[0] if ids else parsed.path).rstrip("/")
-		drive = graph.graph_request("GET", f"/drives/{drive_id}", APP_ONLY, params={"$select": "webUrl"})
+		drive = graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "webUrl"})
 		root = unquote(urlparse(drive.get("webUrl") or "").path).rstrip("/")
 		if root and path.lower().startswith(root.lower() + "/"):
 			item = _get_by_path(drive_id, [p for p in path[len(root) + 1 :].split("/") if p])
@@ -567,7 +573,7 @@ def existing_folder_values(row, location):
 				item = graph.graph_request(
 					"GET",
 					f"/shares/{token}/driveItem",
-					APP_ONLY,
+					APP,
 					params={"$select": "id,name,folder,webUrl,parentReference"},
 				)
 			except MsGraphError:
@@ -790,7 +796,7 @@ def redirect_moved_file():
 	path = unquote(request.path or "")
 	if not path.startswith(("/private/files/", "/files/")) or ".." in path.split("/"):
 		return
-	if os.path.exists(local_path(path)):
+	if os.path.exists(local_path(path)) or not has_file_fields():
 		return
 	name = frappe.db.get_value(
 		"File", {"custom_microsoft_local_url": path, "custom_microsoft_status": STORED}, "name"
@@ -871,7 +877,7 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 		return graph.graph_request(
 			"PUT",
 			f"{target}/content",
-			APP_ONLY,
+			APP,
 			data=fh.read(),
 			params={"@microsoft.graph.conflictBehavior": "rename"},
 			headers={"Content-Type": content_type},
@@ -881,7 +887,7 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 	session = graph.graph_request(
 		"POST",
 		f"{target}/createUploadSession",
-		APP_ONLY,
+		APP,
 		json={
 			"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
 		},
@@ -1047,7 +1053,7 @@ def on_file_trash(doc, method=None):
 	if others:
 		return
 	try:
-		graph.graph_request("DELETE", f"/drives/{doc.custom_microsoft_drive_id}/items/{item_id}", APP_ONLY)
+		graph.graph_request("DELETE", f"/drives/{doc.custom_microsoft_drive_id}/items/{item_id}", APP)
 	except MsGraphNotFound:
 		_forget_message()
 		pass
@@ -1058,9 +1064,7 @@ def on_file_trash(doc, method=None):
 
 def on_doc_trash(doc, method=None):
 	"""Any document's on_trash: forget its folder record. The SharePoint folder is kept."""
-	if doc.doctype in ("SharePoint Folder", "File") or not frappe.db.table_exists("SharePoint Folder"):
-		return
-	if doc.doctype not in mapped_doctypes():
+	if doc.doctype in ("SharePoint Folder", "File") or doc.doctype not in mapped_doctypes():
 		return
 	filters = {"reference_doctype": doc.doctype, "reference_name": doc.name}
 	if frappe.db.exists("SharePoint Folder", filters):
@@ -1088,7 +1092,7 @@ def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
 		item = graph.graph_request(
 			"PATCH",
 			f"/drives/{folder.drive_id}/items/{folder.item_id}",
-			APP_ONLY,
+			APP,
 			json={
 				"name": new_name,
 				"@microsoft.graph.conflictBehavior": "fail",
@@ -1169,6 +1173,8 @@ def queue_existing(doctype: str | None = None, limit: int = 500):
 def storage_summary():
 	"""Counts by status, for the Settings form. System Manager."""
 	frappe.only_for("System Manager")
+	if not has_file_fields():
+		return {}
 	# One count per status rather than a GROUP BY: newer Frappe refuses SQL functions written as
 	# strings in fields, and the dict form it wants instead does not exist on v15.
 	counts = {}
@@ -1181,8 +1187,23 @@ def storage_summary():
 
 # --- reading -----------------------------------------------------------------------------
 
-#: Served as a download even when asked to open inline: a browser renders these as active
-#: content on our origin. The same list Frappe applies to /private/files.
+#: The only types opened in the browser tab; everything else downloads. An allow-list, because
+#: what is not on it — HTML, SVG, XML, and anything whose type is unknown — a browser may render
+#: as active content on our origin. A file with no extension has no type of its own, and the
+#: Content-Type SharePoint reports for it is whatever was uploaded, so it is never trusted.
+INLINE_TYPES = ("application/pdf", "text/plain", "text/csv")
+INLINE_TYPE_PREFIXES = ("image/", "audio/", "video/")
+
+
+def opens_inline(content_type):
+	"""Pure. Whether a file of this type may be shown in the browser rather than downloaded."""
+	if not content_type or content_type == "image/svg+xml":
+		return False
+	return content_type in INLINE_TYPES or content_type.startswith(INLINE_TYPE_PREFIXES)
+
+
+#: Always downloaded, whatever their type is guessed to be. Kept alongside the allow-list as a
+#: second line: the same list Frappe applies to /private/files.
 FORCE_DOWNLOAD_EXTENSIONS = (
 	".svg",
 	".svgz",
@@ -1208,13 +1229,15 @@ def _stream(drive_id, item_id, filename, download=False):
 	Authorization header on the way, since the host changes.
 	"""
 	resp = graph.graph_request(
-		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP_ONLY, raw=True, stream=True, timeout=60
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, stream=True, timeout=60
 	)
 	headers = resp.headers or {}
-	content_type = (
-		mimetypes.guess_type(filename)[0] or headers.get("Content-Type") or "application/octet-stream"
+	content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+	inline = (
+		not download
+		and opens_inline(content_type)
+		and not filename.lower().endswith(FORCE_DOWNLOAD_EXTENSIONS)
 	)
-	inline = not download and not filename.lower().endswith(FORCE_DOWNLOAD_EXTENSIONS)
 
 	response = Response(
 		resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES), direct_passthrough=True, content_type=content_type
@@ -1277,7 +1300,7 @@ def open_file(file: str, download: int = 0):
 def fetch_content(drive_id, item_id):
 	"""The whole content of a driveItem as bytes. For File.get_content; not for big files."""
 	resp = graph.graph_request(
-		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP_ONLY, raw=True, timeout=120
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, timeout=120
 	)
 	try:
 		return resp.content
@@ -1311,7 +1334,7 @@ def list_folder(doctype: str, name: str, subfolder: str | None = None):
 		items = graph.graph_paged(
 			f"/drives/{folder.drive_id}/items/{parent_id}/children"
 			"?$select=id,name,size,file,folder,webUrl,lastModifiedDateTime,lastModifiedBy&$top=200",
-			APP_ONLY,
+			APP,
 		)
 	except MsGraphNotFound:
 		_forget_message()
@@ -1391,7 +1414,7 @@ def _assert_inside(folder, item_id):
 			item = graph.graph_request(
 				"GET",
 				f"/drives/{folder.drive_id}/items/{current}",
-				APP_ONLY,
+				APP,
 				params={"$select": "id,parentReference"},
 			)
 		except MsGraphNotFound:
@@ -1415,7 +1438,7 @@ def open_item(doctype: str, name: str, item_id: str, download: int = 0):
 		frappe.throw(_("This record has no SharePoint folder yet."), frappe.DoesNotExistError)
 	_assert_inside(folder, item_id)
 	item = graph.graph_request(
-		"GET", f"/drives/{folder.drive_id}/items/{item_id}", APP_ONLY, params={"$select": "id,name,file"}
+		"GET", f"/drives/{folder.drive_id}/items/{item_id}", APP, params={"$select": "id,name,file"}
 	)
 	if "file" not in item:
 		frappe.throw(_("That is a folder, not a file."))
@@ -1517,7 +1540,7 @@ def test_connection(mapping: str | None = None):
 		try:
 			base = ensure_path(drive_id, segments) if segments else _get_by_path(drive_id, [])
 			probe = _create_folder(drive_id, base["id"], PROBE_FOLDER)
-			graph.graph_request("DELETE", f"/drives/{drive_id}/items/{probe['id']}", APP_ONLY)
+			graph.graph_request("DELETE", f"/drives/{drive_id}/items/{probe['id']}", APP)
 		except Exception as e:
 			findings.append(
 				finding(
@@ -1623,7 +1646,7 @@ def bring_back(file_name):
 		resp = graph.graph_request(
 			"GET",
 			f"/drives/{file_doc.custom_microsoft_drive_id}/items/{file_doc.custom_microsoft_item_id}/content",
-			APP_ONLY,
+			APP,
 			raw=True,
 			stream=True,
 			timeout=120,
@@ -1687,7 +1710,7 @@ def leave_in_sharepoint(file_name):
 		item = graph.graph_request(
 			"GET",
 			f"/drives/{file_doc.custom_microsoft_drive_id}/items/{file_doc.custom_microsoft_item_id}",
-			APP_ONLY,
+			APP,
 			params={"$select": "webUrl"},
 		)
 		web_url = item.get("webUrl")

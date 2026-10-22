@@ -57,11 +57,12 @@ Open the channel's **Files** (or **Shared**) tab and find the folder named after
 
 The ERP connects as its own app with access to only the SharePoint sites you grant it; no one's personal sign-in is used. A Global Administrator does these steps once per Microsoft 365 tenant.
 
-**1. Register the app** in the Microsoft Entra admin center: *Identity → Applications → App registrations → New registration*.
+**1. Choose the app registration.** Either works:
 
-- Name it after the ERP site, e.g. `ERP – production`. Use one registration per ERP site so each can be revoked alone.
-- Supported account types: **this organizational directory only**. Leave the redirect URI blank.
-- From **Overview**, note the **Application (client) ID** and the **Directory (tenant) ID**.
+- **A separate registration for storage (recommended).** Microsoft advises keeping permissions that act as the app apart from permissions that act for signed-in people. In the Microsoft Entra admin center: *Identity → Applications → App registrations → New registration*. Name it after the ERP site, e.g. `ERP – production` (one registration per ERP site, so each can be revoked alone). Supported account types: **this organizational directory only**. Leave the redirect URI blank: nobody signs in to it.
+- **The registration you already use for calendar or mail.** Nothing new to create; add the permission in step 3 to it.
+
+From **Overview**, note the **Application (client) ID** and the **Directory (tenant) ID**.
 
 **2. Create a client secret**: *Certificates & secrets → New client secret*.
 
@@ -95,9 +96,10 @@ Three places hold the configuration: **Microsoft Settings** for the connection, 
 
 **Microsoft Settings and SharePoint Settings**
 
-1. Fill in **Tenant ID**, **Client ID** and **Client Secret Value** from the Microsoft setup. Tenant ID must be the directory ID, not `common`.
-2. Tick **Enabled** and **SharePoint document storage**, then **Save**.
-3. Open **SharePoint Settings** (sidebar *SharePoint Settings*, or the link under the tickbox) and choose the options:
+1. Fill in **Tenant ID**, **Client ID** and **Client Secret Value** of your main registration if they are not there yet. Tenant ID must be the directory ID, not `common`.
+2. Tick **Enabled** and **SharePoint document storage**, then **Save**. Saving the tickbox for the first time adds the fields on File that record where each attachment lives; sites that never tick it never get them. Storage needs Frappe v16.
+3. If you created a separate registration in step 1, open **Application Access** (below the main registration) and enter its **Application Client ID** and **Application Client Secret Value**. Leave both empty to use the main registration.
+4. Open **SharePoint Settings** (sidebar *SharePoint Settings*, or the link under the tickbox) and choose the options:
 
 | Option | Off (default) | On |
 | --- | --- | --- |

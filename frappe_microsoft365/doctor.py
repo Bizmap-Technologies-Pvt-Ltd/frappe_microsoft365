@@ -36,7 +36,7 @@ import frappe
 from frappe import _
 from frappe.utils.password import get_decrypted_password
 
-from frappe_microsoft365 import background
+from frappe_microsoft365 import background, capabilities
 from frappe_microsoft365 import microsoft_graph as graph
 
 # microsoft_graph does not import this module, so this direction is safe.
@@ -1264,38 +1264,30 @@ def manual_step_findings(settings=None):
 def _capability_summary(settings):
 	"""What this site asked for, and the permission each capability needs granting.
 
-	Derived from graph.CAPABILITY_SCOPES rather than a second list, so the guide can never
-	advertise a permission the sign-in will not request.
+	Read from the capability registry, the same definitions the sign-in scopes come from, so
+	the guide can never advertise a permission the sign-in will not request.
 
 	Only the ticked ones, to match the steps: a guide that says it covers Teams meetings on a
-	calendar-only site is describing somebody else's setup.
+	calendar-only site is describing somebody else's setup. Mail and sign-in are left out: their
+	permissions live on the Connected App and Social Login Key, which have checks of their own.
 	"""
-	labels = {
-		"use_calendar": _("Outlook calendar"),
-		"use_teams": _("Standalone Teams meetings"),
-		"use_transcripts": _("Transcripts and recordings"),
-	}
-	summary = [
-		{
-			"id": field.replace("use_", ""),
-			"field": field,
-			"label": labels.get(field, field),
-			"enabled": True,
-			"permissions": list(scopes),
-		}
-		for field, scopes in graph.CAPABILITY_SCOPES
-		if settings.get(field)
-	]
-	if settings.get("use_files"):
-		# An application permission, not a delegated scope, so it is not in CAPABILITY_SCOPES:
-		# nobody signs in for it and it never appears on a consent screen at sign-in.
+	summary = []
+	for capability in capabilities.ticked(settings):
+		if capability.access == capabilities.DELEGATED:
+			permissions = list(capability.graph_scopes)
+		elif capability.access == capabilities.APPLICATION:
+			# Application permissions: nobody signs in for them, so they never appear on a
+			# consent screen at sign-in and only an admin grant gives them.
+			permissions = [f"{p} (Application)" for p in capability.azure_permissions]
+		else:
+			continue
 		summary.append(
 			{
-				"id": "files",
-				"field": "use_files",
-				"label": _("SharePoint document storage"),
+				"id": capability.id,
+				"field": capability.field,
+				"label": _(capability.label),
 				"enabled": True,
-				"permissions": ["Sites.Selected (Application)"],
+				"permissions": permissions,
 			}
 		)
 	return summary

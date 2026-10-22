@@ -23,9 +23,16 @@ def after_migrate():
 
 
 def setup():
-	"""Everything this app needs present on a site. Idempotent, safe to re-run."""
+	"""Everything this app needs present on a site. Idempotent, safe to re-run.
+
+	What an optional capability needs (the File fields for SharePoint storage, say) is created
+	when its tickbox is switched on, not here, so a site that never uses it never gets it. On
+	migrate it is refreshed only for the capabilities that are on.
+	"""
+	from frappe_microsoft365 import capabilities
+
 	create_event_custom_fields()
-	create_file_custom_fields()
+	capabilities.ensure_enabled_capabilities()
 
 
 def create_event_custom_fields(only_definitions=False):
@@ -271,6 +278,8 @@ FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nFailed"
 
 def create_file_custom_fields(only_definitions=False):
 	"""Fields on File that record where an attachment lives in SharePoint (idempotent).
+
+	Created when SharePoint document storage is switched on (capabilities.py), never before.
 
 	Custom fields rather than a side table: every reader of File — permissions, copies made by
 	create_attachment_copy, the File list — already carries them along, and a moved File is still

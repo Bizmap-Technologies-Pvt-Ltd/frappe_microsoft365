@@ -58,9 +58,10 @@ Microsoft Graph.
 - **Attachments in SharePoint / Teams.** Map a DocType to a site and a channel folder and each
   record gets its own folder: attachments move there and stop using your server's disk, and
   files dropped into the folder from Teams show on the record. Signs in as the app with
-  `Sites.Selected`, so it reaches only the sites an admin grants. See
+  `Sites.Selected`, so it reaches only the sites an admin grants. Frappe v16. See
   [SharePoint document storage](docs/sharepoint-files.md), with a
   [user guide](docs/sharepoint-user-guide.md) for the people who use and set it up.
+  Contributed by David Eleben ([@eleben](https://github.com/eleben)).
 - **A doctor for when it breaks.** Setup spans two Microsoft portals and almost every mistake
   surfaces as the same unhelpful string. **Run Diagnostics** names the failing step;
   **Explain an Error** decodes a message from the Error Log into a cause and a fix.

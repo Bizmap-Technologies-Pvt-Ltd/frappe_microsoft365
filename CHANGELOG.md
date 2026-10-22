@@ -2,6 +2,10 @@
 
 ## Unreleased — SharePoint document storage
 
+SharePoint document storage was built by David Eleben (@eleben) in his fork
+(`eleben/frappe_microsoft365`, branch `feature/sharepoint-files`) and brought into this app as a
+capability, with the changes listed under *Changed from the original*.
+
 ### Added
 
 - **Document Storage**: a *SharePoint Mapping* per DocType points it at a SharePoint site,
@@ -16,7 +20,7 @@
   upload sessions. Failed moves are marked on the File and retried hourly.
 - **Files in Microsoft 365** panel on mapped forms: the folder's contents, including files added
   from Teams or SharePoint, opened through Frappe with the record's own read permission.
-- **App-only Graph calls**: `graph_request(..., microsoft_graph.APP_ONLY)` uses the client
+- **App-only Graph calls**: `graph_request(..., microsoft_graph.APP)` uses the client
   credentials flow, with the token cached encrypted per site. Document storage needs the
   `Sites.Selected` application permission and a per-site grant — never tenant-wide
   `Sites.ReadWrite.All`.
@@ -44,6 +48,25 @@
 
 Nothing is deleted from SharePoint unless *Remove from SharePoint when the attachment is
 deleted* is ticked, and then only to the site recycle bin. Deleting a record keeps its folder.
+
+### Changed from the original
+
+- **One capability registry** (`capabilities.py`): each tickbox on Microsoft Settings is defined
+  once — label, whether it acts as a person or as the app, Azure permissions, prerequisites,
+  minimum Frappe version, and what to create when it is switched on. Scopes, Set Up, the doctor
+  and the Settings form all read it.
+- **Off means off**: the File fields are created when storage is switched on, not on install, and
+  every hook returns before doing any work while it is off.
+- **App auth context** `microsoft_graph.APP` replaces the `APP_ONLY` marker; an optional separate
+  *Application Access* registration on Microsoft Settings; the app token is keyed to the tenant
+  and client that minted it and dropped whenever Microsoft Settings is saved.
+- **Frappe v16 only** for storage: the tickbox is refused on v15, where moved files could not be
+  read server-side.
+- **Only known-safe types open inline** (PDF, images other than SVG, plain text, audio, video);
+  everything else, including files without an extension, downloads.
+- `File.get_content` no longer depends on a Frappe constant some v16 releases lack.
+- The fork's intermediate-DocType migration patches are not carried over: the DocTypes are
+  created in their final form, and a site upgrading from the fork already has them.
 
 ## Unreleased — modular setup
 

@@ -821,7 +821,12 @@ class TestSetupGuideEndpoint(BaseTestCase):
 
 		for capability in doctor.setup_guide()["capabilities"]:
 			with self.subTest(capability=capability["id"]):
-				self.assertEqual(capability["permissions"], by_field[capability["field"]])
+				if capability["field"] in by_field:
+					self.assertEqual(capability["permissions"], by_field[capability["field"]])
+				else:
+					# An application permission: granted by an admin, never part of sign-in.
+					for permission in capability["permissions"]:
+						self.assertTrue(permission.endswith("(Application)"), permission)
 
 	def test_only_the_capabilities_this_site_ticked_are_described(self):
 		"""The dialog prints these as "Covers:", so an unticked one there describes somebody

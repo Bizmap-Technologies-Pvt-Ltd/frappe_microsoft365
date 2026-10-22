@@ -187,15 +187,18 @@ m.list_folder("Project", "PROJ-0001")               # whitelisted; checks read p
 ```
 
 Any Graph call can be made as the application with
-`microsoft_graph.graph_request(method, path, microsoft_graph.APP_ONLY, ...)`.
+`microsoft_graph.graph_request(method, path, microsoft_graph.APP, ...)`. ``APP`` is an explicit
+auth context: such a call never uses a person's token, and a delegated call never becomes an
+application call. It signs in with the *Application Access* registration on Microsoft Settings
+when one is entered, otherwise with the main one; the token is cached per site and dropped
+whenever Microsoft Settings is saved.
 
 ## Frappe v15
 
-Everything works on v15 except one thing. Server-side code that reads a moved attachment's bytes
-(`File.get_content()`, used for example to attach a file to an outgoing email) needs Frappe v16's
-`extend_doctype_class` hook. On v15 those readers get no content, while opening and downloading
-from the desk work as normal. If you rely on emailing attachments of a mapped DocType on v15,
-keep a local copy.
+Storage needs Frappe v16, and Microsoft Settings refuses the tickbox on v15. Server-side code that
+reads a moved attachment's bytes (`File.get_content()`, used for example to attach a file to an
+outgoing email) is answered from SharePoint through v16's `extend_doctype_class` hook; v15 has no
+such hook, so those readers would get no content. The other capabilities work on v15 as before.
 
 ## Graph endpoints used
 

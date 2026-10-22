@@ -16,10 +16,23 @@ from frappe.utils import add_to_date
 from frappe_microsoft365 import doctor
 from frappe_microsoft365 import microsoft_files as files
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import APP_ONLY, MsGraphError, MsGraphNotFound
+from frappe_microsoft365.microsoft_graph import APP, MsGraphError, MsGraphNotFound
 from frappe_microsoft365.tests.base import BaseTestCase
 
 MAPPED = "ToDo"
+
+
+def setUpModule():
+	"""Create the File fields before any test switches storage on.
+
+	Switching it on creates them (capabilities.py), and creating a column is DDL, which MariaDB
+	commits together with whatever the test had written so far — settings a test means to roll
+	back would stick. Done once here, the switch finds them present and alters nothing.
+	"""
+	from frappe_microsoft365.setup import create_file_custom_fields
+
+	create_file_custom_fields()
+	frappe.db.commit()  # nosemgrep: DDL above has committed already; make that explicit
 
 
 STORAGE_OPTIONS = (
@@ -119,7 +132,7 @@ class FakeGraph:
 		data=None,
 		timeout=30,
 	):
-		assert caller is APP_ONLY, "document storage must always call as the application"
+		assert caller is APP, "document storage must always call as the application"
 		self.calls.append((method, path))
 		if method == "GET" and path == "/drives/DRIVE":
 			return {"webUrl": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"}
@@ -278,7 +291,7 @@ class TestAppOnly(BaseTestCase):
 			patch.object(graph, "get_valid_access_token") as delegated,
 			patch.object(graph, "_http_request", return_value=_response(payload={"id": "x"})) as http,
 		):
-			self.assertEqual(graph.graph_request("GET", "/sites/root", APP_ONLY), {"id": "x"})
+			self.assertEqual(graph.graph_request("GET", "/sites/root", APP), {"id": "x"})
 		tok.assert_called_once()
 		delegated.assert_not_called()
 		self.assertEqual(http.call_args.kwargs["headers"]["Authorization"], "Bearer APPTOKEN")
@@ -291,7 +304,7 @@ class TestAppOnly(BaseTestCase):
 				graph, "_http_request", side_effect=[_response(401), _response(payload={"ok": 1})]
 			) as http,
 		):
-			self.assertEqual(graph.graph_request("GET", "/sites/root", APP_ONLY), {"ok": 1})
+			self.assertEqual(graph.graph_request("GET", "/sites/root", APP), {"ok": 1})
 		cleared.assert_called_once()
 		self.assertEqual(http.call_args.kwargs["headers"]["Authorization"], "Bearer NEW")
 
@@ -303,7 +316,7 @@ class TestAppOnly(BaseTestCase):
 			),
 		):
 			with self.assertRaises(MsGraphNotFound):
-				graph.graph_request("GET", "/drives/d/items/x", APP_ONLY)
+				graph.graph_request("GET", "/drives/d/items/x", APP)
 		with (
 			patch.object(graph, "get_app_access_token", return_value="T"),
 			patch.object(
@@ -311,21 +324,74 @@ class TestAppOnly(BaseTestCase):
 			),
 		):
 			with self.assertRaises(graph.MsGraphConflict):
-				graph.graph_request("POST", "/drives/d/items/x/children", APP_ONLY)
+				graph.graph_request("POST", "/drives/d/items/x/children", APP)
+
+	def _app_token(self, settings, minted=("SECRET-TOKEN",), secret="main-secret"):
+		"""get_app_access_token against these settings, with MSAL faked. Returns (tokens, msal mock)."""
+		import msal
+
+		app = MagicMock()
+		app.acquire_token_for_client.side_effect = [
+			{"access_token": token, "expires_in": 3600} for token in minted
+		]
+		with (
+			patch.object(graph, "get_settings", return_value=settings),
+			patch.object(graph, "_client_secret", return_value=secret),
+			patch.object(graph, "get_decrypted_password", return_value="app-secret"),
+			patch.object(msal, "ConfidentialClientApplication", return_value=app) as cca,
+		):
+			tokens = [graph.get_app_access_token() for _ in minted]
+		return tokens, app, cca
 
 	def test_app_token_is_cached_encrypted(self):
-		app = MagicMock()
-		app.acquire_token_for_client.return_value = {"access_token": "SECRET-TOKEN", "expires_in": 3600}
 		graph.clear_app_token_cache()
 		self.addCleanup(graph.clear_app_token_cache)
-		with (
-			patch.object(graph, "get_settings", return_value=frappe._dict(enabled=1)),
-			patch.object(graph, "_msal_app", return_value=app),
-		):
-			self.assertEqual(graph.get_app_access_token(), "SECRET-TOKEN")
-			self.assertEqual(graph.get_app_access_token(), "SECRET-TOKEN")
-		app.acquire_token_for_client.assert_called_once_with(scopes=[graph.APP_ONLY_GRAPH_SCOPE])
+		settings = frappe._dict(enabled=1, tenant_id="contoso.onmicrosoft.com", client_id="MAIN")
+		tokens, app, _cca = self._app_token(settings, minted=("SECRET-TOKEN", "UNUSED"))
+		self.assertEqual(tokens, ["SECRET-TOKEN", "SECRET-TOKEN"])
+		app.acquire_token_for_client.assert_called_once_with(scopes=[graph.APP_GRAPH_SCOPE])
 		self.assertNotIn("SECRET-TOKEN", str(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY)))
+
+	def test_separate_application_registration_is_used_when_set(self):
+		graph.clear_app_token_cache()
+		self.addCleanup(graph.clear_app_token_cache)
+		settings = frappe._dict(
+			enabled=1, tenant_id="contoso.onmicrosoft.com", client_id="MAIN", app_client_id="APPREG"
+		)
+		_tokens, _app, cca = self._app_token(settings)
+		self.assertEqual(cca.call_args.args[0], "APPREG")
+		self.assertEqual(cca.call_args.kwargs["client_credential"], "app-secret")
+
+	def test_main_registration_is_used_when_no_separate_one(self):
+		graph.clear_app_token_cache()
+		self.addCleanup(graph.clear_app_token_cache)
+		settings = frappe._dict(enabled=1, tenant_id="contoso.onmicrosoft.com", client_id="MAIN")
+		_tokens, _app, cca = self._app_token(settings)
+		self.assertEqual(cca.call_args.args[0], "MAIN")
+		self.assertEqual(cca.call_args.kwargs["client_credential"], "main-secret")
+
+	def test_a_cached_token_from_another_registration_is_not_served(self):
+		graph.clear_app_token_cache()
+		self.addCleanup(graph.clear_app_token_cache)
+		tenant = "contoso.onmicrosoft.com"
+		self._app_token(frappe._dict(enabled=1, tenant_id=tenant, client_id="OLD"), minted=("OLD-TOKEN",))
+		tokens, _app, _cca = self._app_token(
+			frappe._dict(enabled=1, tenant_id=tenant, client_id="NEW"), minted=("NEW-TOKEN",)
+		)
+		self.assertEqual(tokens, ["NEW-TOKEN"])
+
+	def test_app_calls_need_a_specific_tenant(self):
+		for tenant in ("", "common", "organizations"):
+			with patch.object(
+				graph, "get_settings", return_value=frappe._dict(enabled=1, tenant_id=tenant, client_id="X")
+			):
+				with self.assertRaises(MsGraphError):
+					graph.app_credentials()
+
+	def test_saving_microsoft_settings_forgets_the_app_token(self):
+		frappe.cache().set_value(graph.APP_TOKEN_CACHE_KEY, {"owner": "x", "token": "y"})
+		configure(self)
+		self.assertIsNone(frappe.cache().get_value(graph.APP_TOKEN_CACHE_KEY))
 
 	def test_large_uploads_send_ranges_without_a_bearer_token(self):
 		size = files.SIMPLE_UPLOAD_MAX_BYTES + 1
@@ -927,7 +993,10 @@ class TestFolderPermissions(FilesTestCase):
 		user.save(ignore_permissions=True)
 		frappe.set_user(self.STAFF)
 		self.addCleanup(frappe.set_user, "Administrator")
-		self.mine = frappe.get_doc({"doctype": "ToDo", "description": "staff's own"}).insert()
+		# Assigned to them: newer Frappe lets only the assignee (or a ToDo role) read a ToDo.
+		self.mine = frappe.get_doc(
+			{"doctype": "ToDo", "description": "staff's own", "allocated_to": self.STAFF}
+		).insert()
 		frappe.set_user("Administrator")
 
 	def test_system_managers_can_create_folders(self):
@@ -1035,3 +1104,59 @@ class TestDoctorFiles(BaseTestCase):
 		steps = [s["id"] for s in doctor.manual_setup_steps({"use_files": 1})]
 		self.assertIn("files_site_grant", steps)
 		self.assertIn("admin_consent", steps)
+
+
+class TestOffMeansOff(BaseTestCase):
+	"""A site that never switched storage on gets no File fields and no behaviour change."""
+
+	def test_old_file_links_are_left_alone_without_the_fields(self):
+		request = SimpleNamespace(method="GET", path="/private/files/nowhere-to-be-found.pdf")
+		with (
+			patch.object(frappe.local, "request", request, create=True),
+			patch.object(files, "has_file_fields", return_value=False),
+			patch.object(frappe.db, "get_value") as lookup,
+		):
+			files.redirect_moved_file()
+		lookup.assert_not_called()
+
+	def test_summary_is_empty_without_the_fields(self):
+		with patch.object(files, "has_file_fields", return_value=False):
+			self.assertEqual(files.storage_summary(), {})
+
+	def test_hooks_do_nothing_when_off(self):
+		off = frappe._dict(enabled=1, use_files=0)
+		with patch.object(files, "_settings", return_value=off):
+			self.assertEqual(files.mapped_doctypes(), [])
+			self.assertFalse(files._eligible(frappe._dict(attached_to_doctype="ToDo", attached_to_name="x")))
+
+	def test_switching_storage_on_creates_the_fields(self):
+		with patch("frappe_microsoft365.setup.create_file_custom_fields") as create:
+			from frappe_microsoft365 import capabilities
+
+			capabilities.apply_changes({"use_files": 0}, {"use_files": 1})
+		create.assert_called_once()
+
+
+class TestInlineTypes(BaseTestCase):
+	def test_safe_types_open_inline(self):
+		for content_type in ("application/pdf", "image/png", "text/plain", "video/mp4"):
+			self.assertTrue(files.opens_inline(content_type), content_type)
+
+	def test_everything_else_downloads(self):
+		for content_type in (
+			None,
+			"application/octet-stream",
+			"text/html",
+			"image/svg+xml",
+			"application/xml",
+			"application/javascript",
+		):
+			self.assertFalse(files.opens_inline(content_type), content_type)
+
+	def test_extensionless_file_downloads_whatever_sharepoint_says(self):
+		resp = MagicMock(headers={"Content-Type": "text/html"})
+		resp.iter_content.return_value = iter([b"<script>alert(1)</script>"])
+		with patch.object(graph, "graph_request", return_value=resp):
+			response = files._stream("DRIVE", "ITEM", "report")
+		self.assertIn("attachment", response.headers["Content-Disposition"])
+		self.assertEqual(response.content_type, "application/octet-stream")

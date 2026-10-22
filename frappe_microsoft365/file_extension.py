@@ -11,6 +11,11 @@ usual but server-side readers see no content; docs/sharepoint-files.md says so.
 
 from frappe_microsoft365 import microsoft_files
 
+#: Old binary Office files (.doc, .xls) start with this. Some of their bytes decode as text in
+#: the fallback encodings, so they are kept as bytes, as newer Frappe releases do. Defined here
+#: rather than imported because not every v16 release has it.
+OLE_FILE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
 
 class SharePointFile:
 	def _stored_in_sharepoint(self):
@@ -25,7 +30,7 @@ class SharePointFile:
 		if self.is_folder or self.get("content") or not self._stored_in_sharepoint():
 			return super().get_content(encodings=encodings)
 
-		from frappe.core.doctype.file.file import FILE_ENCODING_OPTIONS, OLE_FILE_SIGNATURE
+		from frappe.core.doctype.file.file import FILE_ENCODING_OPTIONS
 
 		content = microsoft_files.fetch_content(self.custom_microsoft_drive_id, self.custom_microsoft_item_id)
 		if not content.startswith(OLE_FILE_SIGNATURE):
