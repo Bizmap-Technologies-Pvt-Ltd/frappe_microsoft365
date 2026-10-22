@@ -109,6 +109,17 @@ Three causes account for most of the reports.
 - [`The scheduler is off` / `No background worker is running`](#background-jobs)
 - [`This app's scheduled jobs have stopped running`](#jobs-stale)
 
+**SharePoint document storage**
+
+- [`401` / `generalException` on `GET /sites/…`](#files-401) — no Microsoft Graph site permission in the token
+- [`The app signed in, but its token carries no SharePoint permission`](#files-no-roles)
+- [`403` / `accessDenied` on a site](#files-403) — the site was never granted to the app
+- [`Can read … but not write to it`](#files-read-only) — granted `read` instead of `write`
+- [`404` / `itemNotFound` on a site or library](#files-404)
+- [Granting a site: Graph Explorer does not offer `Sites.FullControl.All`, or answers `Empty Payload`](#files-graph-explorer)
+- [A private or shared channel's files are not reachable](#files-private-channel)
+- [Attachments stay `Pending`](#files-pending)
+
 [When nothing here matches](#nothing-matches)
 
 ---
@@ -190,7 +201,9 @@ The secret Frappe sent is not the app's secret. Microsoft's description says no 
    operational experience rather than a citable rule. It is also the one cause that is detectable
    from the outside: a Secret ID is a GUID and a secret value never is, which is why **Microsoft
    Settings refuses a secret that looks like a GUID on save**.
-2. The secret was truncated, or carries whitespace from the copy.
+2. The secret was truncated, or carries whitespace from the copy. Once you leave *Certificates &
+   secrets*, the Value column shows only the first few characters followed by asterisks, and
+   copying from it copies that masked text. Create a new secret and copy it before leaving the page.
 3. The secret belongs to a different app registration than the Client ID.
 
 **Fix.** Entra admin center → **App registrations** → your app → **Certificates & secrets** →
@@ -1136,11 +1149,135 @@ yesterday is not running, whatever the scheduler setting, Redis and the worker c
 
 ---
 
+## SharePoint document storage
+
+Document storage signs in as the application (client credentials), so none of the per-user
+authorisation above applies. Run **Test** on the SharePoint Mapping (or **Troubleshoot → Test SharePoint
+Connection** for every mapping) first: it signs in, reads which application permissions
+Microsoft put in the token, and then
+resolves, reads and writes each mapped site in turn, stopping at the first step that fails.
+
+<a id="files-401"></a>
+
+### `401` / `generalException` on `GET /sites/…`
+
+```
+Microsoft Graph GET /sites/contoso.sharepoint.com:/sites/Example failed (401): generalException: General exception while processing
+```
+
+SharePoint received a valid token that carries **no site permission at all**. It answers that
+with a bare 401 rather than a 403, which makes it look like an authentication fault or an outage.
+The secret, tenant and client id are all fine, otherwise sign-in would have failed earlier with an
+`AADSTS` code.
+
+**The commonest cause is `Sites.Selected` added under the wrong API.** In *API permissions →
+Add a permission*, both **Microsoft Graph** and **SharePoint** offer an application permission
+called `Sites.Selected`, with the same description. Only the Microsoft Graph one is valid for
+Graph calls. A registration showing `SharePoint → Sites.Selected → Application → Granted` looks
+correct and gives exactly this error.
+
+**Fix.** *API permissions → Add a permission → Microsoft Graph → Application permissions →
+`Sites.Selected` → Add*, then **Grant admin consent**. Remove the SharePoint one if nothing else
+uses it. The per-site grant does not need redoing: it is attached to the app, not to the permission.
+
+<a id="files-no-roles"></a>
+
+### `The app signed in, but its token carries no SharePoint permission`
+
+This is the connection test's reading of the 401 above, from the token itself.
+*Application permissions in the token: none* means Microsoft issued the token without any
+application permission. It is one of the following:
+
+1. `Sites.Selected` is missing under Microsoft Graph, or was added as **Delegated**, or is listed
+   only under the SharePoint API. See [above](#files-401).
+2. Admin consent was granted moments ago. New tokens can take several minutes to include it.
+   The test always fetches a new token, so wait and run it again.
+3. Microsoft Settings points at a different app registration or tenant than the one being edited.
+   Compare **Application (client) ID** and **Directory (tenant) ID** on the registration's
+   *Overview* page with the values in Microsoft Settings.
+
+<a id="files-403"></a>
+
+### `403` / `accessDenied` on a site
+
+The token carries `Sites.Selected`, but this site was never granted to the app. `Sites.Selected`
+by itself reaches no site. A site or global administrator grants each one: the **Site Grant
+Script** section of SharePoint Settings generates the commands for every mapped site (or **Site Grant Script**
+on one mapping, for its site), or see
+[Granting a site](#files-graph-explorer) for doing it from Graph Explorer.
+
+<a id="files-read-only"></a>
+
+### `Can read … but not write to it`
+
+The grant gave the role `read`. Grant `write` instead: create the permission again with
+`"roles": ["write"]`, or update the existing one (`PATCH /sites/{site-id}/permissions/{id}`).
+
+<a id="files-404"></a>
+
+### `404` / `itemNotFound` on a site or library
+
+The site URL or the library name does not match. Copy the site URL from the channel or library
+itself (*Files → Open in SharePoint*). Anything after `/sites/<name>` is ignored, so pasting the
+whole address bar is fine. The library behind a Teams channel is called **Documents**. A private
+channel has its own site; see [below](#files-private-channel).
+
+<a id="files-graph-explorer"></a>
+
+### Granting a site: Graph Explorer does not offer `Sites.FullControl.All`, or answers `Empty Payload`
+
+Creating a site grant needs `Sites.FullControl.All` on **your own** admin session. It is never
+needed on the app being granted.
+
+- **Not listed.** The *Modify permissions* tab only lists permissions for the request currently
+  in the URL box. Put `POST https://graph.microsoft.com/v1.0/sites/{site-id}/permissions` there
+  first, or use the profile menu → *Consent to permissions* and search `Sites.FullControl`. The
+  button is disabled for an account that cannot grant admin consent.
+- **Consented, but the request still fails.** After consenting, the row shows *Unconsent* and a
+  **Reload** button. Graph Explorer keeps using the earlier token until you reload or sign in
+  again. The *Access token* tab shows which scopes the current token carries.
+- **`BadRequest: Empty Payload. JSON content expected.`** The POST was sent without a body. Paste
+  the JSON into the **Request body** tab under the URL bar, not into the URL:
+
+  ```json
+  {
+    "roles": ["write"],
+    "grantedToIdentities": [
+      { "application": { "id": "<Application (client) ID>", "displayName": "Frappe" } }
+    ]
+  }
+  ```
+
+  `201 Created` means the grant exists. `GET /sites/{site-id}/permissions` lists it.
+
+When the grant is done, the admin consent given to Graph Explorer for `Sites.FullControl.All`
+can be removed under *Enterprise applications → Graph Explorer → Permissions*.
+
+<a id="files-private-channel"></a>
+
+### A private or shared channel's files are not reachable
+
+Private and shared channels do not keep files in the team's site. Each gets a site of its own,
+usually `/sites/<Team>-<Channel>`, which only exists once someone has opened the channel's *Files*
+tab. Map that site, with library **Documents** and the channel name as the base folder, and grant
+the app **that** site. A grant on the parent team's site does not reach it.
+
+<a id="files-pending"></a>
+
+### Attachments stay `Pending`
+
+The move runs on the `long` queue. If nothing changes within a minute or two, no worker is
+consuming that queue. Run **Run Diagnostics** to check the background worker, or look at
+`logs/worker.error.log` on the bench. Files that fail are marked `Failed` with the reason in
+*Last SharePoint Error*, and are retried hourly up to five times.
+
+---
+
 <a id="nothing-matches"></a>
 
 ## When nothing here matches
 
-Twenty-five patterns is not omniscience, and pretending otherwise costs trust. **Explain an Error**
+A list of known patterns is not omniscience, and pretending otherwise costs trust. **Explain an Error**
 answers *Unrecognised error* rather than guessing, and so does this page.
 
 What is worth doing next:

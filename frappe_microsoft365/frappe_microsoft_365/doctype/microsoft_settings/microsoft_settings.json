@@ -14,7 +14,8 @@
   "use_mail",
   "mail_flow",
   "use_sso",
-  "capabilities_help",
+  "use_files",
+  "files_summary",
   "app_section",
   "tenant_id",
   "client_id",
@@ -43,7 +44,7 @@
    "fieldname": "capabilities_section",
    "fieldtype": "Section Break",
    "label": "Capabilities",
-   "description": "Pick what you want. The Azure permissions follow from what you tick."
+   "description": "Pick what you want. The Azure permissions follow from what you tick.<br>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified."
   },
   {
    "fieldname": "use_calendar",
@@ -95,10 +96,17 @@
    "description": "Adds a Microsoft button to the login page."
   },
   {
-   "fieldname": "capabilities_help",
+   "fieldname": "use_files",
+   "fieldtype": "Check",
+   "label": "SharePoint document storage",
+   "default": "0",
+   "description": "Store attachments of chosen DocTypes in SharePoint / Teams instead of on this server. Uses an application permission (Sites.Selected), not anyone's sign-in."
+  },
+  {
+   "fieldname": "files_summary",
    "fieldtype": "HTML",
-   "label": "Capabilities Help",
-   "options": "<div class='text-muted' style='font-size:12px'>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified.</div>"
+   "label": "SharePoint Attachments Summary",
+   "depends_on": "use_files"
   },
   {
    "fieldname": "app_section",
@@ -164,7 +172,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-09-13 00:00:00",
+ "modified": "2026-10-09 00:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Settings",
  "owner": "Administrator",

@@ -1,0 +1,113 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-10-07 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "reference_doctype",
+  "reference_name",
+  "existing_folder",
+  "folder_name",
+  "column_break_ref",
+  "web_url",
+  "microsoft_section",
+  "drive_id",
+  "item_id",
+  "column_break_ms",
+  "folder_path"
+ ],
+ "fields": [
+  {
+   "description": "Always the mapping's DocType.",
+   "fieldname": "reference_doctype",
+   "fieldtype": "Link",
+   "in_list_view": 0,
+   "label": "DocType",
+   "options": "DocType",
+   "reqd": 0,
+   "search_index": 1,
+   "hidden": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "reference_name",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "label": "Record",
+   "options": "reference_doctype",
+   "reqd": 1,
+   "search_index": 1,
+   "read_only_depends_on": "eval:doc.item_id",
+   "columns": 3
+  },
+  {
+   "depends_on": "eval:!doc.item_id",
+   "description": "Optional, for a new row. Leave empty to create the folder where the mapping says, or paste a SharePoint folder address (from the browser or Copy link) or a path in the library, e.g. Projects/PROJ-0001.",
+   "fieldname": "existing_folder",
+   "fieldtype": "Data",
+   "label": "Existing Folder"
+  },
+  {
+   "fieldname": "folder_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Folder Name",
+   "read_only": 1,
+   "columns": 3
+  },
+  {
+   "fieldname": "column_break_ref",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "web_url",
+   "fieldtype": "Data",
+   "label": "SharePoint Link",
+   "options": "URL",
+   "read_only": 1,
+   "in_list_view": 1,
+   "columns": 4
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "microsoft_section",
+   "fieldtype": "Section Break",
+   "label": "Microsoft"
+  },
+  {
+   "fieldname": "drive_id",
+   "fieldtype": "Data",
+   "label": "Drive ID",
+   "read_only": 1
+  },
+  {
+   "description": "Stable across renames and moves inside the library, so the link survives someone tidying folders in Teams.",
+   "fieldname": "item_id",
+   "fieldtype": "Data",
+   "label": "Item ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_ms",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "folder_path",
+   "fieldtype": "Small Text",
+   "label": "Path When Created",
+   "read_only": 1
+  }
+ ],
+ "links": [],
+ "modified": "2026-10-09 04:00:00",
+ "module": "Frappe Microsoft 365",
+ "name": "SharePoint Folder",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "istable": 1,
+ "editable_grid": 0
+}

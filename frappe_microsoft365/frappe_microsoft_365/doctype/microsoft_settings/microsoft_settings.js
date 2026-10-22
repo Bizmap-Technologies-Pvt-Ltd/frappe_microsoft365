@@ -6,7 +6,7 @@
 // The scope tickboxes. Anything ticked here changes what sign-in asks Microsoft for, so the
 // derived list is re-rendered whenever one of them moves.
 const SCOPE_FIELDS = ["use_calendar", "use_teams", "use_transcripts"];
-const CAPABILITY_FIELDS = [...SCOPE_FIELDS, "use_mail", "use_sso"];
+const CAPABILITY_FIELDS = [...SCOPE_FIELDS, "use_mail", "use_sso", "use_files"];
 
 const scope_handlers = {};
 [...SCOPE_FIELDS, "default_scopes"].forEach((field) => {
@@ -21,6 +21,16 @@ frappe.ui.form.on("Microsoft Settings", {
 		frm.add_custom_button(__("Run Diagnostics"), () => run_diagnostics(), __("Troubleshoot"));
 		frm.add_custom_button(__("Explain an Error"), () => explain_error(), __("Troubleshoot"));
 		frm.add_custom_button(__("Exchange Setup Script"), () => powershell(), __("Troubleshoot"));
+
+		if (frm.doc.use_files) {
+			frm.add_custom_button(
+				__("Test SharePoint Connection"),
+				() => frappe_microsoft365.files.test_connection(frm),
+				__("Troubleshoot")
+			);
+			const field = frm.fields_dict.files_summary;
+			field && frappe_microsoft365.files.render_summary(field.$wrapper, { link: true });
+		}
 
 		render_scopes(frm);
 
@@ -87,15 +97,17 @@ function setup_guide() {
 				return rows.join("");
 			});
 
-			new frappe.ui.Dialog({
+			// primary_action receives the dialog's values, not the dialog: close over it instead.
+			const dialog = new frappe.ui.Dialog({
 				title: __("Setup Guide"),
 				size: "large",
 				fields: [{ fieldtype: "HTML", options: head.join("") + steps.join("") }],
 				primary_action_label: __("Close"),
-				primary_action(dialog) {
+				primary_action() {
 					dialog.hide();
 				},
-			}).show();
+			});
+			dialog.show();
 		},
 	});
 }

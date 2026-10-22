@@ -44,7 +44,9 @@ frappe_microsoft365.show_findings = function (title, result) {
 		counts.skip || 0,
 	]);
 
-	new frappe.ui.Dialog({
+	// Frappe calls primary_action with the dialog's *values*, not the dialog, so the handler
+	// has to close over the instance; `primary_action(d) { d.hide() }` silently did nothing.
+	const dialog = new frappe.ui.Dialog({
 		title: title,
 		size: "large",
 		fields: [
@@ -55,8 +57,9 @@ frappe_microsoft365.show_findings = function (title, result) {
 			},
 		],
 		primary_action_label: __("Close"),
-		primary_action(d) {
-			d.hide();
+		primary_action() {
+			dialog.hide();
 		},
-	}).show();
+	});
+	dialog.show();
 };

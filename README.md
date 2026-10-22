@@ -1,7 +1,7 @@
 <div align="center">
 	<img src=".github/logo.png" height="110" alt="Frappe Microsoft 365">
 	<h1>Frappe Microsoft 365</h1>
-	<p><b>Outlook calendar sync, Teams meetings and Microsoft sign-in for Frappe and ERPNext</b></p>
+	<p><b>Outlook calendar sync, Teams meetings, SharePoint document storage and Microsoft sign-in for Frappe and ERPNext</b></p>
 
 ![Frappe](https://img.shields.io/badge/Frappe-v15%20%7C%20v16-2b3a8c)
 ![License](https://img.shields.io/badge/license-MIT-2b3a8c)
@@ -9,6 +9,8 @@
 
 [Setup](docs/setup.md) ·
 [How it behaves](docs/how-it-works.md) ·
+[SharePoint storage](docs/sharepoint-files.md) ·
+[SharePoint user guide](docs/sharepoint-user-guide.md) ·
 [Troubleshooting](docs/troubleshooting.md) ·
 [FAQ](docs/faq.md)
 
@@ -53,6 +55,12 @@ Microsoft Graph.
   file store.
 - **Sign in with Microsoft**, and **Outlook mail over OAuth** — it provisions the `Connected App`
   that Frappe's own `Email Account` needs, then stays out of the way.
+- **Attachments in SharePoint / Teams.** Map a DocType to a site and a channel folder and each
+  record gets its own folder: attachments move there and stop using your server's disk, and
+  files dropped into the folder from Teams show on the record. Signs in as the app with
+  `Sites.Selected`, so it reaches only the sites an admin grants. See
+  [SharePoint document storage](docs/sharepoint-files.md), with a
+  [user guide](docs/sharepoint-user-guide.md) for the people who use and set it up.
 - **A doctor for when it breaks.** Setup spans two Microsoft portals and almost every mistake
   surfaces as the same unhelpful string. **Run Diagnostics** names the failing step;
   **Explain an Error** decodes a message from the Error Log into a cause and a fix.

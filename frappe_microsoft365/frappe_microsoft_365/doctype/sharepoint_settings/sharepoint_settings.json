@@ -1,0 +1,104 @@
+{
+ "actions": [],
+ "creation": "2026-10-09 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "issingle": 1,
+ "field_order": [
+  "status_html",
+  "how_it_works",
+  "options_section",
+  "files_keep_local_copy",
+  "files_archive_links",
+  "options_column",
+  "files_delete_remote",
+  "uninstall_section",
+  "files_on_uninstall",
+  "grant_section",
+  "grant_script_html"
+ ],
+ "fields": [
+  {
+   "fieldname": "status_html",
+   "fieldtype": "HTML",
+   "label": "Status"
+  },
+  {
+   "fieldname": "how_it_works",
+   "fieldtype": "HTML",
+   "label": "How It Works",
+   "options": "<div class='text-muted' style='font-size:13px;line-height:1.6'>Which DocTypes are stored where is set in <a href='/app/sharepoint-mapping'><b>SharePoint Mapping</b></a>, one record per DocType, each with its own <b>Test</b> button. Each record of a mapped DocType gets its own folder, created on first use. New attachments are moved there in the background and open through Frappe for anyone allowed to read the record; files people add to the folder in Teams or SharePoint show in the record's <b>Files in Microsoft 365</b> panel. The Azure app needs the <b>Sites.Selected</b> application permission under Microsoft Graph, with admin consent, plus write access granted on each site.</div>"
+  },
+  {
+   "fieldname": "options_section",
+   "fieldtype": "Section Break",
+   "label": "Options"
+  },
+  {
+   "fieldname": "files_keep_local_copy",
+   "fieldtype": "Check",
+   "label": "Keep a local copy after upload",
+   "default": "0",
+   "description": "<b>Off:</b> the copy on this server is deleted once the file is in SharePoint, freeing disk space.<br><b>On:</b> both copies are kept, e.g. while trialling. If the SharePoint copy disappears, the local one is served.<br>The default for every DocType; a SharePoint Mapping can set its own under Options."
+  },
+  {
+   "fieldname": "files_archive_links",
+   "fieldtype": "Check",
+   "label": "Also copy linked files into SharePoint",
+   "default": "0",
+   "description": "<b>Off:</b> attachments that are only a web link stay links.<br><b>On:</b> the linked file is downloaded once and archived in the record's folder. The link itself is kept."
+  },
+  {
+   "fieldname": "options_column",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "files_delete_remote",
+   "fieldtype": "Check",
+   "label": "Remove from SharePoint when the attachment is deleted",
+   "default": "0",
+   "description": "<b>Off:</b> deleting an attachment here leaves the SharePoint copy alone.<br><b>On:</b> the SharePoint copy goes to the site's recycle bin, where it can be restored.<br>The default for every DocType; a SharePoint Mapping can set its own under Options."
+  },
+  {
+   "fieldname": "uninstall_section",
+   "fieldtype": "Section Break",
+   "label": "Uninstalling"
+  },
+  {
+   "fieldname": "files_on_uninstall",
+   "fieldtype": "Select",
+   "label": "If this app is uninstalled",
+   "options": "\nBring files back to this server\nLeave files in SharePoint",
+   "description": "What happens to attachments stored in SharePoint when the app is removed.<br><b>Bring files back to this server:</b> each file is downloaded back and its attachment works as before. Checks there is enough free disk space first, and stops if there is not.<br><b>Leave files in SharePoint:</b> nothing is downloaded; each attachment becomes a link to the file in SharePoint, which opens for people with access to the site.<br><b>Blank:</b> the uninstall stops and asks."
+  },
+  {
+   "fieldname": "grant_section",
+   "fieldtype": "Section Break",
+   "label": "Site Grant Script",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "grant_script_html",
+   "fieldtype": "HTML",
+   "label": "Site Grant Script"
+  }
+ ],
+ "links": [],
+ "modified": "2026-10-09 05:00:00",
+ "modified_by": "Administrator",
+ "module": "Frappe Microsoft 365",
+ "name": "SharePoint Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "read": 1,
+   "write": 1,
+   "role": "System Manager"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

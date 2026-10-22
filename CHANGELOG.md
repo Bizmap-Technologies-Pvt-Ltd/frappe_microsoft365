@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — SharePoint document storage
+
+### Added
+
+- **Document Storage**: a *SharePoint Mapping* per DocType points it at a SharePoint site,
+  library and base folder (a Teams channel's Files tab is just that), with its own Test, Site
+  Grant Script and Move Existing Attachments; the global switch and options live in Microsoft
+  Settings.
+- **Automatic or On demand** per mapping: on demand, a record's files move only once someone
+  creates its folder (from the record, or a row in the mapping's Folders table); a row can
+  also link a folder that already exists in SharePoint. Each record gets its own folder; new
+  attachments are moved there by a background job and keep opening from the form, and the copy
+  on disk is removed unless *Keep a local copy* is ticked. Large files go through resumable
+  upload sessions. Failed moves are marked on the File and retried hourly.
+- **Files in Microsoft 365** panel on mapped forms: the folder's contents, including files added
+  from Teams or SharePoint, opened through Frappe with the record's own read permission.
+- **App-only Graph calls**: `graph_request(..., microsoft_graph.APP_ONLY)` uses the client
+  credentials flow, with the token cached encrypted per site. Document storage needs the
+  `Sites.Selected` application permission and a per-site grant — never tenant-wide
+  `Sites.ReadWrite.All`.
+- **SharePoint Settings**: its own page in the sidebar for the storage options, attachment counts,
+  tools and the site grant script; Microsoft Settings keeps only the capability tickbox.
+- The app's sidebar is shipped in both v16 formats: `<module>/sidebar/` (Frappe 16.4x and later)
+  and `workspace_sidebar/` (earlier v16 releases), so every page is listed on either.
+- Record folders are the *Folders* table of their SharePoint Mapping (Add Row to create or link
+  one, Delete to forget one); the sidebar's
+  SharePoint section lists only the mappings.
+- Per-mapping *Options*: a SharePoint Mapping can set *Keep a local copy* and *Remove from
+  SharePoint when the attachment is deleted* to On or Off for its DocType, or follow SharePoint
+  Settings (Default).
+- [User guide](docs/sharepoint-user-guide.md) for SharePoint document storage: everyday use, setup on
+  both the Microsoft and Frappe sides, administration and troubleshooting.
+- Doctor: Document Storage checks, a *Test SharePoint Connection* that proves write access per
+  mapping, and a *SharePoint Site Grant Script* that grants the app only the mapped sites.
+- *Move Existing Attachments* queues files attached before a DocType was mapped. Optional
+  archiving of linked attachments, SSRF-guarded to public addresses.
+
+- **Clean uninstall**: attachments in SharePoint are brought back to the server (only if the disk
+  has room) or turned into SharePoint links, as chosen in Microsoft Settings; the uninstall stops
+  rather than guess or leave one broken. Then every custom field the app added to Event and File
+  is deleted and its column dropped. A dry run only reports.
+
+Nothing is deleted from SharePoint unless *Remove from SharePoint when the attachment is
+deleted* is ticked, and then only to the site recycle bin. Deleting a record keeps its folder.
+
 ## Unreleased — modular setup
 
 ### Added
