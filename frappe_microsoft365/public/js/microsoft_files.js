@@ -22,11 +22,19 @@ frappe.provide("frappe_microsoft365.files");
 		return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 	}
 
+	// Graph times are UTC ("...Z"); Frappe's date helpers expect the site's own time zone.
+	function system_time(iso) {
+		const system = frappe.boot.time_zone && frappe.boot.time_zone.system;
+		return (system ? moment.utc(iso).tz(system) : moment(iso)).format("YYYY-MM-DD HH:mm:ss");
+	}
+
+	// HTML. prettyDate, not comment_when: comment_when returns markup, which esc() printed as text.
 	function when(iso) {
 		if (!iso) return "";
-		return frappe.datetime.comment_when
-			? frappe.datetime.comment_when(iso.replace("T", " ").replace("Z", ""), true)
-			: iso.slice(0, 10);
+		const value = system_time(iso);
+		const text = prettyDate(value, true) || value.slice(0, 10);
+		const full = frappe.datetime.str_to_user(frappe.datetime.convert_to_user_tz(value));
+		return `<span title="${esc(full)}">${esc(text)}</span>`;
 	}
 
 	function open_url(frm, item_id, download) {
@@ -185,7 +193,7 @@ frappe.provide("frappe_microsoft365.files");
 					<td style="width:24px">${icon}</td>
 					<td>${link}${tag}</td>
 					<td class="text-muted small text-nowrap">${esc(item.modified_by || "")}</td>
-					<td class="text-muted small text-nowrap">${esc(when(item.modified))}</td>
+					<td class="text-muted small text-nowrap">${when(item.modified)}</td>
 					<td class="text-muted small text-right text-nowrap">${extra}</td>
 					<td style="width:24px" class="text-right">${download}</td>
 				</tr>`;
