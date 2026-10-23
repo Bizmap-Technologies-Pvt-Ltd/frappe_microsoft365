@@ -93,7 +93,7 @@ scheduler_events = {
 # load the new version after a deploy instead of a copy cached for a year.
 app_include_js = [
 	"microsoft_doctor.bundle.js",
-	"/assets/frappe_microsoft365/js/microsoft_files.js",
+	"microsoft_files.bundle.js",
 ]
 
 # include js, css files in header of web template

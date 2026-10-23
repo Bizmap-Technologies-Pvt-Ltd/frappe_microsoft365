@@ -123,6 +123,7 @@ jobs:
           bench build --app frappe_microsoft365
           # Every desk script must come out as a hashed bundle, or deploys never reach browsers.
           grep -q '"microsoft_doctor.bundle.js": "/assets/frappe_microsoft365/dist/js/microsoft_doctor.bundle\.[A-Z0-9]*\.js"' sites/assets/assets.json
+          grep -q '"microsoft_files.bundle.js": "/assets/frappe_microsoft365/dist/js/microsoft_files.bundle\.[A-Z0-9]*\.js"' sites/assets/assets.json
 
       - name: Run tests
         working-directory: /home/runner/frappe-bench
