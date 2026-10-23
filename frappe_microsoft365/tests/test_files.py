@@ -568,6 +568,17 @@ class TestUpload(FilesTestCase):
 		self.assertEqual(row.custom_microsoft_attempts, 1)
 		self.assertTrue(os.path.exists(f.get_full_path()))
 
+	def test_a_long_file_name_is_recorded(self):
+		# SharePoint's web URL percent-encodes every space: a 100-character name is well past 140.
+		name = "Quotation for cold storage panels, Pune warehouse, revision 3, signed and returned.csv"
+		f = self.attach(name=name)
+		files.upload_file(f.name)
+		row = frappe.db.get_value(
+			"File", f.name, ["custom_microsoft_status", "custom_microsoft_web_url"], as_dict=True
+		)
+		self.assertEqual(row.custom_microsoft_status, files.STORED)
+		self.assertGreater(len(row.custom_microsoft_web_url), 140)
+
 	def test_rerunning_a_stored_file_does_nothing(self):
 		f = self.attach()
 		files.upload_file(f.name)
@@ -702,6 +713,25 @@ class TestSettings(BaseTestCase):
 		boot = frappe._dict()
 		files.boot_session(boot)
 		self.assertEqual(boot.microsoft365_files_doctypes, [MAPPED])
+
+	def test_addresses_names_and_ids_are_not_cut_at_140(self):
+		# Frappe's Data default is varchar(140). SharePoint addresses, paths and names pass it
+		# routinely, and the failed write came after the work was done in SharePoint.
+		from frappe_microsoft365.setup import create_file_custom_fields
+
+		fields = [
+			(f["fieldname"], f.get("length"))
+			for f in create_file_custom_fields(only_definitions=True)["File"]
+			if f["fieldtype"] == "Data"
+		]
+		for doctype in ("SharePoint Mapping", "SharePoint Folder"):
+			fields += [
+				(f"{doctype}.{df.fieldname}", df.length)
+				for df in frappe.get_meta(doctype).fields
+				if df.fieldtype == "Data"
+			]
+		for fieldname, length in fields:
+			self.assertGreaterEqual(length or 140, 255, fieldname)
 
 
 class TestUninstall(FilesTestCase):

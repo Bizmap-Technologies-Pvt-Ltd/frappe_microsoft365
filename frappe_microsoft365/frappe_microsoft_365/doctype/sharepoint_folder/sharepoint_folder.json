@@ -46,7 +46,8 @@
    "description": "Optional, for a new row. Leave empty to create the folder where the mapping says, or paste a SharePoint folder address (from the browser or Copy link) or a path in the library, e.g. Projects/PROJ-0001.",
    "fieldname": "existing_folder",
    "fieldtype": "Data",
-   "label": "Existing Folder"
+   "label": "Existing Folder",
+   "length": 1000
   },
   {
    "fieldname": "folder_name",
@@ -54,7 +55,8 @@
    "in_list_view": 1,
    "label": "Folder Name",
    "read_only": 1,
-   "columns": 3
+   "columns": 3,
+   "length": 1000
   },
   {
    "fieldname": "column_break_ref",
@@ -67,7 +69,8 @@
    "options": "URL",
    "read_only": 1,
    "in_list_view": 1,
-   "columns": 4
+   "columns": 4,
+   "length": 1000
   },
   {
    "collapsible": 1,
@@ -79,14 +82,16 @@
    "fieldname": "drive_id",
    "fieldtype": "Data",
    "label": "Drive ID",
-   "read_only": 1
+   "read_only": 1,
+   "length": 255
   },
   {
    "description": "Stable across renames and moves inside the library, so the link survives someone tidying folders in Teams.",
    "fieldname": "item_id",
    "fieldtype": "Data",
    "label": "Item ID",
-   "read_only": 1
+   "read_only": 1,
+   "length": 255
   },
   {
    "fieldname": "column_break_ms",
@@ -100,7 +105,7 @@
   }
  ],
  "links": [],
- "modified": "2026-10-09 04:00:00",
+ "modified": "2026-10-23 12:00:00",
  "module": "Frappe Microsoft 365",
  "name": "SharePoint Folder",
  "owner": "Administrator",

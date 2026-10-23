@@ -82,14 +82,16 @@
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "SharePoint Site URL",
-   "reqd": 1
+   "reqd": 1,
+   "length": 1000
   },
   {
    "default": "Documents",
    "description": "The library's display name. Teams channel files live in Documents (shown in SharePoint as Shared Documents).",
    "fieldname": "library",
    "fieldtype": "Data",
-   "label": "Document Library"
+   "label": "Document Library",
+   "length": 1000
   },
   {
    "fieldname": "column_break_where",
@@ -109,14 +111,16 @@
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Base Folder",
-   "mandatory_depends_on": "eval:doc.use_base_folder"
+   "mandatory_depends_on": "eval:doc.use_base_folder",
+   "length": 1000
   },
   {
    "default": "{name}",
    "description": "One folder per record, named from its fields: {name}, {title}, or any {fieldname}, e.g. {name} - {customer}. Characters SharePoint does not allow are replaced.",
    "fieldname": "folder_pattern",
    "fieldtype": "Data",
-   "label": "Folder Name Pattern"
+   "label": "Folder Name Pattern",
+   "length": 1000
   },
   {
    "fieldname": "options_section",
@@ -169,7 +173,8 @@
    "fieldname": "site_id",
    "fieldtype": "Data",
    "label": "Site ID",
-   "read_only": 1
+   "read_only": 1,
+   "length": 255
   },
   {
    "fieldname": "column_break_resolved",
@@ -179,7 +184,8 @@
    "fieldname": "drive_id",
    "fieldtype": "Data",
    "label": "Drive ID",
-   "read_only": 1
+   "read_only": 1,
+   "length": 255
   },
   {
    "description": "Who may click <b>Create folder</b> on a record that has no folder yet. They must also be able to edit the record.<br><b>Empty:</b> System Managers only.<br><b>Roles listed:</b> System Managers, plus users with any of these roles.",
@@ -190,7 +196,7 @@
   }
  ],
  "links": [],
- "modified": "2026-10-09 05:00:00",
+ "modified": "2026-10-23 12:00:00",
  "module": "Frappe Microsoft 365",
  "name": "SharePoint Mapping",
  "naming_rule": "By fieldname",

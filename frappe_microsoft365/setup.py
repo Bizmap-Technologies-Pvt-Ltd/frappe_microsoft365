@@ -315,6 +315,12 @@ def create_file_custom_fields(only_definitions=False):
 				"options": "URL",
 				"insert_after": "custom_microsoft_status",
 				"read_only": 1,
+				# A SharePoint web URL carries the site, library, folders and file name, percent-
+				# encoded, and passes Frappe's 140-char default for any long file or customer
+				# name. At 140 the write failed AFTER the upload, the job died before recording
+				# the attempt, and the hourly retry uploaded the file again, every hour, as
+				# "name (1).pdf", "name (2).pdf", ... Nothing queries it: width, no index.
+				"length": 1000,
 			},
 			{
 				"fieldname": "custom_microsoft_error",
@@ -335,6 +341,9 @@ def create_file_custom_fields(only_definitions=False):
 				"label": "Drive ID",
 				"insert_after": "custom_microsoft_column",
 				"read_only": 1,
+				# Graph ids have no documented maximum; drive ids run to ~66 characters and item
+				# ids to ~34. 255 leaves headroom without widening every File row for nothing.
+				"length": 255,
 			},
 			{
 				"fieldname": "custom_microsoft_item_id",
@@ -343,6 +352,7 @@ def create_file_custom_fields(only_definitions=False):
 				"insert_after": "custom_microsoft_drive_id",
 				"read_only": 1,
 				"search_index": 1,
+				"length": 255,
 			},
 			{
 				"fieldname": "custom_microsoft_local_url",
@@ -351,6 +361,10 @@ def create_file_custom_fields(only_definitions=False):
 				"insert_after": "custom_microsoft_item_id",
 				"read_only": 1,
 				"search_index": 1,
+				# The local file URL before the move: as long as the file name. Indexed, because
+				# every old link is looked up by it, so 768, the widest utf8mb4 column InnoDB can
+				# still index.
+				"length": 768,
 				"description": "Where the file was on this server before it moved. Old links to it are redirected to SharePoint. With Keep a local copy on, the copy is still there and is served if the SharePoint copy disappears.",
 			},
 			{
