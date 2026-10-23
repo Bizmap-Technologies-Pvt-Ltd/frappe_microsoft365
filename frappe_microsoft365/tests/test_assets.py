@@ -36,6 +36,7 @@ class TestDeskScripts(BaseTestCase):
 			code = re.sub(r"//.*", "", source)
 			own = set(re.findall(r"\bfunction (\w+)\s*\(", code))
 			own |= set(re.findall(r"\b(?:const|let|var) (\w+)\s*=", code))
+			own |= set(re.findall(r"^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{", code, re.M))  # methods
 			for name in sorted(private - own):
 				self.assertIsNone(re.search(rf"(?<![\w.$]){name}\s*\(", code), f"{script}: {name}")
 
