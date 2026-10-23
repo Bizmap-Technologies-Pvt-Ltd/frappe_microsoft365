@@ -259,6 +259,24 @@ def boot_session(bootinfo):
 		bootinfo.microsoft365_files_panel = {}
 
 
+def refresh_desk_boot():
+	"""Make every desk pick up a change to which DocTypes have the panel, or where it goes.
+
+	Frappe keeps each user's boot in the cache until they reload or sign in again, so without
+	this a changed placement reaches nobody: "Own tab" adds the tab at once while the panel stays
+	at the top of the form. The next page load rebuilds the boot.
+	"""
+	frappe.cache().delete_value("bootinfo")
+
+
+@frappe.whitelist()
+def files_panel_boot():
+	"""The panel's boot values, for a desk that should not wait for a reload (see refresh_desk_boot)."""
+	bootinfo = frappe._dict()
+	boot_session(bootinfo)
+	return {key: bootinfo[key] for key in ("microsoft365_files_doctypes", "microsoft365_files_panel")}
+
+
 PANEL_TOP = "Top of form"
 PANEL_TAB = "Own tab"
 PANEL_HIDDEN = "Hidden"
