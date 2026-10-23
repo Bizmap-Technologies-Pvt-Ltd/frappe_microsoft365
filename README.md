@@ -102,6 +102,7 @@ issued.
 | [Troubleshooting](docs/troubleshooting.md) | Every Microsoft error this app can produce, with its real cause |
 | [FAQ](docs/faq.md) | What it does, what it costs, what it will not do |
 | [Azure reference](docs/azure-setup.md) · [Graph endpoints](docs/graph-api-reference.md) | The detail behind both |
+| [Changelog](CHANGELOG.md) · [Releases](https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365/releases) | What changed in each version, and what to run after updating |
 
 ## Contributing
 
@@ -114,6 +115,8 @@ bench --site <your-site> run-tests --app frappe_microsoft365
 If you find something wrong with the sync — a recurring series, a timezone, an event edited in
 two places at once — an issue describing both calendars' states is the most useful thing you can
 send.
+
+How a change becomes a release (versions, changelog, tags) is in [RELEASING.md](RELEASING.md).
 
 ## License
 
