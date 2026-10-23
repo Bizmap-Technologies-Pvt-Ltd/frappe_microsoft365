@@ -68,6 +68,16 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - The fork's intermediate-DocType migration patches are not carried over: the DocTypes are
   created in their final form, and a site upgrading from the fork already has them.
 
+## 1.0.2 — fix
+
+### Fixed
+
+- **New versions reach browsers after a deploy.** The desk script was loaded by a file name
+  that never changed, and browsers keep `/assets` files for up to a year, so after an update
+  people kept running the old script — even after migrate, clearing the cache and hard
+  refreshes. It is now built as a bundle with a new file name for every version. Run
+  `bench build --app frappe_microsoft365` once after updating (`bench update` does it for you).
+
 ## 1.0.1 — fix
 
 ### Fixed
