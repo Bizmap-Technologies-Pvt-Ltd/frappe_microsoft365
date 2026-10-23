@@ -83,7 +83,7 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - **Script changes did not reach browsers after a deploy.** The panel script is now a bundle with
   a new file name for every version, like the doctor script in 1.0.2.
 
-## 1.0.2 — fix
+## 1.0.2 — 2026-10-23
 
 ### Fixed
 
@@ -93,7 +93,7 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
   refreshes. It is now built as a bundle with a new file name for every version. Run
   `bench build --app frappe_microsoft365` once after updating (`bench update` does it for you).
 
-## 1.0.1 — fix
+## 1.0.1 — 2026-10-22
 
 ### Fixed
 
@@ -103,9 +103,15 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
   cancellation. Deleting is a write, so it now follows the push switch like creating and
   updating already did, both when the delete happens and again when the queued job runs.
 
-## Unreleased — modular setup
+## 1.0.0 — 2026-09-14
 
-### Added
+First stable release: two-way Outlook calendar sync including recurrence, Teams meetings from an
+Event, RSVP, transcripts and recordings, Microsoft sign-in and Outlook mail OAuth, the connection
+doctor and modular setup. 412 tests, CI on Frappe 15 and 16.
+
+### Modular setup
+
+#### Added
 
 - **Capability selection** in Microsoft Settings: calendar, mail and sign-in are independent
   and individually optional. The doctor only checks what you selected, so it never nags about
@@ -124,9 +130,9 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 Still read-only with respect to mail: no Graph mail, no replacement for `Email Account`, no
 changes to the email queue.
 
-## Unreleased — connection doctor
+### Connection doctor
 
-### Added
+#### Added
 
 - **Microsoft connection doctor** (`Microsoft Settings` → Troubleshoot): inspects Microsoft
   Settings, the Connected App and every Email Account and reports what is wrong, instead of
@@ -144,13 +150,13 @@ changes to the email queue.
 The doctor is read-only. It does not send or receive mail, replace `Email Account`, or touch
 the email queue; Frappe's own IMAP/SMTP + OAuth path is untouched.
 
-## Unreleased — sync correctness
+### Sync correctness
 
 The calendar sync engine was reworked around Graph delta queries. If you are upgrading an
 existing install, run `bench --site <site> migrate`; the first sync after the upgrade
 re-initialises the delta window automatically.
 
-### Fixed
+#### Fixed
 
 - **Pushed events stopped syncing after the first pull.** The pull flagged every event it
   touched as "pulled from Microsoft", including ones Frappe had just pushed, and the doc-event
@@ -181,7 +187,7 @@ re-initialises the delta window automatically.
 - Pointless saves during the pull bumped `modified` on unchanged events, which made the push
   step patch them back to Graph on every run.
 
-### Added
+#### Added
 
 - `graph_paged()` and `graph_delta()` helpers in `microsoft_graph`.
 - `last_error`, `delta_window_end` and `oauth_state_expiry` fields on `Microsoft Calendar`;
@@ -190,6 +196,6 @@ re-initialises the delta window automatically.
 - 31 tests covering the sync engine and Graph transport with mocked Graph responses.
 - CI runs a Frappe `version-15` + `version-16` matrix.
 
-### Removed
+#### Removed
 
 - The unused `authorization_code` field on `Microsoft Calendar`.
