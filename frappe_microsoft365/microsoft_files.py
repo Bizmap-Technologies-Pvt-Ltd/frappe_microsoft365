@@ -689,8 +689,17 @@ def on_file_insert(doc, method=None):
 	try:
 		if not _eligible(doc):
 			return
+		# A copy (File.create_attachment_copy) arrives with the original's SharePoint fields. A new
+		# File has never been uploaded itself, so ids it carries are not its own to resume from.
 		doc.db_set(
-			{"custom_microsoft_status": PENDING, "custom_microsoft_error": None}, update_modified=False
+			{
+				"custom_microsoft_status": PENDING,
+				"custom_microsoft_error": None,
+				"custom_microsoft_attempts": 0,
+				"custom_microsoft_drive_id": None,
+				"custom_microsoft_item_id": None,
+			},
+			update_modified=False,
 		)
 		enqueue_upload(doc.name)
 	except Exception:
@@ -717,44 +726,45 @@ def upload_file(file_name):
 		return
 
 	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
+	# Counted before anything can fail, so that whatever goes wrong, here or later in a way
+	# nobody foresaw, still uses up one of the MAX_ATTEMPTS and the hourly retry stops.
+	frappe.db.set_value("File", file_name, "custom_microsoft_attempts", attempts, update_modified=False)
+	frappe.db.commit()  # nosemgrep
+
 	# A savepoint, not a full rollback, on failure: a half-recorded folder must not survive, but
 	# neither should the caller's own unrelated writes be thrown away with it.
 	frappe.db.savepoint("microsoft365_upload")
 	try:
 		folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
-		try:
-			item = _upload(file_doc, folder)
-		except MsGraphNotFound:
-			_forget_message()
-			# Someone deleted or moved the record's folder out of the library. Recreate it once.
-			_forget_folder(folder)
-			folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
-			item = _upload(file_doc, folder)
+		item = _already_uploaded(file_doc, folder)
+		if not item:
+			try:
+				item = _upload(file_doc, folder)
+			except MsGraphNotFound:
+				_forget_message()
+				# Someone deleted or moved the record's folder out of the library. Recreate it once.
+				_forget_folder(folder)
+				folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
+				item = _upload(file_doc, folder)
+			# The bytes are in SharePoint now. Say so durably before anything else can fail, or
+			# a retry uploads them again and SharePoint keeps both, as "name (1).pdf".
+			frappe.db.set_value(
+				"File",
+				file_name,
+				{"custom_microsoft_drive_id": _drive_of(item, folder), "custom_microsoft_item_id": item["id"]},
+				update_modified=False,
+			)
+			frappe.db.commit()  # nosemgrep
 	except Exception as e:
 		frappe.db.rollback(save_point="microsoft365_upload")
-		frappe.db.set_value(
-			"File",
-			file_name,
-			{
-				"custom_microsoft_status": FAILED,
-				"custom_microsoft_error": str(e)[:1000],
-				"custom_microsoft_attempts": attempts,
-			},
-			update_modified=False,
-		)
-		# The failure has to outlive the job that hit it, or the hourly retry never sees it.
-		frappe.db.commit()  # nosemgrep
-		if attempts >= MAX_ATTEMPTS:
-			frappe.log_error(
-				title=_("Microsoft 365: file not stored in SharePoint"), message=f"File {file_name}: {e}"
-			)
+		_record_failure(file_name, attempts, e)
 		return
 
 	local_url = file_doc.file_url if is_local(file_doc) else None
 	keep_local = bool(storage_option("files_keep_local_copy", file_doc.attached_to_doctype))
 	values = {
 		"custom_microsoft_status": STORED if local_url else ARCHIVED,
-		"custom_microsoft_drive_id": item.get("parentReference", {}).get("driveId") or folder.drive_id,
+		"custom_microsoft_drive_id": _drive_of(item, folder),
 		"custom_microsoft_item_id": item["id"],
 		"custom_microsoft_web_url": item.get("webUrl"),
 		"custom_microsoft_error": None,
@@ -766,14 +776,68 @@ def upload_file(file_name):
 		# Kept whether or not the disk copy is: links already handed out (a bookmark, an email,
 		# a form opened before the move) still say this URL, and redirect_moved_file follows it.
 		values["custom_microsoft_local_url"] = local_url
-	frappe.db.set_value("File", file_name, values, update_modified=False)
-	# The row must point at SharePoint, durably, before the copy on disk is removed.
-	frappe.db.commit()  # nosemgrep
+	frappe.db.savepoint("microsoft365_record")
+	try:
+		frappe.db.set_value("File", file_name, values, update_modified=False)
+		# The row must point at SharePoint, durably, before the copy on disk is removed.
+		frappe.db.commit()  # nosemgrep
+	except Exception as e:
+		# The upload is recorded already: the next attempt picks it up instead of sending it again.
+		frappe.db.rollback(save_point="microsoft365_record")
+		_record_failure(file_name, attempts, e)
+		return
 
 	if local_url:
 		_repoint_links(file_doc, local_url, values["file_url"])
 	if local_url and not keep_local:
 		_remove_local_copy(local_url)
+
+
+def _drive_of(item, folder):
+	return item.get("parentReference", {}).get("driveId") or folder.drive_id
+
+
+def _already_uploaded(file_doc, folder):
+	"""The driveItem an earlier attempt uploaded before it failed, if it is still in the folder."""
+	item_id = file_doc.get("custom_microsoft_item_id")
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	if not (item_id and drive_id):
+		return None
+	try:
+		item = graph.graph_request(
+			"GET",
+			f"/drives/{drive_id}/items/{item_id}",
+			APP,
+			params={"$select": "id,webUrl,parentReference"},
+		)
+	except MsGraphNotFound:
+		_forget_message()
+		# Removed from SharePoint since: upload it again.
+		return None
+	parent = item.get("parentReference") or {}
+	if parent.get("id") != folder.item_id or (parent.get("driveId") or drive_id) != folder.drive_id:
+		# Moved out of the record's folder since, or the folder was recreated: not this file's copy.
+		return None
+	return item
+
+
+def _record_failure(file_name, attempts, error):
+	frappe.db.set_value(
+		"File",
+		file_name,
+		{
+			"custom_microsoft_status": FAILED,
+			"custom_microsoft_error": str(error)[:1000],
+			"custom_microsoft_attempts": attempts,
+		},
+		update_modified=False,
+	)
+	# The failure has to outlive the job that hit it, or the hourly retry never sees it.
+	frappe.db.commit()  # nosemgrep
+	if attempts >= MAX_ATTEMPTS:
+		frappe.log_error(
+			title=_("Microsoft 365: file not stored in SharePoint"), message=f"File {file_name}: {error}"
+		)
 
 
 MOVED_EVENT = "microsoft365_file_moved"

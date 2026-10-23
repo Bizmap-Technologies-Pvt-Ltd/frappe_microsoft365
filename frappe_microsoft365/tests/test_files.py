@@ -123,6 +123,7 @@ class FakeGraph:
 		self.calls = []
 		self.items = {"FOLDER": {"id": "FOLDER", "parent": "BASE"}, "BASE": {"id": "BASE", "parent": "ROOT"}}
 		self.fail_upload = None
+		self.web_url_padding = ""
 
 	def __call__(
 		self,
@@ -149,10 +150,13 @@ class FakeGraph:
 			if self.fail_upload:
 				raise self.fail_upload
 			name = path.split(":/", 1)[1].rsplit(":/content", 1)[0]
+			parent = path.split("/items/", 1)[1].split(":/", 1)[0]
+			web_url = "https://contoso.sharepoint.com/" + self.web_url_padding + name
+			self.items["ITEM-" + name] = {"id": "ITEM-" + name, "name": name, "parent": parent, "webUrl": web_url}
 			return {
 				"id": "ITEM-" + name,
-				"webUrl": "https://contoso.sharepoint.com/" + name,
-				"parentReference": {"driveId": "DRIVE", "id": "FOLDER"},
+				"webUrl": web_url,
+				"parentReference": {"driveId": "DRIVE", "id": parent},
 			}
 		if method == "GET" and path.startswith("/drives/DRIVE/items/") and params:
 			item_id = path.rsplit("/", 1)[-1]
@@ -163,6 +167,7 @@ class FakeGraph:
 				"id": item_id,
 				"name": item.get("name", item_id),
 				"file": {},
+				"webUrl": item.get("webUrl"),
 				"parentReference": {"driveId": "DRIVE", "id": item.get("parent")},
 			}
 		raise AssertionError(f"unexpected Graph call {method} {path}")
@@ -578,6 +583,77 @@ class TestUpload(FilesTestCase):
 		)
 		self.assertEqual(row.custom_microsoft_status, files.STORED)
 		self.assertGreater(len(row.custom_microsoft_web_url), 140)
+
+	def uploads(self):
+		return [path for method, path in self.graph.calls if method == "PUT"]
+
+	def test_a_failure_after_the_upload_never_uploads_again(self):
+		# Recording the upload fails (here: an address wider than the column) after SharePoint
+		# has the bytes. Before this was handled, every hourly retry uploaded another copy.
+		self.graph.web_url_padding = "x" * 1000
+		f = self.attach()
+		files.upload_file(f.name)
+		row = frappe.db.get_value(
+			"File",
+			f.name,
+			["file_url", "custom_microsoft_status", "custom_microsoft_error", "custom_microsoft_item_id"],
+			as_dict=True,
+		)
+		self.assertEqual(row.custom_microsoft_status, files.FAILED)
+		self.assertIn("too long", row.custom_microsoft_error)
+		self.assertEqual(row.custom_microsoft_item_id, "ITEM-" + f.file_name)  # the upload is known
+		self.assertEqual(row.file_url, f.file_url)  # and nothing was moved off the disk
+		self.assertTrue(os.path.exists(f.get_full_path()))
+
+		self.graph.web_url_padding = ""
+		self.graph.items["ITEM-" + f.file_name]["webUrl"] = "https://contoso.sharepoint.com/spec"
+		files.upload_file(f.name)
+		self.assertEqual(len(self.uploads()), 1)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.STORED)
+
+	def test_an_attempt_counts_even_when_the_job_dies(self):
+		class Killed(BaseException):
+			"""What a job timeout or a worker restart looks like from inside the job."""
+
+		f = self.attach()
+		with patch.object(files, "_upload", side_effect=Killed):
+			with self.assertRaises(Killed):
+				files.upload_file(f.name)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_attempts"), 1)
+
+	def test_an_upload_no_longer_in_the_folder_is_sent_again(self):
+		f = self.attach()
+		self.graph.items["MOVED"] = {"id": "MOVED", "parent": "SOMEWHERE-ELSE"}
+		frappe.db.set_value(
+			"File", f.name, {"custom_microsoft_item_id": "MOVED", "custom_microsoft_drive_id": "DRIVE"}
+		)
+		files.upload_file(f.name)
+		self.assertEqual(len(self.uploads()), 1)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_item_id"), "ITEM-" + f.file_name)
+
+	def test_a_copy_does_not_take_over_the_originals_upload(self):
+		f = self.attach()
+		frappe.db.set_value(
+			"File",
+			f.name,
+			{
+				"custom_microsoft_status": files.FAILED,
+				"custom_microsoft_attempts": 5,
+				"custom_microsoft_item_id": "ITEM-elsewhere",
+				"custom_microsoft_drive_id": "DRIVE",
+			},
+		)
+		other = frappe.get_doc({"doctype": "ToDo", "description": "copy target"}).insert()
+		copy = frappe.get_doc("File", f.name).create_attachment_copy(MAPPED, other.name)
+		row = frappe.db.get_value(
+			"File",
+			copy.name,
+			["custom_microsoft_status", "custom_microsoft_attempts", "custom_microsoft_item_id"],
+			as_dict=True,
+		)
+		self.assertEqual(row.custom_microsoft_status, files.PENDING)
+		self.assertEqual(row.custom_microsoft_attempts, 0)
+		self.assertIsNone(row.custom_microsoft_item_id)
 
 	def test_rerunning_a_stored_file_does_nothing(self):
 		f = self.attach()
