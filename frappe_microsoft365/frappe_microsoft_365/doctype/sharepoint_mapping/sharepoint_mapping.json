@@ -23,6 +23,7 @@
   "keep_local_copy",
   "options_column",
   "delete_remote",
+  "files_panel",
   "folders_section",
   "folders",
   "resolved_section",
@@ -150,6 +151,14 @@
    "description": "<b>Default:</b> as in SharePoint Settings.<br><b>On:</b> deleting one of this DocType's attachments sends its SharePoint copy to the site's recycle bin.<br><b>Off:</b> the SharePoint copy is always kept, e.g. for records that must be retained."
   },
   {
+   "fieldname": "files_panel",
+   "fieldtype": "Select",
+   "label": "Files Panel",
+   "options": "Top of form\nOwn tab\nHidden",
+   "default": "Top of form",
+   "description": "Where this DocType's forms show <b>Files in Microsoft 365</b>.<br><b>Top of form:</b> above the first tab's fields.<br><b>Own tab:</b> a <i>Microsoft 365 Files</i> tab at the end of the form.<br><b>Hidden:</b> no panel. Files still move and open from the record, and the SharePoint toolbar menu stays."
+  },
+  {
    "fieldname": "folders_section",
    "fieldtype": "Section Break",
    "label": "Folders",
@@ -196,7 +205,7 @@
   }
  ],
  "links": [],
- "modified": "2026-10-23 12:00:00",
+ "modified": "2026-10-23 13:00:00",
  "module": "Frappe Microsoft 365",
  "name": "SharePoint Mapping",
  "naming_rule": "By fieldname",

@@ -383,8 +383,15 @@ def create_file_custom_fields(only_definitions=False):
 
 def app_custom_fields():
 	"""Every custom field this app adds, as ``{doctype: [fieldname, ...]}``. Used by uninstall."""
+	from frappe_microsoft365.microsoft_files import FILES_TAB_FIELDS
+
 	out = {}
 	for definitions in (create_event_custom_fields(True), create_file_custom_fields(True)):
 		for doctype, fields in definitions.items():
 			out.setdefault(doctype, []).extend(f["fieldname"] for f in fields)
+	# The Microsoft 365 Files tab, on whichever DocTypes a mapping put it.
+	for row in frappe.get_all(
+		"Custom Field", filters={"fieldname": ["in", FILES_TAB_FIELDS]}, fields=["dt", "fieldname"]
+	):
+		out.setdefault(row.dt, []).append(row.fieldname)
 	return out

@@ -92,6 +92,9 @@ class SharePointMapping(Document):
 		from frappe_microsoft365 import microsoft_files as files
 
 		files.clear_mapping_cache()
+		files.sync_files_tab(
+			self.reference_doctype, bool(self.enabled) and files.panel_placement(self) == files.PANEL_TAB
+		)
 		queued = sum(
 			files.queue_record(self.reference_doctype, name) for name in self.flags.new_folders or []
 		)
@@ -101,6 +104,7 @@ class SharePointMapping(Document):
 			)
 
 	def on_trash(self):
-		from frappe_microsoft365.microsoft_files import clear_mapping_cache
+		from frappe_microsoft365.microsoft_files import clear_mapping_cache, sync_files_tab
 
 		clear_mapping_cache()
+		sync_files_tab(self.reference_doctype, False)

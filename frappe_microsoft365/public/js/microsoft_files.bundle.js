@@ -15,6 +15,14 @@ frappe.provide("frappe_microsoft365.files");
 		return (frappe.boot.microsoft365_files_doctypes || []).includes(doctype);
 	}
 
+	// SharePoint Mapping > Files Panel: "Top of form", "Own tab" or "Hidden".
+	const FILES_TAB = "custom_microsoft365_files_tab";
+	const FILES_HTML = "custom_microsoft365_files";
+
+	function placement(doctype) {
+		return (frappe.boot.microsoft365_files_panel || {})[doctype] || "Top of form";
+	}
+
 	function size(bytes) {
 		if (bytes == null) return "";
 		if (bytes < 1024) return `${bytes} B`;
@@ -55,22 +63,40 @@ frappe.provide("frappe_microsoft365.files");
 			this.load();
 		}
 
-		// Its own block at the top of the form's first tab. Not frm.dashboard: on a DocType
-		// with a Connections tab (Project, Customer, …) Frappe puts the dashboard inside that
-		// tab, where nobody looks for files.
+		// Top of form: its own block at the top of the form's first tab. Not frm.dashboard: on
+		// a DocType with a Connections tab (Project, Customer, …) Frappe puts the dashboard
+		// inside that tab, where nobody looks for files.
+		// Own tab: inside the Microsoft 365 Files tab the mapping added to the DocType.
+		// Hidden: nothing; the toolbar still offers the folder.
 		mount() {
 			const frm = this.frm;
 			frm.$wrapper.find(".microsoft365-files").remove();
+			const where = placement(frm.doctype);
+			if (where === "Hidden") return null;
 			const $section = $(`
 				<div class="microsoft365-files" style="padding:12px var(--padding-md, 15px);border-bottom:1px solid var(--border-color)">
 					<div style="font-weight:600;margin-bottom:6px">${__("Files in Microsoft 365")}</div>
 					<div class="microsoft365-files-body"></div>
 				</div>`);
-			const tabs = frm.layout && frm.layout.tabs;
-			const target =
-				tabs && tabs.length ? tabs[0].wrapper : frm.layout.wrapper.find(".form-page");
-			$(target).prepend($section);
+			const field = frm.fields_dict[FILES_HTML];
+			if (where === "Own tab" && field) {
+				field.$wrapper.empty().append($section);
+			} else {
+				// Also where an Own tab mapping lands until the form has its new tab (a stale
+				// meta in the browser), so the files are never out of reach.
+				const tabs = frm.layout && frm.layout.tabs;
+				const target =
+					tabs && tabs.length ? tabs[0].wrapper : frm.layout.wrapper.find(".form-page");
+				$(target).prepend($section);
+			}
 			return $section.find(".microsoft365-files-body");
+		}
+
+		show() {
+			const tabs = (this.frm.layout && this.frm.layout.tabs) || [];
+			const own = tabs.find((t) => t.df && t.df.fieldname === FILES_TAB);
+			((placement(this.frm.doctype) === "Own tab" && own) || tabs[0])?.set_active();
+			this.frm.$wrapper.find(".microsoft365-files")[0]?.scrollIntoView({ behavior: "smooth" });
 		}
 
 		// The same actions in the toolbar, so they are found without scrolling to the panel.
@@ -90,16 +116,9 @@ frappe.provide("frappe_microsoft365.files");
 					group,
 				);
 			}
-			frm.add_custom_button(
-				__("Show files"),
-				() => {
-					frm.layout.tabs && frm.layout.tabs.length && frm.layout.tabs[0].set_active();
-					frm.$wrapper
-						.find(".microsoft365-files")[0]
-						?.scrollIntoView({ behavior: "smooth" });
-				},
-				group,
-			);
+			if (this.$body) {
+				frm.add_custom_button(__("Show files"), () => this.show(), group);
+			}
 		}
 
 		create() {
@@ -123,12 +142,13 @@ frappe.provide("frappe_microsoft365.files");
 
 		load() {
 			const subfolder = this.trail.length ? this.trail[this.trail.length - 1].id : null;
-			this.$body.html(`<div class="text-muted small">${__("Loading…")}</div>`);
+			this.$body && this.$body.html(`<div class="text-muted small">${__("Loading…")}</div>`);
 			frappe.call({
 				method: `${METHOD}.list_folder`,
 				args: { doctype: this.frm.doctype, name: this.frm.docname, subfolder },
 				callback: (r) => this.render(r.message || {}),
 				error: () =>
+					this.$body &&
 					this.$body.html(
 						`<div class="text-muted small">${__(
 							"Could not read the SharePoint folder. Microsoft Settings > Troubleshoot > Test SharePoint Connection says why.",
@@ -139,6 +159,7 @@ frappe.provide("frappe_microsoft365.files");
 
 		render(data) {
 			if (!this.trail.length) this.toolbar(data);
+			if (!this.$body) return;
 			if (!data.exists) {
 				const kind = __(this.frm.doctype);
 				let msg = data.missing

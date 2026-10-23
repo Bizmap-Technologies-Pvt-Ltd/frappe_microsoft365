@@ -790,6 +790,65 @@ class TestSettings(BaseTestCase):
 		files.boot_session(boot)
 		self.assertEqual(boot.microsoft365_files_doctypes, [MAPPED])
 
+	def tab_fields(self):
+		return frappe.get_all(
+			"Custom Field",
+			filters={"dt": MAPPED, "fieldname": ["in", files.FILES_TAB_FIELDS]},
+			pluck="fieldname",
+			order_by="fieldname",
+		)
+
+	def panel(self, mapping, placement):
+		mapping.files_panel = placement
+		mapping.save()
+		self.addCleanup(files.sync_files_tab, MAPPED, False)
+
+	def test_files_panel_defaults_to_the_top_of_the_form(self):
+		configure(self)
+		boot = frappe._dict()
+		files.boot_session(boot)
+		self.assertEqual(boot.microsoft365_files_panel, {MAPPED: files.PANEL_TOP})
+		self.assertEqual(self.tab_fields(), [])
+
+	def test_own_tab_adds_a_tab_to_the_form(self):
+		mapping = configure(self)
+		self.panel(mapping, files.PANEL_TAB)
+		self.assertEqual(self.tab_fields(), sorted(files.FILES_TAB_FIELDS))
+		meta = frappe.get_meta(MAPPED)
+		self.assertEqual(meta.get_field(files.FILES_TAB_FIELD).fieldtype, "Tab Break")
+		self.assertEqual(meta.fields[-1].fieldname, files.FILES_HTML_FIELD)  # at the end of the form
+		self.assertFalse(frappe.db.has_column(MAPPED, files.FILES_HTML_FIELD))
+		boot = frappe._dict()
+		files.boot_session(boot)
+		self.assertEqual(boot.microsoft365_files_panel, {MAPPED: files.PANEL_TAB})
+
+		mapping.save()  # saving again changes nothing
+		self.assertEqual(len(self.tab_fields()), 2)
+
+	def test_the_tab_goes_when_it_is_no_longer_wanted(self):
+		mapping = configure(self)
+		self.panel(mapping, files.PANEL_TAB)
+		self.panel(mapping, files.PANEL_HIDDEN)
+		self.assertEqual(self.tab_fields(), [])
+
+		self.panel(mapping, files.PANEL_TAB)
+		mapping.enabled = 0
+		mapping.save()
+		self.assertEqual(self.tab_fields(), [])
+
+		mapping.enabled = 1
+		mapping.save()
+		self.assertEqual(len(self.tab_fields()), 2)
+		mapping.delete()
+		self.assertEqual(self.tab_fields(), [])
+
+	def test_uninstall_removes_the_tab_too(self):
+		from frappe_microsoft365.setup import app_custom_fields
+
+		mapping = configure(self)
+		self.panel(mapping, files.PANEL_TAB)
+		self.assertEqual(sorted(app_custom_fields()[MAPPED]), sorted(files.FILES_TAB_FIELDS))
+
 	def test_addresses_names_and_ids_are_not_cut_at_140(self):
 		# Frappe's Data default is varchar(140). SharePoint addresses, paths and names pass it
 		# routinely, and the failed write came after the work was done in SharePoint.

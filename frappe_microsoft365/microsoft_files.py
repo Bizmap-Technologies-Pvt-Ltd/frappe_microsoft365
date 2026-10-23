@@ -159,6 +159,7 @@ MAPPING_FIELDS = [
 	"drive_id",
 	"keep_local_copy",
 	"delete_remote",
+	"files_panel",
 ]
 
 
@@ -246,12 +247,72 @@ def mapped_doctype_query(
 
 
 def boot_session(bootinfo):
-	"""Tell the desk which DocTypes get the "Files in Microsoft 365" panel."""
+	"""Tell the desk which DocTypes get the "Files in Microsoft 365" panel, and where."""
 	try:
 		bootinfo.microsoft365_files_doctypes = mapped_doctypes()
+		bootinfo.microsoft365_files_panel = {
+			doctype: panel_placement(mapping_for(doctype)) for doctype in bootinfo.microsoft365_files_doctypes
+		}
 	except Exception:
 		# A broken settings row must never stop the desk from loading.
 		bootinfo.microsoft365_files_doctypes = []
+		bootinfo.microsoft365_files_panel = {}
+
+
+PANEL_TOP = "Top of form"
+PANEL_TAB = "Own tab"
+PANEL_HIDDEN = "Hidden"
+
+#: The tab a mapping with Files Panel = Own tab adds to its DocType's form, and the field the panel
+#: draws into. Neither has a column.
+FILES_TAB_FIELD = "custom_microsoft365_files_tab"
+FILES_HTML_FIELD = "custom_microsoft365_files"
+FILES_TAB_FIELDS = (FILES_TAB_FIELD, FILES_HTML_FIELD)
+
+
+def panel_placement(row):
+	return (row or {}).get("files_panel") or PANEL_TOP
+
+
+def sync_files_tab(doctype, wanted):
+	"""Add or remove the Microsoft 365 Files tab on a DocType's form (idempotent).
+
+	A tab is form layout, so it is a Custom Field like any other change to someone else's form;
+	that is also what lets a System Manager move it with Customize Form.
+	"""
+	names = frappe.get_all(
+		"Custom Field", filters={"dt": doctype, "fieldname": ["in", FILES_TAB_FIELDS]}, pluck="name"
+	)
+	if len(names) == (len(FILES_TAB_FIELDS) if wanted else 0):
+		return
+	for name in names:
+		frappe.delete_doc("Custom Field", name, ignore_permissions=True, force=True)
+	if wanted:
+		last = [df.fieldname for df in frappe.get_meta(doctype).fields if df.fieldname not in FILES_TAB_FIELDS]
+		fields = [
+			{
+				"fieldname": FILES_TAB_FIELD,
+				"fieldtype": "Tab Break",
+				"label": "Microsoft 365 Files",
+				"insert_after": last[-1] if last else None,
+				# Only on saved records of a DocType that is still mapped with storage on: the
+				# boot list is empty when either is switched off.
+				"depends_on": "eval:!doc.__islocal && (frappe.boot.microsoft365_files_doctypes || []).includes(doc.doctype)",
+			},
+			{"fieldname": FILES_HTML_FIELD, "fieldtype": "HTML", "insert_after": FILES_TAB_FIELD},
+		]
+		# Inserted directly rather than through create_custom_fields: that ends in a schema sync,
+		# which commits, and neither field has a column to sync.
+		in_create = frappe.flags.in_create_custom_fields
+		frappe.flags.in_create_custom_fields = True
+		try:
+			for df in fields:
+				field = frappe.get_doc({"doctype": "Custom Field", "dt": doctype, **df})
+				field.flags.ignore_validate = True
+				field.insert(ignore_permissions=True)
+		finally:
+			frappe.flags.in_create_custom_fields = in_create
+	frappe.clear_cache(doctype=doctype)
 
 
 # --- names and paths ---------------------------------------------------------------------
