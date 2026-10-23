@@ -588,9 +588,10 @@ class TestUpload(FilesTestCase):
 		return [path for method, path in self.graph.calls if method == "PUT"]
 
 	def test_a_failure_after_the_upload_never_uploads_again(self):
-		# Recording the upload fails (here: an address wider than the column) after SharePoint
-		# has the bytes. Before this was handled, every hourly retry uploaded another copy.
-		self.graph.web_url_padding = "x" * 1000
+		# Recording the upload fails (here: an address wider than the column, a TEXT's 64 KB)
+		# after SharePoint has the bytes. Before this was handled, every hourly retry uploaded
+		# another copy.
+		self.graph.web_url_padding = "x" * 70000
 		f = self.attach()
 		files.upload_file(f.name)
 		row = frappe.db.get_value(
@@ -903,6 +904,19 @@ class TestSettings(BaseTestCase):
 			]
 		for fieldname, length in fields:
 			self.assertGreaterEqual(length or 140, 255, fieldname)
+
+	def test_file_gets_at_most_one_wide_varchar(self):
+		# tabFile is shared with every app on the site and can already be near InnoDB's row
+		# limit: a second wide varchar beside the indexed local_url failed migrate on a
+		# COMPRESSED table. Anything long that is not indexed belongs in a Text field.
+		from frappe_microsoft365.setup import create_file_custom_fields
+
+		wide = [
+			f["fieldname"]
+			for f in create_file_custom_fields(only_definitions=True)["File"]
+			if f["fieldtype"] == "Data" and (f.get("length") or 140) > 255
+		]
+		self.assertEqual(wide, ["custom_microsoft_local_url"])
 
 
 class TestUninstall(FilesTestCase):
