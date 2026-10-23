@@ -37,10 +37,11 @@ frappe.provide("frappe_microsoft365.files");
 	}
 
 	// HTML. prettyDate, not comment_when: comment_when returns markup, which esc() printed as text.
+	// Through frappe.datetime: the desk bundle keeps a bare prettyDate to itself.
 	function when(iso) {
 		if (!iso) return "";
 		const value = system_time(iso);
-		const text = prettyDate(value, true) || value.slice(0, 10);
+		const text = frappe.datetime.prettyDate(value, true) || value.slice(0, 10);
 		const full = frappe.datetime.str_to_user(frappe.datetime.convert_to_user_tz(value));
 		return `<span title="${esc(full)}">${esc(text)}</span>`;
 	}
