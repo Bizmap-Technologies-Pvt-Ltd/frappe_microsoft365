@@ -42,7 +42,8 @@ frees disk space, which matters on hosted plans with a fixed quota (Frappe Cloud
    SharePoint Settings, or for one DocType on its mapping).
 4. The record shows a **Files in Microsoft 365** panel. It lists everything in the folder,
    including subfolders and files added from Teams or SharePoint, and has an **Open in
-   SharePoint** button.
+   SharePoint** button. The mapping's **Files Panel** puts it at the top of the form, in its own
+   tab, or hides it.
 5. Files open through Frappe, so anyone who can read the record can open its files, whether or
    not they have a SharePoint licence. People with SharePoint access can also use the folder
    directly.

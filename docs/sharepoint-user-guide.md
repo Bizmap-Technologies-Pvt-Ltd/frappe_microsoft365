@@ -34,7 +34,7 @@ Attach files exactly as you always have; storage in SharePoint happens on its ow
 
 **The Files in Microsoft 365 panel**
 
-On records of a mapped type, a **Files in Microsoft 365** panel sits near the top of the form. It lists everything in the record's SharePoint folder, including files and subfolders added from Teams.
+On records of a mapped type, a **Files in Microsoft 365** panel sits near the top of the form, or in its own **Microsoft 365 Files** tab, depending on the record type's **Files Panel** setting (see the mapping's **Options**). It lists everything in the record's SharePoint folder, including files and subfolders added from Teams.
 
 - Click a file name to open it, or the download arrow to save it.
 - Click a folder to go into it; use the path at the top to go back.
@@ -108,6 +108,14 @@ Three places hold the configuration: **Microsoft Settings** for the connection, 
 | Remove from SharePoint when the attachment is deleted | SharePoint keeps the file | The file goes to the site's recycle bin, where it can be restored |
 
 These are the defaults for every record type. Two of them can be set differently for one record type, under **Options** on its SharePoint Mapping (next section): **Keep a local copy after upload** and **Remove from SharePoint when the attachment is deleted**. Each offers **Default** (follow SharePoint Settings; the mapping shows what that currently is), **On** or **Off**. Typical uses: keep local copies only for the record type being trialled, or set removal to **Off** for a record type whose documents must be retained even when deleted in the ERP. **Also copy linked files** and **If this app is uninstalled** are site-wide only.
+
+**Files Panel**, also under a mapping's **Options**, sets where that record type's forms show the panel:
+
+| Files Panel | The form shows |
+| --- | --- |
+| Top of form (default) | The panel above the first tab's fields |
+| Own tab | A **Microsoft 365 Files** tab at the end of the form, holding the panel. A System Manager can move the tab with **Customize Form** |
+| Hidden | No panel. Files still move to SharePoint and open from the record, and the **SharePoint** toolbar menu (Create folder, Open in SharePoint) stays |
 
 **SharePoint Mapping** (sidebar *SharePoint → Mappings*, then **Add**)
 
@@ -200,5 +208,7 @@ Run **Test** on the mapping first; it names the failing step. Then match what yo
 | Graph Explorer: `Empty Payload. JSON content expected.` | The POST was sent without a body | Paste the JSON into the **Request body** tab under the URL bar |
 | Files stay *Pending* | No background worker is running | *Run Diagnostics*; start the worker (on Frappe Cloud it always runs) |
 | Files show *Failed* | See the File's **Last SharePoint Error** | Fix the cause above; failed files retry hourly up to 5 times, or click **Move Existing Attachments** |
+| The same file appears in the folder several times, as `name (1).pdf`, `name (2).pdf` | Before this was fixed, a file whose SharePoint address passed 140 characters (a long file or record name) was uploaded again every hour | Update the app and run `bench migrate`. Then delete the extra copies in Teams or SharePoint; the app never deletes them itself, because it cannot know which ones people have since opened or edited |
+| A change to the app doesn't show after an update, even after a hard refresh | The app's scripts are built into versioned bundles; an update that skipped the build still serves the old ones | Run `bench build --app frappe_microsoft365` (`bench update` does it), then reload |
 | An attachment link opens *Forbidden* | The page was opened before the file moved, and the live update didn't reach it | Reload the record; the link then opens from SharePoint |
 | Record folders appear inside an extra folder in a private channel | **Group record folders in a base folder** is on | Untick it on the mapping; drag existing folders up a level in Teams if wanted |

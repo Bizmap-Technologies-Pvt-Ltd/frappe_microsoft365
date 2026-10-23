@@ -20,6 +20,8 @@ capability, with the changes listed under *Changed from the original*.
   upload sessions. Failed moves are marked on the File and retried hourly.
 - **Files in Microsoft 365** panel on mapped forms: the folder's contents, including files added
   from Teams or SharePoint, opened through Frappe with the record's own read permission.
+  *Files Panel* on each mapping puts it at the top of the form (default), in its own
+  *Microsoft 365 Files* tab, or hides it.
 - **App-only Graph calls**: `graph_request(..., microsoft_graph.APP)` uses the client
   credentials flow, with the token cached encrypted per site. Document storage needs the
   `Sites.Selected` application permission and a per-site grant — never tenant-wide
@@ -67,6 +69,19 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - `File.get_content` no longer depends on a Frappe constant some v16 releases lack.
 - The fork's intermediate-DocType migration patches are not carried over: the DocTypes are
   created in their final form, and a site upgrading from the fork already has them.
+
+### Fixed from the original (found in testing)
+
+- **A file was uploaded again every hour.** A SharePoint address longer than 140 characters
+  (any long file or record name) could not be saved after the upload, the attempt was never
+  counted, and the hourly retry uploaded the file again, as `name (1).pdf`, `name (2).pdf`, ...
+  Addresses, paths and names now have room (1000), every attempt counts before any work, and a
+  retry resumes from the upload it already made. Copies already in SharePoint are not deleted:
+  remove the extras by hand.
+- **The Files panel's Modified column showed raw HTML**, and its times were off by the site's
+  UTC offset (a file saved two minutes ago showed as hours old on an India site).
+- **Script changes did not reach browsers after a deploy.** The panel script is now a bundle with
+  a new file name for every version, like the doctor script in 1.0.2.
 
 ## 1.0.2 — fix
 

@@ -58,6 +58,10 @@ Kept as written, with the same DocType names so existing data carries over:
 | Frappe v15 | Storage could be enabled; server-side `File.get_content` returned nothing for moved files | Storage requires v16 (`extend_doctype_class`); ticking it on v15 is refused with an explanation |
 | Opening files inline | Extensionless files fell back to SharePoint's Content-Type | Only known-safe types (PDF, images except SVG, plain text, audio, video) open inline; everything else downloads |
 | Migration patches | Four patches from intermediate fork-only DocTypes | Dropped: the DocTypes are created in their final form |
+| Field widths | Frappe's default varchar(140) for addresses, paths and ids | URLs, paths and names 1000 (768 where indexed), Graph ids 255. At 140 a long file name failed after the upload and was uploaded again every hour |
+| Retrying an upload | The attempt was recorded only after the work, so a failure in between was retried forever; each retry uploaded again | The attempt is counted first; the item id is saved straight after the upload, and a retry resumes from it instead of sending the bytes again |
+| Files panel | Always at the top of the form | *Files Panel* per mapping: top of form, its own tab (a Tab Break + HTML Custom Field, no column), or hidden |
+| Desk scripts | Included by plain `/assets` path, cached by browsers across deploys | Built as `*.bundle.js`, a new file name for every version |
 
 ## Upgrading from the fork
 
