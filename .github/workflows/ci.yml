@@ -117,6 +117,13 @@ jobs:
           bench --site test_site install-app frappe_microsoft365
           bench --site test_site migrate
 
+      - name: Build desk scripts
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench build --app frappe_microsoft365
+          # Every desk script must come out as a hashed bundle, or deploys never reach browsers.
+          grep -q '"microsoft_doctor.bundle.js": "/assets/frappe_microsoft365/dist/js/microsoft_doctor.bundle\.[A-Z0-9]*\.js"' sites/assets/assets.json
+
       - name: Run tests
         working-directory: /home/runner/frappe-bench
         run: |

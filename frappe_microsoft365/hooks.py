@@ -62,7 +62,9 @@ scheduler_events = {
 # include js, css files in header of desk.html
 # app_include_css = "/assets/frappe_microsoft365/css/frappe_microsoft365.css"
 # The doctor's shared renderer. Read-only UI; this app never changes how mail is sent.
-app_include_js = ["/assets/frappe_microsoft365/js/microsoft_doctor.js"]
+# A bundle, not a plain /assets path: bundles get a new file name on every build, so browsers
+# load the new version after a deploy instead of a copy cached for a year.
+app_include_js = ["microsoft_doctor.bundle.js"]
 
 # include js, css files in header of web template
 # web_include_css = "/assets/frappe_microsoft365/css/frappe_microsoft365.css"
