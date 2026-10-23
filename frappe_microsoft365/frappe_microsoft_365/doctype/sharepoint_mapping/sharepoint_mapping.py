@@ -92,6 +92,7 @@ class SharePointMapping(Document):
 		from frappe_microsoft365 import microsoft_files as files
 
 		files.clear_mapping_cache()
+		files.refresh_desk_boot()
 		files.sync_files_tab(
 			self.reference_doctype, bool(self.enabled) and files.panel_placement(self) == files.PANEL_TAB
 		)
@@ -104,7 +105,14 @@ class SharePointMapping(Document):
 			)
 
 	def on_trash(self):
-		from frappe_microsoft365.microsoft_files import clear_mapping_cache, sync_files_tab
+		from frappe_microsoft365.microsoft_files import sync_files_tab
+
+		sync_files_tab(self.reference_doctype, False)
+
+	def after_delete(self):
+		# Not in on_trash: the row is still there then, and removing the tab's Custom Fields runs
+		# the "*" delete hooks, which read the mappings and would cache this one all over again.
+		from frappe_microsoft365.microsoft_files import clear_mapping_cache, refresh_desk_boot
 
 		clear_mapping_cache()
-		sync_files_tab(self.reference_doctype, False)
+		refresh_desk_boot()

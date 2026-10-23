@@ -849,6 +849,42 @@ class TestSettings(BaseTestCase):
 		self.panel(mapping, files.PANEL_TAB)
 		self.assertEqual(sorted(app_custom_fields()[MAPPED]), sorted(files.FILES_TAB_FIELDS))
 
+	def seed_cached_boot(self):
+		# Frappe keeps each user's boot until they reload; stand in for a desk already open.
+		frappe.cache().hset("bootinfo", "someone@example.com", {"from_cache": 1})
+		self.addCleanup(frappe.cache().hdel, "bootinfo", "someone@example.com")
+
+	def cached_boot(self):
+		return frappe.cache().hget("bootinfo", "someone@example.com")
+
+	def test_a_new_placement_reaches_desks_on_their_next_load(self):
+		mapping = configure(self)
+		self.seed_cached_boot()
+		self.panel(mapping, files.PANEL_TAB)
+		self.assertIsNone(self.cached_boot())
+		# What the saving desk is handed straight away, and what the others rebuild.
+		self.assertEqual(files.files_panel_boot()["microsoft365_files_panel"], {MAPPED: files.PANEL_TAB})
+
+		self.seed_cached_boot()
+		mapping.delete()
+		self.assertIsNone(self.cached_boot())
+		self.assertNotIn(MAPPED, files.files_panel_boot()["microsoft365_files_doctypes"])
+		self.assertIsNone(files.mapping_for(MAPPED))  # nor go on storing its files
+
+	def test_switching_storage_on_or_off_reaches_desks_on_their_next_load(self):
+		configure(self)
+		settings = frappe.get_doc("Microsoft Settings")
+		settings.flags.ignore_permissions = True
+
+		self.seed_cached_boot()
+		settings.save()  # storage still on: nothing for a desk to pick up
+		self.assertIsNotNone(self.cached_boot())
+
+		settings.use_files = 0
+		settings.save()
+		self.assertIsNone(self.cached_boot())
+		self.assertEqual(files.files_panel_boot()["microsoft365_files_doctypes"], [])
+
 	def test_addresses_names_and_ids_are_not_cut_at_140(self):
 		# Frappe's Data default is varchar(140). SharePoint addresses, paths and names pass it
 		# routinely, and the failed write came after the work was done in SharePoint.

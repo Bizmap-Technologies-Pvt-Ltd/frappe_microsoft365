@@ -44,7 +44,13 @@ class MicrosoftSettings(Document):
 		# The tenant, client or secret may just have changed; a token minted under the old ones
 		# must not be served again.
 		clear_app_token_cache()
-		capabilities.apply_changes(self.get_doc_before_save(), self)
+		before = self.get_doc_before_save()
+		capabilities.apply_changes(before, self)
+		if bool((before or {}).get("use_files")) != bool(self.use_files):
+			# Which forms get the Files panel follows this tick; see refresh_desk_boot.
+			from frappe_microsoft365.microsoft_files import refresh_desk_boot
+
+			refresh_desk_boot()
 
 	def _drop_capabilities_that_lost_their_prerequisite(self):
 		"""A capability that builds on another cannot work without it — transcripts, for one,
