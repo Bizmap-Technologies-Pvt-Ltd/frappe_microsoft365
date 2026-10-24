@@ -114,8 +114,11 @@ asks for `Sites.ReadWrite.All`.
    - **Document Library**: `Documents` for Teams.
    - **Base Folder**: the channel name, e.g. `Projects`. Nested paths like `Projects/2026` work.
      The folder is created if it is missing.
-   - **Folder Name Pattern**: `{name}` by default. Use `{fieldname}` for any field, e.g.
-     `{name} - {customer}`.
+   - **Folder Name Pattern**: `{name}` by default. `{title}` is the record's title (its DocType's
+     Title Field, or the name when there is none), and `{fieldname}` any field, e.g.
+     `{name} - {title}` gives `DEV-00042 - Scan-Line 920B`, or `{name} - {customer}`.
+     The name is set when the folder is created and follows a rename of the record, not later
+     edits to the title or other fields.
 4. Save the mapping, then click **Site Grant Script** on it. A SharePoint or Global administrator
    runs the script in Microsoft Graph PowerShell. (The *Site Grant Script* section of
    *SharePoint Settings* gives one script for every mapped site.) For each site it runs:
