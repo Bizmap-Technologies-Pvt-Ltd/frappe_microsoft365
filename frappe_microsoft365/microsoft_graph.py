@@ -8,14 +8,16 @@ See docs/graph-api-reference.md for the verified endpoint/permission contract.
 """
 
 import time
+from http import cookiejar
 
 import frappe
 import requests
-from http import cookiejar
 from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
 from requests.adapters import HTTPAdapter
+
+from frappe_microsoft365 import capabilities
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -23,8 +25,8 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 #: which Microsoft account it is attached to.
 BASE_SCOPE = "User.Read"
 
-#: Capability field on Microsoft Settings -> the delegated scopes it needs. Ordered so the
-#: derived list reads the same way every time.
+#: Capability field on Microsoft Settings -> the delegated scopes it needs, in the order the
+#: derived list reads. Defined in capabilities.py with everything else about each capability.
 #:
 #: The split matters because the permissions are not interchangeable, verified against the
 #: endpoints this app calls (docs/graph-api-reference.md):
@@ -41,11 +43,7 @@ BASE_SCOPE = "User.Read"
 #:
 #: Bundling them forced admins to hand-edit the scope field back down to what their tenant had
 #: actually consented to, which is the failure this split removes.
-CAPABILITY_SCOPES = (
-	("use_calendar", ("Calendars.ReadWrite",)),
-	("use_teams", ("OnlineMeetings.ReadWrite",)),
-	("use_transcripts", ("OnlineMeetingTranscript.Read.All", "OnlineMeetingRecording.Read.All")),
-)
+CAPABILITY_SCOPES = capabilities.delegated_graph_scopes()
 
 #: Added by build_authorize_url, never derived and never valid in an override: MSAL treats
 #: these as reserved and refuses them in the `scopes` argument of the token calls, so an
@@ -82,6 +80,47 @@ class MsGraphError(frappe.ValidationError):
 
 class MsGraphResyncRequired(MsGraphError):
 	"""Graph invalidated our delta token (410 Gone). The caller must restart from a full sync."""
+
+
+class MsGraphNotFound(MsGraphError):
+	"""Graph answered 404. Raised separately because "is it there?" is a normal question to ask."""
+
+
+class MsGraphConflict(MsGraphError):
+	"""Graph answered 409 — typically "an item with that name already exists"."""
+
+
+class _App:
+	"""The auth context for calling Graph as the Azure app itself (client credentials).
+
+	Every Graph call states who it acts as. A Microsoft Calendar (doc or name) acts as the person
+	who authorised it, which is right for their mailbox and wrong for a shared document library:
+	files would stop working the day that person leaves. ``APP`` acts as the application and
+	needs an *application* permission (for SharePoint, Sites.Selected, granted per site).
+
+	Nothing ever falls back from one to the other: a call made as APP never uses a person's
+	token, and a delegated call never quietly becomes an application call.
+
+	An object, not a string, so it can never collide with a calendar named the same thing.
+	"""
+
+	name = "app"
+
+	def __repr__(self):
+		return "APP"
+
+
+APP = _App()
+
+#: Client-credential tokens are always requested for the resource's /.default scope; the
+#: permissions in the token are whatever application permissions an admin has consented.
+APP_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+
+APP_TOKEN_CACHE_KEY = "frappe_microsoft365:app_token"
+
+#: Tenant values that name no single directory. Client credentials needs a specific tenant: there
+#: is no "whichever organisation the user belongs to" when no user is involved.
+MULTI_TENANT_AUTHORITIES = ("", "common", "organizations", "consumers")
 
 
 # --- settings helpers ----------------------------------------------------------------
@@ -349,6 +388,102 @@ def get_valid_access_token(calendar):
 	return result.get("access_token")
 
 
+# --- application (client credentials) tokens -------------------------------------------
+
+def app_credentials(settings=None):
+	"""``(tenant, client_id, client_secret)`` for calls made as the app.
+
+	Microsoft advises keeping application and delegated permissions in separate app
+	registrations, so Microsoft Settings has an optional Application access registration of its
+	own. Left empty, the main registration is used for both — simpler, and fine for most sites.
+	"""
+	settings = settings or get_settings()
+	tenant = (settings.tenant_id or "").strip()
+	if tenant.lower() in MULTI_TENANT_AUTHORITIES:
+		frappe.throw(
+			_(
+				"Calling Microsoft as the app needs the Tenant ID of your directory in Microsoft "
+				"Settings, not '{0}'."
+			).format(tenant or "common"),
+			MsGraphError,
+		)
+	client_id = (settings.get("app_client_id") or "").strip()
+	if client_id:
+		secret = get_decrypted_password(
+			"Microsoft Settings", "Microsoft Settings", "app_client_secret", raise_exception=False
+		)
+		if not secret:
+			frappe.throw(
+				_("Microsoft Settings: Application access has a Client ID but no client secret."),
+				MsGraphError,
+			)
+		return tenant, client_id, secret
+	return tenant, settings.client_id, _client_secret()
+
+
+def get_app_access_token():
+	"""A Graph access token for the Azure app itself (client credentials flow).
+
+	Cached in Redis, encrypted with the site key, until five minutes before it expires: each
+	upload or folder listing would otherwise pay a round trip to the login authority. Redis is
+	namespaced per site by frappe.cache(), so one bench serving several sites never shares one.
+	The entry remembers which tenant and client minted it, so changing either in Microsoft
+	Settings can never keep serving the old registration's token.
+	"""
+	import msal
+	from frappe.utils.password import decrypt, encrypt
+
+	tenant, client_id, secret = app_credentials()
+	owner = f"{tenant}/{client_id}"
+
+	# expires=True: the entry is written with an expiry, which set_value keeps out of the
+	# request-local cache. Without it, v15 remembers a miss for the rest of the request, so
+	# every call in that request would mint a fresh token.
+	cached = frappe.cache().get_value(APP_TOKEN_CACHE_KEY, expires=True)
+	if cached and cached.get("owner") == owner:
+		try:
+			return decrypt(cached["token"])
+		except Exception:
+			# A rotated encryption key leaves an unreadable entry; fall through and mint anew.
+			pass
+
+	app = msal.ConfidentialClientApplication(
+		client_id, client_credential=secret, authority=f"https://login.microsoftonline.com/{tenant}"
+	)
+	result = app.acquire_token_for_client(scopes=[APP_GRAPH_SCOPE])
+	if not result or "access_token" not in result:
+		err = (result or {}).get("error_description") or (result or {}).get("error") or "unknown error"
+		frappe.throw(_("Microsoft app sign-in failed: {0}").format(err), MsGraphError)
+
+	ttl = max(int(result.get("expires_in") or 3600) - 300, 60)
+	frappe.cache().set_value(
+		APP_TOKEN_CACHE_KEY,
+		{"owner": owner, "token": encrypt(result["access_token"])},
+		expires_in_sec=ttl,
+	)
+	return result["access_token"]
+
+
+def clear_app_token_cache():
+	"""Forget the app token. Microsoft Settings calls this on every save."""
+	frappe.cache().delete_value(APP_TOKEN_CACHE_KEY)
+
+
+def _token_for(auth):
+	if auth is APP:
+		return get_app_access_token()
+	return get_valid_access_token(auth)
+
+
+def _force_refresh(auth):
+	"""Make the next _token_for(auth) mint a new token instead of resending the refused one."""
+	if auth is APP:
+		clear_app_token_cache()
+		return
+	frappe.db.set_value("Microsoft Calendar", auth, "token_expiry", add_to_date(now_datetime(), seconds=-60))
+	clear_token_cache(auth)
+
+
 # --- authenticated Graph requests ----------------------------------------------------
 
 _session = None
@@ -405,37 +540,48 @@ def _release(resp):
 	resp.close()
 
 
-def graph_request(method, path, calendar, json=None, params=None, headers=None, raw=False, stream=False, _retried=False):
+def graph_request(
+	method, path, auth, json=None, params=None, headers=None, raw=False, stream=False,
+	data=None, timeout=30, _retried=False,
+):
 	"""Authenticated Graph v1.0 call. Refreshes the token once on 401 and retries.
+
+	`auth` says who the call acts as: a Microsoft Calendar (doc or name) for a delegated call, or
+	APP to call as the application itself (client credentials). See _App.
 
 	`path` is relative to GRAPH_BASE (e.g. '/me/events') or an absolute graph URL.
 	Returns parsed JSON (or the requests.Response when raw=True).
 
 	`stream` leaves the body on the wire for the caller to consume in chunks — a Teams recording
 	runs to gigabytes, and buffering one to hand back a .content is how a worker gets killed.
+
+	`data` sends a raw body (bytes or a file-like object) instead of JSON — a file upload.
 	"""
-	name = calendar if isinstance(calendar, str) else calendar.name
-	token = get_valid_access_token(name)
+	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
+	token = _token_for(name)
 	url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
 	req_headers = {"Authorization": f"Bearer {token}"}
 	if headers:
 		req_headers.update(headers)
-	resp = _http_request(
-		method, url, json=json, params=params, headers=req_headers, timeout=30, stream=stream
-	)
+	kwargs = {"params": params, "headers": req_headers, "timeout": timeout, "stream": stream}
+	if data is not None:
+		kwargs["data"] = data
+	else:
+		kwargs["json"] = json
+	resp = _http_request(method, url, **kwargs)
 
-	if resp.status_code == 401 and not _retried:
+	if resp.status_code == 401 and not _retried and not hasattr(data, "read"):
 		# Force refresh then retry once. Dropping the cached token is half of the force: without
-		# it the retry would resolve to the very token Graph has just rejected.
-		frappe.db.set_value("Microsoft Calendar", name, "token_expiry", add_to_date(now_datetime(), seconds=-60))
-		clear_token_cache(name)
+		# it the retry would resolve to the very token Graph has just rejected. A body that was a
+		# stream has already been consumed, so that one cannot be replayed and falls through.
+		_force_refresh(name)
 		_release(resp)
 		return graph_request(
 			method, path, name, json=json, params=params, headers=headers,
-			raw=raw, stream=stream, _retried=True,
+			raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
 		)
 
-	if resp.status_code == 429 and not _retried:
+	if resp.status_code == 429 and not _retried and not hasattr(data, "read"):
 		# Honour Retry-After for short waits; longer backoffs are left to the next run.
 		wait = _retry_after_seconds(resp)
 		if wait is not None:
@@ -443,7 +589,7 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 			_release(resp)
 			return graph_request(
 				method, path, name, json=json, params=params, headers=headers,
-				raw=raw, stream=stream, _retried=True,
+				raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
 			)
 
 	if resp.status_code == 429:
@@ -464,7 +610,8 @@ def graph_request(method, path, calendar, json=None, params=None, headers=None, 
 	if resp.status_code >= 400:
 		detail = _safe_error(resp)
 		_release(resp)
-		frappe.throw(f"Microsoft Graph {method} {path} failed ({resp.status_code}): {detail}", MsGraphError)
+		exc = {404: MsGraphNotFound, 409: MsGraphConflict}.get(resp.status_code, MsGraphError)
+		frappe.throw(f"Microsoft Graph {method} {path} failed ({resp.status_code}): {detail}", exc)
 
 	if raw or stream:
 		# `stream` too: touching .content below would pull the whole body into memory, which is
@@ -505,7 +652,7 @@ def _retry_after_seconds(resp):
 	return max(wait, 1)
 
 
-def graph_paged(path, calendar, headers=None, max_pages=MAX_PAGES):
+def graph_paged(path, auth, headers=None, max_pages=MAX_PAGES):
 	"""GET every page of a Graph collection, following ``@odata.nextLink``.
 
 	Graph caps page size (``$top`` is a hint, not a guarantee), so any collection read that
@@ -514,7 +661,7 @@ def graph_paged(path, calendar, headers=None, max_pages=MAX_PAGES):
 	items = []
 	next_path = path
 	for _page in range(max_pages):
-		resp = graph_request("GET", next_path, calendar, headers=headers)
+		resp = graph_request("GET", next_path, auth, headers=headers)
 		items.extend(resp.get("value") or [])
 		next_path = resp.get("@odata.nextLink")
 		if not next_path:
@@ -522,7 +669,7 @@ def graph_paged(path, calendar, headers=None, max_pages=MAX_PAGES):
 	return items
 
 
-def graph_delta(path, calendar, headers=None, max_pages=MAX_PAGES):
+def graph_delta(path, auth, headers=None, max_pages=MAX_PAGES):
 	"""Follow a delta query to the end. Returns ``(items, delta_link)``.
 
 	``delta_link`` is the ``@odata.deltaLink`` to pass back on the next run; it is only
@@ -533,7 +680,7 @@ def graph_delta(path, calendar, headers=None, max_pages=MAX_PAGES):
 	next_path = path
 	delta_link = None
 	for _page in range(max_pages):
-		resp = graph_request("GET", next_path, calendar, headers=headers)
+		resp = graph_request("GET", next_path, auth, headers=headers)
 		items.extend(resp.get("value") or [])
 		delta_link = resp.get("@odata.deltaLink")
 		next_path = resp.get("@odata.nextLink")

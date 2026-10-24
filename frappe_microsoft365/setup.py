@@ -23,11 +23,19 @@ def after_migrate():
 
 
 def setup():
-	"""Everything this app needs present on a site. Idempotent, safe to re-run."""
+	"""Everything this app needs present on a site. Idempotent, safe to re-run.
+
+	What an optional capability needs (the File fields for SharePoint storage, say) is created
+	when its tickbox is switched on, not here, so a site that never uses it never gets it. On
+	migrate it is refreshed only for the capabilities that are on.
+	"""
+	from frappe_microsoft365 import capabilities
+
 	create_event_custom_fields()
+	capabilities.ensure_enabled_capabilities()
 
 
-def create_event_custom_fields():
+def create_event_custom_fields(only_definitions=False):
 	"""Add Microsoft-sync custom fields to the Event doctype (idempotent)."""
 	custom_fields = {
 		"Event": [
@@ -131,7 +139,7 @@ def create_event_custom_fields():
 				# needs width but no index.
 				"length": 1000,
 				"description": "Use the Join Meeting button above.",
-							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_web_link",
@@ -143,7 +151,7 @@ def create_event_custom_fields():
 				# Small Text rather than Data: webLink can be very long and, unlike the event
 				# id, is never looked up, so there is no index to preserve.
 				"description": "Also available as a button above.",
-							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_organizer",
@@ -157,7 +165,7 @@ def create_event_custom_fields():
 				# varchar(140) default. Nothing queries this column, so the width is free.
 				"length": 254,
 				"description": "The Microsoft account that organized this event.",
-							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_my_response",
@@ -171,7 +179,7 @@ def create_event_custom_fields():
 				# leading blank covers an event Microsoft has said nothing about yet.
 				"options": "\nnone\norganizer\ntentativelyAccepted\naccepted\ndeclined\nnotResponded",
 				"description": "Your reply to this invitation, as Microsoft has it.",
-							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 			{
 				"fieldname": "custom_microsoft_online_meeting_id",
@@ -256,8 +264,139 @@ def create_event_custom_fields():
 				# unlike custom_microsoft_event_id nothing ever queries this column, so there is
 				# no index to keep inside InnoDB's 3072-byte key limit.
 				"description": "Everyone invited, with their reply. Refreshed by each sync.",
-							"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
+				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
 		]
 	}
+	if only_definitions:
+		return custom_fields
 	create_custom_fields(custom_fields, ignore_validate=True)
+
+
+FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nFailed"
+
+
+def create_file_custom_fields(only_definitions=False):
+	"""Fields on File that record where an attachment lives in SharePoint (idempotent).
+
+	Created when SharePoint document storage is switched on (capabilities.py), never before.
+
+	Custom fields rather than a side table: every reader of File — permissions, copies made by
+	create_attachment_copy, the File list — already carries them along, and a moved File is still
+	just a File.
+	"""
+	custom_fields = {
+		"File": [
+			{
+				"fieldname": "custom_microsoft_section",
+				"fieldtype": "Section Break",
+				"label": "Microsoft 365",
+				"insert_after": "uploaded_to_google_drive"
+				if frappe.db.has_column("File", "uploaded_to_google_drive")
+				else "content_hash",
+				"collapsible": 1,
+				"depends_on": "eval:doc.custom_microsoft_status",
+			},
+			{
+				"fieldname": "custom_microsoft_status",
+				"fieldtype": "Select",
+				"label": "SharePoint Status",
+				"options": FILE_STATUS_OPTIONS,
+				"insert_after": "custom_microsoft_section",
+				"read_only": 1,
+				# In the File list, so what has moved is visible at a glance. The status rather
+				# than an "Uploaded to SharePoint" tick: Archived and Failed fit no yes/no.
+				"in_list_view": 1,
+				"in_standard_filter": 1,
+				"search_index": 1,
+				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
+			},
+			{
+				"fieldname": "custom_microsoft_web_url",
+				"fieldtype": "Small Text",
+				"label": "Open in SharePoint",
+				"insert_after": "custom_microsoft_status",
+				"read_only": 1,
+				# A SharePoint web URL carries the site, library, folders and file name, percent-
+				# encoded, and passes Frappe's 140-char default for any long file or customer
+				# name. At 140 the write failed AFTER the upload, the job died before recording
+				# the attempt, and the hourly retry uploaded the file again, every hour, as
+				# "name (1).pdf", "name (2).pdf", ... Nothing queries it: width, no index.
+				# Small Text, not a long Data: a varchar(1000) here beside the indexed
+				# local_url varchar(768) took a busy tabFile (ROW_FORMAT=COMPRESSED, other
+				# apps' columns and indexes) past InnoDB's 8126-byte row limit, and migrate
+				# failed. TEXT has no width to outgrow and does not count against the limit.
+			},
+			{
+				"fieldname": "custom_microsoft_error",
+				"fieldtype": "Small Text",
+				"label": "Last SharePoint Error",
+				"insert_after": "custom_microsoft_web_url",
+				"read_only": 1,
+				"depends_on": "eval:doc.custom_microsoft_status == 'Failed'",
+			},
+			{
+				"fieldname": "custom_microsoft_column",
+				"fieldtype": "Column Break",
+				"insert_after": "custom_microsoft_error",
+			},
+			{
+				"fieldname": "custom_microsoft_drive_id",
+				"fieldtype": "Data",
+				"label": "Drive ID",
+				"insert_after": "custom_microsoft_column",
+				"read_only": 1,
+				# Graph ids have no documented maximum; drive ids run to ~66 characters and item
+				# ids to ~34. 255 leaves headroom without widening every File row for nothing.
+				"length": 255,
+			},
+			{
+				"fieldname": "custom_microsoft_item_id",
+				"fieldtype": "Data",
+				"label": "Item ID",
+				"insert_after": "custom_microsoft_drive_id",
+				"read_only": 1,
+				"search_index": 1,
+				"length": 255,
+			},
+			{
+				"fieldname": "custom_microsoft_local_url",
+				"fieldtype": "Data",
+				"label": "Original URL",
+				"insert_after": "custom_microsoft_item_id",
+				"read_only": 1,
+				"search_index": 1,
+				# The local file URL before the move: as long as the file name. Indexed, because
+				# every old link is looked up by it, so 768, the widest utf8mb4 column InnoDB can
+				# still index.
+				"length": 768,
+				"description": "Where the file was on this server before it moved. Old links to it are redirected to SharePoint. With Keep a local copy on, the copy is still there and is served if the SharePoint copy disappears.",
+			},
+			{
+				"fieldname": "custom_microsoft_attempts",
+				"fieldtype": "Int",
+				"label": "Upload Attempts",
+				"insert_after": "custom_microsoft_local_url",
+				"read_only": 1,
+			},
+		]
+	}
+	if only_definitions:
+		return custom_fields
+	create_custom_fields(custom_fields, ignore_validate=True)
+
+
+def app_custom_fields():
+	"""Every custom field this app adds, as ``{doctype: [fieldname, ...]}``. Used by uninstall."""
+	from frappe_microsoft365.microsoft_files import FILES_TAB_FIELDS
+
+	out = {}
+	for definitions in (create_event_custom_fields(True), create_file_custom_fields(True)):
+		for doctype, fields in definitions.items():
+			out.setdefault(doctype, []).extend(f["fieldname"] for f in fields)
+	# The Microsoft 365 Files tab, on whichever DocTypes a mapping put it.
+	for row in frappe.get_all(
+		"Custom Field", filters={"fieldname": ["in", FILES_TAB_FIELDS]}, fields=["dt", "fieldname"]
+	):
+		out.setdefault(row.dt, []).append(row.fieldname)
+	return out

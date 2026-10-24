@@ -1,0 +1,233 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:reference_doctype",
+ "creation": "2026-10-07 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "how_it_works_section",
+  "how_it_works",
+  "main_section",
+  "enabled",
+  "reference_doctype",
+  "folder_creation",
+  "folder_roles",
+  "site_url",
+  "library",
+  "column_break_where",
+  "use_base_folder",
+  "base_folder",
+  "folder_pattern",
+  "options_section",
+  "keep_local_copy",
+  "options_column",
+  "delete_remote",
+  "files_panel",
+  "folders_section",
+  "folders",
+  "resolved_section",
+  "site_id",
+  "column_break_resolved",
+  "drive_id"
+ ],
+ "fields": [
+  {
+   "collapsible": 1,
+   "fieldname": "how_it_works_section",
+   "fieldtype": "Section Break",
+   "label": "How it works"
+  },
+  {
+   "fieldname": "how_it_works",
+   "fieldtype": "HTML",
+   "label": "How It Works",
+   "options": "<div class='text-muted small'><ol style='padding-left:18px;margin:0'><li>Each record of the DocType below can have its own folder in SharePoint, named by <b>Folder Name Pattern</b>. With <b>Folder Creation</b> set to <i>Automatic</i> it is created on the record's first attachment; with <i>On demand</i>, only when someone asks: on the record, use <b>SharePoint › Create folder</b> in the toolbar or <b>Create folder now</b> in the <b>Files in Microsoft 365</b> panel at the top of the form; or add a SharePoint Folder.</li><li>Files attached to a record that has a folder (sidebar attachments, not image or Attach fields) are moved into it in the background a few seconds later. They keep opening from the record, through the ERP's own permissions.</li><li>Files people save into the folder from Teams or SharePoint show in the record's <b>Files in Microsoft 365</b> panel, at the top of its form.</li><li>Nothing is deleted from SharePoint unless <b>Microsoft Settings</b> says so, and then only to the site recycle bin.</li></ol><p style='margin:8px 0 0'><b>Setting up:</b> paste the site URL (for a Teams channel: Files tab › Open in SharePoint), save, click <b>Site Grant Script</b> and have a SharePoint admin run it, then click <b>Test</b>. <b>Standard channel:</b> keep <i>Group record folders in a base folder</i> on and use the channel name as Base Folder. <b>Private or shared channel:</b> use the channel's own site and untick it, so record folders sit directly in the channel.</p></div>"
+  },
+  {
+   "fieldname": "main_section",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Enabled"
+  },
+  {
+   "description": "Attachments on records of this DocType are stored in SharePoint. One mapping per DocType.",
+   "fieldname": "reference_doctype",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "DocType",
+   "options": "DocType",
+   "reqd": 1,
+   "set_only_once": 1,
+   "unique": 1
+  },
+  {
+   "default": "Automatic",
+   "description": "<b>Automatic:</b> every record gets a folder on its first attachment, and all its attachments move to SharePoint.<br><b>On demand:</b> nothing moves until someone creates the record's folder (SharePoint › Create folder in the record's toolbar, or Add Row in Folders below). From then on that record's attachments move; other records stay on this server.",
+   "fieldname": "folder_creation",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Folder Creation",
+   "options": "Automatic\nOn demand",
+   "reqd": 1
+  },
+  {
+   "description": "The site that owns the library, e.g. https://contoso.sharepoint.com/sites/Sales. For a Microsoft Teams team, open the channel's Files tab and choose Open in SharePoint.",
+   "fieldname": "site_url",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "SharePoint Site URL",
+   "reqd": 1,
+   "length": 1000
+  },
+  {
+   "default": "Documents",
+   "description": "The library's display name. Teams channel files live in Documents (shown in SharePoint as Shared Documents).",
+   "fieldname": "library",
+   "fieldtype": "Data",
+   "label": "Document Library",
+   "length": 1000
+  },
+  {
+   "fieldname": "column_break_where",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "description": "<b>On:</b> record folders go inside the Base Folder below. Use this for a standard Teams channel, with the channel name as Base Folder.<br><b>Off:</b> record folders go straight into the library. Use this for a private or shared channel, which has a site of its own, so they appear directly in the channel's Files tab.",
+   "fieldname": "use_base_folder",
+   "fieldtype": "Check",
+   "label": "Group record folders in a base folder"
+  },
+  {
+   "depends_on": "eval:doc.use_base_folder",
+   "description": "Path inside the library, created if missing. For a standard Teams channel this is the channel name, e.g. Projects. Nested paths like Projects/2026 work.",
+   "fieldname": "base_folder",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Base Folder",
+   "mandatory_depends_on": "eval:doc.use_base_folder",
+   "length": 1000
+  },
+  {
+   "default": "{name}",
+   "description": "One folder per record, named from its fields: {name}, {title}, or any {fieldname}, e.g. {name} - {customer}. Characters SharePoint does not allow are replaced.",
+   "fieldname": "folder_pattern",
+   "fieldtype": "Data",
+   "label": "Folder Name Pattern",
+   "length": 1000
+  },
+  {
+   "fieldname": "options_section",
+   "fieldtype": "Section Break",
+   "label": "Options",
+   "collapsible": 1,
+   "description": "Each option follows SharePoint Settings unless set here for this DocType."
+  },
+  {
+   "fieldname": "keep_local_copy",
+   "fieldtype": "Select",
+   "label": "Keep a local copy after upload",
+   "options": "Default\nOn\nOff",
+   "default": "Default",
+   "description": "<b>Default:</b> as in SharePoint Settings.<br><b>On:</b> this DocType's files keep their copy on this server too, e.g. while trialling it.<br><b>Off:</b> the copy on this server is deleted once the file is in SharePoint."
+  },
+  {
+   "fieldname": "options_column",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "delete_remote",
+   "fieldtype": "Select",
+   "label": "Remove from SharePoint when the attachment is deleted",
+   "options": "Default\nOn\nOff",
+   "default": "Default",
+   "description": "<b>Default:</b> as in SharePoint Settings.<br><b>On:</b> deleting one of this DocType's attachments sends its SharePoint copy to the site's recycle bin.<br><b>Off:</b> the SharePoint copy is always kept, e.g. for records that must be retained."
+  },
+  {
+   "fieldname": "files_panel",
+   "fieldtype": "Select",
+   "label": "Files Panel",
+   "options": "Top of form\nOwn tab\nHidden",
+   "default": "Top of form",
+   "description": "Where this DocType's forms show <b>Files in Microsoft 365</b>.<br><b>Top of form:</b> above the first tab's fields.<br><b>Own tab:</b> a <i>Microsoft 365 Files</i> tab at the end of the form.<br><b>Hidden:</b> no panel. Files still move and open from the record, and the SharePoint toolbar menu stays."
+  },
+  {
+   "fieldname": "folders_section",
+   "fieldtype": "Section Break",
+   "label": "Folders",
+   "depends_on": "eval:!doc.__islocal"
+  },
+  {
+   "fieldname": "folders",
+   "fieldtype": "Table",
+   "label": "Folders",
+   "options": "SharePoint Folder",
+   "description": "One row per record that has a SharePoint folder. The app adds rows as records get their folder. <b>Add Row</b> to give a record one by hand: pick the record and Save; the folder is created where this mapping says, or linked if you paste one in Existing Folder. <b>Delete</b> removes only the link: the folder and its files stay in SharePoint."
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "resolved_section",
+   "fieldtype": "Section Break",
+   "label": "Resolved by Microsoft"
+  },
+  {
+   "description": "Looked up from the URL on first use. Cleared whenever the URL or library changes.",
+   "fieldname": "site_id",
+   "fieldtype": "Data",
+   "label": "Site ID",
+   "read_only": 1,
+   "length": 255
+  },
+  {
+   "fieldname": "column_break_resolved",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "drive_id",
+   "fieldtype": "Data",
+   "label": "Drive ID",
+   "read_only": 1,
+   "length": 255
+  },
+  {
+   "description": "Who may click <b>Create folder</b> on a record that has no folder yet. They must also be able to edit the record.<br><b>Empty:</b> System Managers only.<br><b>Roles listed:</b> System Managers, plus users with any of these roles.",
+   "fieldname": "folder_roles",
+   "fieldtype": "Table MultiSelect",
+   "label": "Who can create folders",
+   "options": "SharePoint Mapping Role"
+  }
+ ],
+ "links": [],
+ "modified": "2026-10-23 13:00:00",
+ "module": "Frappe Microsoft 365",
+ "name": "SharePoint Mapping",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "show_title_field_in_link": 0,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "reference_doctype",
+ "track_changes": 1
+}

@@ -25,6 +25,7 @@ import frappe
 from frappe import _
 from frappe.utils.password import get_decrypted_password
 
+from frappe_microsoft365 import capabilities as capability_registry
 from frappe_microsoft365 import doctor
 from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE_ACCESS
@@ -105,12 +106,10 @@ def social_login_key_values(settings):
 
 # --- capability registry --------------------------------------------------------------
 
-#: Capability id -> the Microsoft Settings field that turns it on. Only the Graph capabilities
-#: appear here; mail and sign-in are not Graph scopes at all.
+#: Capability id -> the Microsoft Settings field that turns it on, for the capabilities our own
+#: sign-in requests Graph scopes for. Mail and sign-in are not Graph scopes at all.
 GRAPH_CAPABILITY_FIELDS = {
-	"calendar": "use_calendar",
-	"teams": "use_teams",
-	"transcripts": "use_transcripts",
+	c.id: c.field for c in capability_registry.all_capabilities() if c.access == capability_registry.DELEGATED
 }
 
 
@@ -127,81 +126,29 @@ def _graph_azure_permissions(field):
 
 def capabilities():
 	"""What each capability needs from Azure, and what this app will create for it."""
-	return [
-		{
-			"id": "calendar",
-			"label": _("Outlook calendar"),
-			"creates": _("Nothing — this app talks to Graph directly."),
-			"azure": _graph_azure_permissions("use_calendar"),
-			"azure_type": _("Microsoft Graph, Delegated"),
-			"note": _(
-				"Covers the Add Teams meeting tickbox on an Event too: Microsoft creates the "
-				"Teams link as part of the event, so no meeting permission is involved. Each "
-				"user authorises their own Microsoft Calendar."
-			),
-		},
-		{
-			"id": "teams",
-			"label": _("Standalone Teams meetings"),
-			"creates": _("Nothing — this app talks to Graph directly."),
-			"azure": _graph_azure_permissions("use_teams"),
-			"azure_type": _("Microsoft Graph, Delegated"),
-			"note": _(
-				"Only for meetings created outside a calendar event, and for resolving a join "
-				"URL back to a meeting. Tenants commonly refuse this one; leave it off unless "
-				"something asks for it."
-			),
-		},
-		{
-			"id": "transcripts",
-			"label": _("Meeting transcripts and recordings"),
-			"creates": _("Nothing — this app talks to Graph directly."),
-			"azure": _graph_azure_permissions("use_transcripts"),
-			"azure_type": _("Microsoft Graph, Delegated"),
-			"note": _(
-				"Transcripts are reached through the meeting behind a join URL, so this builds on "
-				"standalone Teams meetings. The meeting must also be calendar-associated and not "
-				"expired, or Graph returns nothing."
-			),
-		},
-		{
-			"id": "mail",
-			"label": _("Outlook mail"),
-			"creates": _("A Connected App named '{0}' for Frappe's Email Account.").format(MAIL_APP_NAME),
-			"azure": [
-				DELEGATED_SCOPES["imap"],
-				DELEGATED_SCOPES["smtp"],
-				"offline_access",
-			],
-			"azure_type": _("Office 365 Exchange Online, Delegated"),
-			"note": _(
-				"Mail itself stays with Frappe's Email Account. For shared mailboxes choose the "
-				"Application method, which also needs IMAP.AccessAsApp / SMTP.SendAsApp plus the "
-				"Exchange setup script."
-			),
-		},
-		{
-			"id": "sso",
-			"label": _("Sign in with Microsoft"),
-			"creates": _("A Social Login Key named '{0}'.").format(SSO_KEY_NAME),
-			"azure": ["openid", "email", "profile"],
-			"azure_type": _("Microsoft Graph, Delegated"),
-			"note": _(
-				"New visitors cannot self-register by default; existing users with a matching "
-				"email can sign in."
-			),
-		},
-	]
+	out = []
+	for capability in capability_registry.all_capabilities():
+		if capability.access == capability_registry.DELEGATED:
+			azure = _graph_azure_permissions(capability.field)
+		else:
+			azure = list(capability.azure_permissions)
+		out.append(
+			{
+				"id": capability.id,
+				"label": _(capability.label),
+				"access": capability.access,
+				"creates": _(capability.creates).format(mail_app=MAIL_APP_NAME, sso_key=SSO_KEY_NAME),
+				"azure": azure,
+				"azure_type": _(capability.azure_type),
+				"note": _(capability.note),
+			}
+		)
+	return out
 
 
 def selected_capabilities(settings):
 	"""The capability ids ticked in Microsoft Settings, in the order capabilities() lists them."""
-	chosen = []
-	for capability in capabilities():
-		field = GRAPH_CAPABILITY_FIELDS.get(capability["id"]) or f"use_{capability['id']}"
-		if settings.get(field):
-			chosen.append(capability["id"])
-	return chosen
+	return [c.id for c in capability_registry.ticked(settings)]
 
 
 # --- plan / apply ---------------------------------------------------------------------
@@ -233,6 +180,7 @@ def _settings():
 		"use_transcripts": doc.get("use_transcripts"),
 		"use_mail": doc.use_mail,
 		"use_sso": doc.use_sso,
+		"use_files": doc.get("use_files"),
 		"mail_flow": doc.mail_flow or "Delegated",
 	}
 
@@ -308,6 +256,21 @@ def plan():
 			steps.append(_plan_mail(settings))
 		elif capability["id"] == "sso":
 			steps.append(_plan_sso(settings))
+		elif capability["access"] == capability_registry.APPLICATION:
+			# What these need on the site is put there when the tickbox is saved; what is left
+			# is Azure-side and per resource, which nothing here can do on the admin's behalf.
+			steps.append(
+				_step(
+					capability["id"],
+					EXISTS,
+					"",
+					_(
+						"Nothing to create. Grant the application permission listed, then follow "
+						"the capability's own settings page (for SharePoint: SharePoint Settings "
+						"and a SharePoint Mapping)."
+					),
+				)
+			)
 		else:
 			# Graph capabilities create no Frappe records at all; the only work is granting the
 			# listed permissions in Azure, which nothing here can do on the admin's behalf.
@@ -323,6 +286,10 @@ def plan():
 	blockers = []
 	if not (settings.get("tenant_id") or "").strip() or not (settings.get("client_id") or "").strip():
 		blockers.append(_("Tenant ID and Client ID must be filled in before anything can be created."))
+	if "files" in chosen and (settings.get("tenant_id") or "").strip().lower() in graph.MULTI_TENANT_AUTHORITIES:
+		blockers.append(
+			_("SharePoint document storage runs as the app, which needs your directory's Tenant ID, not 'common'.")
+		)
 	if not settings.get("client_secret") and ("mail" in chosen or "sso" in chosen):
 		blockers.append(
 			_("A Client Secret is required for mail and sign-in. Add it in Microsoft Settings first.")

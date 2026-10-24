@@ -1,5 +1,99 @@
 # Changelog
 
+## Unreleased — SharePoint document storage
+
+SharePoint document storage was built by David Eleben (@eleben) in his fork
+(`eleben/frappe_microsoft365`, branch `feature/sharepoint-files`) and brought into this app as a
+capability, with the changes listed under *Changed from the original*.
+
+### Added
+
+- **Document Storage**: a *SharePoint Mapping* per DocType points it at a SharePoint site,
+  library and base folder (a Teams channel's Files tab is just that), with its own Test, Site
+  Grant Script and Move Existing Attachments; the global switch and options live in Microsoft
+  Settings.
+- **Automatic or On demand** per mapping: on demand, a record's files move only once someone
+  creates its folder (from the record, or a row in the mapping's Folders table); a row can
+  also link a folder that already exists in SharePoint. Each record gets its own folder; new
+  attachments are moved there by a background job and keep opening from the form, and the copy
+  on disk is removed unless *Keep a local copy* is ticked. Large files go through resumable
+  upload sessions. Failed moves are marked on the File and retried hourly.
+- **Files in Microsoft 365** panel on mapped forms: the folder's contents, including files added
+  from Teams or SharePoint, opened through Frappe with the record's own read permission.
+  *Files Panel* on each mapping puts it at the top of the form (default), in its own
+  *Microsoft 365 Files* tab, or hides it.
+- **App-only Graph calls**: `graph_request(..., microsoft_graph.APP)` uses the client
+  credentials flow, with the token cached encrypted per site. Document storage needs the
+  `Sites.Selected` application permission and a per-site grant — never tenant-wide
+  `Sites.ReadWrite.All`.
+- **SharePoint Settings**: its own page in the sidebar for the storage options, attachment counts,
+  tools and the site grant script; Microsoft Settings keeps only the capability tickbox.
+- The app's sidebar is shipped in both v16 formats: `<module>/sidebar/` (Frappe 16.4x and later)
+  and `workspace_sidebar/` (earlier v16 releases), so every page is listed on either.
+- Record folders are the *Folders* table of their SharePoint Mapping (Add Row to create or link
+  one, Delete to forget one); the sidebar's
+  SharePoint section lists only the mappings.
+- Per-mapping *Options*: a SharePoint Mapping can set *Keep a local copy* and *Remove from
+  SharePoint when the attachment is deleted* to On or Off for its DocType, or follow SharePoint
+  Settings (Default).
+- [User guide](docs/sharepoint-user-guide.md) for SharePoint document storage: everyday use, setup on
+  both the Microsoft and Frappe sides, administration and troubleshooting.
+- Doctor: Document Storage checks, a *Test SharePoint Connection* that proves write access per
+  mapping, and a *SharePoint Site Grant Script* that grants the app only the mapped sites.
+- *Move Existing Attachments* queues files attached before a DocType was mapped. Optional
+  archiving of linked attachments, SSRF-guarded to public addresses.
+- The File list shows each file's **SharePoint Status** (Pending, Stored, Archived, Failed), so
+  what has moved is visible without opening each file. (Suggested by @kgrininger)
+
+- **Clean uninstall**: attachments in SharePoint are brought back to the server (only if the disk
+  has room) or turned into SharePoint links, as chosen in Microsoft Settings; the uninstall stops
+  rather than guess or leave one broken. Then every custom field the app added to Event and File
+  is deleted and its column dropped. A dry run only reports.
+
+Nothing is deleted from SharePoint unless *Remove from SharePoint when the attachment is
+deleted* is ticked, and then only to the site recycle bin. Deleting a record keeps its folder.
+
+### Changed from the original
+
+- **One capability registry** (`capabilities.py`): each tickbox on Microsoft Settings is defined
+  once — label, whether it acts as a person or as the app, Azure permissions, prerequisites,
+  minimum Frappe version, and what to create when it is switched on. Scopes, Set Up, the doctor
+  and the Settings form all read it.
+- **Off means off**: the File fields are created when storage is switched on, not on install, and
+  every hook returns before doing any work while it is off.
+- **App auth context** `microsoft_graph.APP` replaces the `APP_ONLY` marker; an optional separate
+  *Application Access* registration on Microsoft Settings; the app token is keyed to the tenant
+  and client that minted it and dropped whenever Microsoft Settings is saved.
+- **Frappe v16 only** for storage: the tickbox is refused on v15, where moved files could not be
+  read server-side.
+- **Only known-safe types open inline** (PDF, images other than SVG, plain text, audio, video);
+  everything else, including files without an extension, downloads.
+- `File.get_content` no longer depends on a Frappe constant some v16 releases lack.
+- The fork's intermediate-DocType migration patches are not carried over: the DocTypes are
+  created in their final form, and a site upgrading from the fork already has them.
+
+### Fixed from the original (found in testing)
+
+- **A file was uploaded again every hour.** A SharePoint address longer than 140 characters
+  (any long file or record name) could not be saved after the upload, the attempt was never
+  counted, and the hourly retry uploaded the file again, as `name (1).pdf`, `name (2).pdf`, ...
+  Addresses now have room (the SharePoint address is a text field, so a wide column can't take
+  a busy `tabFile` past MariaDB's row-size limit on migrate), every attempt counts before any
+  work, and a retry resumes from the upload it already made. Copies already in SharePoint are not deleted:
+  remove the extras by hand.
+- **The Files panel's Modified column showed raw HTML**, and its times were off by the site's
+  UTC offset (a file saved two minutes ago showed as hours old on an India site).
+- **Script changes did not reach browsers after a deploy.** The panel script is now a bundle with
+  a new file name for every version, like the doctor script in 1.0.2.
+- **A changed Files panel setting reached nobody until they signed in again.** Saving a mapping,
+  or switching storage on or off, now takes effect on everyone's next page load, and at once on
+  the desk that saved it. A deleted mapping also no longer goes on storing files. (@eleben)
+- **The Site Grant Script left PowerShell waiting at `>>` when pasted.** Each grant is now one
+  line and the script ends with a line break, so it runs as pasted; the mapping form's dialog has
+  a Copy button too. (Found by @kgrininger)
+- **The panel said "Empty" right after *Create folder now*** where realtime is blocked. It now
+  says the attachments are moving and lists them as they arrive. (@eleben)
+
 ## 1.0.2 — 2026-10-23
 
 ### Fixed
