@@ -42,6 +42,8 @@ capability, with the changes listed under *Changed from the original*.
   mapping, and a *SharePoint Site Grant Script* that grants the app only the mapped sites.
 - *Move Existing Attachments* queues files attached before a DocType was mapped. Optional
   archiving of linked attachments, SSRF-guarded to public addresses.
+- The File list shows each file's **SharePoint Status** (Pending, Stored, Archived, Failed), so
+  what has moved is visible without opening each file. (Suggested by @kgrininger)
 
 - **Clean uninstall**: attachments in SharePoint are brought back to the server (only if the disk
   has room) or turned into SharePoint links, as chosen in Microsoft Settings; the uninstall stops

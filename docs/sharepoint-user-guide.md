@@ -170,7 +170,7 @@ The record's attachments still on the server then move into the folder. Each rec
 | Archived | A web link whose target was copied into SharePoint; the link itself is unchanged |
 | Failed | Still on the server and still opens; **Last SharePoint Error** says why. Retried hourly, up to 5 times |
 
-To list problem files, open the File list filtered on *SharePoint Status = Failed*. SharePoint Settings shows counts by status, as does the line under the tickbox on Microsoft Settings.
+The File list shows each file's SharePoint Status in its own column (empty for files that never went to SharePoint). To list problem files, filter it on *SharePoint Status = Failed*. SharePoint Settings shows counts by status, as does the line under the tickbox on Microsoft Settings.
 
 **What happens when…**
 
