@@ -129,7 +129,7 @@ Each mapping is its own record, named after its record type, so a type can only 
 | Document Library | `Documents` for Teams. SharePoint shows it as *Shared Documents* |
 | Group record folders in a base folder | On: record folders go inside the Base Folder. Off: they go straight into the library |
 | Base Folder | The folder that holds the record folders, created if missing. Nested paths like `Projects/2026` work |
-| Folder Name Pattern | How each record's folder is named. `{name}` by default; any field works, e.g. `{name} - {customer}`. Characters SharePoint refuses are replaced |
+| Folder Name Pattern | How each record's folder is named. `{name}` by default; `{title}` is the record's title, and any `{fieldname}` works, e.g. `{name} - {title}` gives `DEV-00042 - Scan-Line 920B`. Characters SharePoint refuses are replaced |
 
 **Folder Creation** decides how much moves to SharePoint:
 
@@ -179,6 +179,7 @@ The File list shows each file's SharePoint Status in its own column (empty for f
 | An attachment is deleted in the ERP | SharePoint keeps the file, unless *Remove from SharePoint when the attachment is deleted* is on for that record type, in SharePoint Settings or on its mapping (then it goes to the recycle bin) |
 | A record is deleted | Its SharePoint folder and files stay; only the ERP's link to the folder is removed |
 | A record is renamed | Its folder is renamed to match |
+| A record's title or another field in the pattern changes | The folder keeps its name; only a rename of the record renames it |
 | The folder is renamed or moved in Teams | The link keeps working; the ERP tracks the folder by its id, not its path |
 | The folder is deleted in Teams | The next attachment creates a new folder |
 | The mapping's site or library is changed | New folders go to the new place; existing folders stay where they are |

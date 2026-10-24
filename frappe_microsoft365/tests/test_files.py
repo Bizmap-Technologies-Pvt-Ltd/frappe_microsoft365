@@ -237,6 +237,14 @@ class TestNames(BaseTestCase):
 		self.assertEqual(files.render_pattern("{name} - {customer}{nope}", doc), "PRJ-01 - ACME")
 		self.assertEqual(files.render_pattern("", doc), "PRJ-01")
 
+	def test_pattern_title_is_the_doctypes_title_field(self):
+		note = frappe.get_doc({"doctype": "Note", "title": "Scan-Line 920B"})
+		note.name = "DEV-00042"
+		self.assertEqual(files.render_pattern("{name} - {title}", note), "DEV-00042 - Scan-Line 920B")
+		# No title: the name stands in, so the folder is never called just "DEV-00042 - ".
+		note.title = None
+		self.assertEqual(files.render_pattern("{title}", note), "DEV-00042")
+
 	def test_base_segments_follow_the_tickbox(self):
 		self.assertEqual(files.base_segments(frappe._dict(use_base_folder=1, base_folder="A/B")), ["A", "B"])
 		self.assertEqual(files.base_segments(frappe._dict(use_base_folder=0, base_folder="A/B")), [])
