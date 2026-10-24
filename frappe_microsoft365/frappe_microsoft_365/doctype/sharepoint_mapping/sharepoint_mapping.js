@@ -20,6 +20,12 @@ frappe.ui.form.on("SharePoint Mapping", {
 	onload_post_render(frm) {
 		show_defaults(frm);
 	},
+	after_save() {
+		// Other desks pick the change up on their next page load; this one should not need one.
+		frappe
+			.call("frappe_microsoft365.microsoft_files.files_panel_boot")
+			.then((r) => Object.assign(frappe.boot, r.message || {}));
+	},
 });
 
 // Each override's Default follows SharePoint Settings; say what that is today, so nobody has

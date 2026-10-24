@@ -136,18 +136,41 @@ frappe.provide("frappe_microsoft365.files");
 							indicator: "green",
 						});
 					}
+					this.moving = queued;
 					this.load();
+					if (queued) this.watch_moves();
 				},
 			});
 		}
 
-		load() {
+		// The moves run in the background. The server announces each one (microsoft365_file_moved,
+		// below), but only over realtime; where that is down or blocked the panel would sit on
+		// "Empty" while the files arrive. Look again for a minute, until they are all there.
+		watch_moves(tries = 20) {
+			if (!this.moving || this.frm.microsoft365_files_panel !== this) return;
+			if (!tries) {
+				this.moving = 0;
+				this.load({ quiet: true });
+				return;
+			}
+			setTimeout(() => this.load({ quiet: true, then: () => this.watch_moves(tries - 1) }), 3000);
+		}
+
+		load({ quiet = false, then = null } = {}) {
 			const subfolder = this.trail.length ? this.trail[this.trail.length - 1].id : null;
-			this.$body && this.$body.html(`<div class="text-muted small">${__("Loading…")}</div>`);
+			if (this.$body && !quiet) this.$body.html(`<div class="text-muted small">${__("Loading…")}</div>`);
 			frappe.call({
 				method: `${METHOD}.list_folder`,
 				args: { doctype: this.frm.doctype, name: this.frm.docname, subfolder },
-				callback: (r) => this.render(r.message || {}),
+				callback: (r) => {
+					const data = r.message || {};
+					if (this.moving && !subfolder) {
+						const arrived = (data.items || []).filter((item) => item.attachment).length;
+						if (arrived >= this.moving) this.moving = 0;
+					}
+					this.render(data);
+					then && then();
+				},
 				error: () =>
 					this.$body &&
 					this.$body.html(
@@ -223,9 +246,11 @@ frappe.provide("frappe_microsoft365.files");
 
 			const table = rows.length
 				? `<table class="table table-sm" style="margin:6px 0 0"><tbody>${rows.join("")}</tbody></table>`
-				: `<div class="text-muted small" style="margin-top:6px">${__(
-						"Empty. Attach a file here, or drop one into the folder in Teams.",
-					)}</div>`;
+				: `<div class="text-muted small" style="margin-top:6px">${
+						this.moving
+							? __("Moving {0} attachment(s) here…", [this.moving])
+							: __("Empty. Attach a file here, or drop one into the folder in Teams.")
+					}</div>`;
 
 			this.$body.html(`
 				<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">

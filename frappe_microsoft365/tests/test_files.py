@@ -588,9 +588,10 @@ class TestUpload(FilesTestCase):
 		return [path for method, path in self.graph.calls if method == "PUT"]
 
 	def test_a_failure_after_the_upload_never_uploads_again(self):
-		# Recording the upload fails (here: an address wider than the column) after SharePoint
-		# has the bytes. Before this was handled, every hourly retry uploaded another copy.
-		self.graph.web_url_padding = "x" * 1000
+		# Recording the upload fails (here: an address wider than the column, a TEXT's 64 KB)
+		# after SharePoint has the bytes. Before this was handled, every hourly retry uploaded
+		# another copy.
+		self.graph.web_url_padding = "x" * 70000
 		f = self.attach()
 		files.upload_file(f.name)
 		row = frappe.db.get_value(
@@ -849,6 +850,42 @@ class TestSettings(BaseTestCase):
 		self.panel(mapping, files.PANEL_TAB)
 		self.assertEqual(sorted(app_custom_fields()[MAPPED]), sorted(files.FILES_TAB_FIELDS))
 
+	def seed_cached_boot(self):
+		# Frappe keeps each user's boot until they reload; stand in for a desk already open.
+		frappe.cache().hset("bootinfo", "someone@example.com", {"from_cache": 1})
+		self.addCleanup(frappe.cache().hdel, "bootinfo", "someone@example.com")
+
+	def cached_boot(self):
+		return frappe.cache().hget("bootinfo", "someone@example.com")
+
+	def test_a_new_placement_reaches_desks_on_their_next_load(self):
+		mapping = configure(self)
+		self.seed_cached_boot()
+		self.panel(mapping, files.PANEL_TAB)
+		self.assertIsNone(self.cached_boot())
+		# What the saving desk is handed straight away, and what the others rebuild.
+		self.assertEqual(files.files_panel_boot()["microsoft365_files_panel"], {MAPPED: files.PANEL_TAB})
+
+		self.seed_cached_boot()
+		mapping.delete()
+		self.assertIsNone(self.cached_boot())
+		self.assertNotIn(MAPPED, files.files_panel_boot()["microsoft365_files_doctypes"])
+		self.assertIsNone(files.mapping_for(MAPPED))  # nor go on storing its files
+
+	def test_switching_storage_on_or_off_reaches_desks_on_their_next_load(self):
+		configure(self)
+		settings = frappe.get_doc("Microsoft Settings")
+		settings.flags.ignore_permissions = True
+
+		self.seed_cached_boot()
+		settings.save()  # storage still on: nothing for a desk to pick up
+		self.assertIsNotNone(self.cached_boot())
+
+		settings.use_files = 0
+		settings.save()
+		self.assertIsNone(self.cached_boot())
+		self.assertEqual(files.files_panel_boot()["microsoft365_files_doctypes"], [])
+
 	def test_addresses_names_and_ids_are_not_cut_at_140(self):
 		# Frappe's Data default is varchar(140). SharePoint addresses, paths and names pass it
 		# routinely, and the failed write came after the work was done in SharePoint.
@@ -867,6 +904,19 @@ class TestSettings(BaseTestCase):
 			]
 		for fieldname, length in fields:
 			self.assertGreaterEqual(length or 140, 255, fieldname)
+
+	def test_file_gets_at_most_one_wide_varchar(self):
+		# tabFile is shared with every app on the site and can already be near InnoDB's row
+		# limit: a second wide varchar beside the indexed local_url failed migrate on a
+		# COMPRESSED table. Anything long that is not indexed belongs in a Text field.
+		from frappe_microsoft365.setup import create_file_custom_fields
+
+		wide = [
+			f["fieldname"]
+			for f in create_file_custom_fields(only_definitions=True)["File"]
+			if f["fieldtype"] == "Data" and (f.get("length") or 140) > 255
+		]
+		self.assertEqual(wide, ["custom_microsoft_local_url"])
 
 
 class TestUninstall(FilesTestCase):
