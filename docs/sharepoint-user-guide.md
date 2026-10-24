@@ -75,7 +75,7 @@ From **Overview**, note the **Application (client) ID** and the **Directory (ten
 - It must be under **Microsoft Graph**, as an **Application** permission. The SharePoint API lists a permission with the same name that does not work for this.
 - `Sites.Selected` on its own reaches no site. Step 4 grants the sites.
 
-**4. Grant the app each SharePoint site** it should use, with the role `write`. The ERP generates the script: open the mapping (next section) and click **Site Grant Script**, or copy the one for every mapped site from the **Site Grant Script** section of SharePoint Settings. Run it in Microsoft Graph PowerShell as a SharePoint or Global Administrator.
+**4. Grant the app each SharePoint site** it should use, with the role `write`. The ERP generates the script: open the mapping (next section) and click **Site Grant Script**, or copy the one for every mapped site from the **Site Grant Script** section of SharePoint Settings. Click **Copy**, paste it into a Microsoft Graph PowerShell window and press Enter, as a SharePoint or Global Administrator. Each line is a complete command, so it runs as pasted.
 
 Without PowerShell, use Graph Explorer: consent to `Sites.FullControl.All` for your own session, click **Reload**, then `GET /sites/<tenant>.sharepoint.com:/sites/<SiteName>` to get the site id, and `POST /sites/<site id>/permissions` with this request body:
 

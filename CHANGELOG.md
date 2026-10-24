@@ -86,6 +86,9 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - **A changed Files panel setting reached nobody until they signed in again.** Saving a mapping,
   or switching storage on or off, now takes effect on everyone's next page load, and at once on
   the desk that saved it. A deleted mapping also no longer goes on storing files. (@eleben)
+- **The Site Grant Script left PowerShell waiting at `>>` when pasted.** Each grant is now one
+  line and the script ends with a line break, so it runs as pasted; the mapping form's dialog has
+  a Copy button too. (Found by @kgrininger)
 - **The panel said "Empty" right after *Create folder now*** where realtime is blocked. It now
   says the attachments are moving and lists them as they arrive. (@eleben)
 
