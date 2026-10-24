@@ -1310,6 +1310,19 @@ class TestDoctorFiles(BaseTestCase):
 		self.assertIn('$appId = "APP-ID"', script)
 		self.assertNotIn('FullControl")', script.split("Connect-MgGraph", 1)[1].split("\n", 1)[1])
 
+	def test_site_grant_script_runs_when_pasted(self):
+		# Pasted into a PowerShell window, a line ending inside @{ ... } leaves the shell at ">>"
+		# waiting for more, and a last line without a line break is never run.
+		script = doctor.powershell_for_site_grant(
+			"APP-ID", ["https://c.sharepoint.com/sites/Sales", "https://c.sharepoint.com/teams/Ops"]
+		)
+		self.assertTrue(script.endswith("\n"))
+		for line in script.splitlines():
+			code = line.split("#", 1)[0].rstrip()
+			self.assertFalse(code.endswith(("{", "(", "|", "`", ",", ";")), line)
+			self.assertEqual(code.count("{"), code.count("}"), line)
+			self.assertEqual(code.count("("), code.count(")"), line)
+
 	def test_explain_recognises_the_sharepoint_401(self):
 		out = doctor.explain_error(
 			"Microsoft Graph GET /sites/contoso.sharepoint.com:/sites/Example failed (401): "

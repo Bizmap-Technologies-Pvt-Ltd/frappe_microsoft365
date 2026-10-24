@@ -1369,6 +1369,10 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 	Sites.Selected is consent to be *granted* sites, not access to any; this is the grant. It
 	needs someone who can manage the sites (SharePoint admin or Sites.FullControl.All), which
 	is deliberately not this app.
+
+	Pasted, not saved as a file: one complete statement per line, and a line break at the end.
+	A line ending inside @{ ... } leaves a PowerShell window at ">>" waiting for the rest, and
+	a last line without a line break is never run.
 	"""
 	from frappe_microsoft365.microsoft_files import parse_site_url
 
@@ -1385,17 +1389,16 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 		lines += [
 			f"# {url}",
 			f'$site = Get-MgSite -SiteId "{site_ref}"',
-			"New-MgSitePermission -SiteId $site.Id -BodyParameter @{",
-			f'    roles = @("{role}")',
-			'    grantedToIdentities = @(@{ application = @{ id = $appId; displayName = "Frappe" } })',
-			"}",
+			"New-MgSitePermission -SiteId $site.Id -BodyParameter @{ "
+			f'roles = @("{role}"); '
+			'grantedToIdentities = @(@{ application = @{ id = $appId; displayName = "Frappe" } }) }',
 			"",
 		]
 	lines += [
 		"# Check: lists the apps granted on the last site above",
 		"Get-MgSitePermission -SiteId $site.Id | Format-List Roles, GrantedToIdentities",
 	]
-	return "\n".join(lines)
+	return "\n".join(lines) + "\n"
 
 
 # --- Exchange PowerShell for app-only access ------------------------------------------

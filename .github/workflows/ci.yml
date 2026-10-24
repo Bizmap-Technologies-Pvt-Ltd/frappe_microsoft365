@@ -125,6 +125,21 @@ jobs:
           grep -q '"microsoft_doctor.bundle.js": "/assets/frappe_microsoft365/dist/js/microsoft_doctor.bundle\.[A-Z0-9]*\.js"' sites/assets/assets.json
           grep -q '"microsoft_files.bundle.js": "/assets/frappe_microsoft365/dist/js/microsoft_files.bundle\.[A-Z0-9]*\.js"' sites/assets/assets.json
 
+      - name: Site Grant Script parses in PowerShell
+        working-directory: /home/runner/frappe-bench/sites
+        shell: bash
+        run: |
+          # Administrators paste this script into PowerShell; check it with PowerShell's own parser.
+          ../env/bin/python -c "
+          from frappe_microsoft365.doctor import powershell_for_site_grant
+          print(powershell_for_site_grant('APP-ID', ['https://c.sharepoint.com/sites/Sales', 'https://c.sharepoint.com/teams/Ops']), end='')
+          " > /tmp/site-grant.ps1
+          pwsh -NoProfile -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("/tmp/site-grant.ps1", [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+            "Site Grant Script parses"'
+
       - name: Run tests
         working-directory: /home/runner/frappe-bench
         run: |

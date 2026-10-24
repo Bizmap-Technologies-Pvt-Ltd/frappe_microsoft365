@@ -90,9 +90,13 @@ function grant_script(frm) {
 		method: "frappe_microsoft365.doctor.site_grant_powershell",
 		args: { mapping: frm.doc.name },
 		callback: (r) => {
+			const script = (r.message || {}).script || "";
 			const dialog = new frappe.ui.Dialog({
 				title: __("SharePoint Site Grant Script"),
 				size: "large",
+				// Copied, not selected by hand: a partial selection is what leaves PowerShell at ">>".
+				primary_action_label: __("Copy"),
+				primary_action: () => frappe.utils.copy_to_clipboard(script),
 				fields: [
 					{
 						fieldtype: "HTML",
@@ -107,7 +111,7 @@ function grant_script(frm) {
 					},
 				],
 			});
-			dialog.set_value("script", (r.message || {}).script || "");
+			dialog.set_value("script", script);
 			dialog.show();
 		},
 	});
