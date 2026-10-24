@@ -75,13 +75,19 @@ deleted* is ticked, and then only to the site recycle bin. Deleting a record kee
 - **A file was uploaded again every hour.** A SharePoint address longer than 140 characters
   (any long file or record name) could not be saved after the upload, the attempt was never
   counted, and the hourly retry uploaded the file again, as `name (1).pdf`, `name (2).pdf`, ...
-  Addresses, paths and names now have room (1000), every attempt counts before any work, and a
-  retry resumes from the upload it already made. Copies already in SharePoint are not deleted:
+  Addresses now have room (the SharePoint address is a text field, so a wide column can't take
+  a busy `tabFile` past MariaDB's row-size limit on migrate), every attempt counts before any
+  work, and a retry resumes from the upload it already made. Copies already in SharePoint are not deleted:
   remove the extras by hand.
 - **The Files panel's Modified column showed raw HTML**, and its times were off by the site's
   UTC offset (a file saved two minutes ago showed as hours old on an India site).
 - **Script changes did not reach browsers after a deploy.** The panel script is now a bundle with
   a new file name for every version, like the doctor script in 1.0.2.
+- **A changed Files panel setting reached nobody until they signed in again.** Saving a mapping,
+  or switching storage on or off, now takes effect on everyone's next page load, and at once on
+  the desk that saved it. A deleted mapping also no longer goes on storing files. (@eleben)
+- **The panel said "Empty" right after *Create folder now*** where realtime is blocked. It now
+  says the attachments are moving and lists them as they arrive. (@eleben)
 
 ## 1.0.2 — 2026-10-23
 
