@@ -310,9 +310,8 @@ def create_file_custom_fields(only_definitions=False):
 			},
 			{
 				"fieldname": "custom_microsoft_web_url",
-				"fieldtype": "Data",
+				"fieldtype": "Small Text",
 				"label": "Open in SharePoint",
-				"options": "URL",
 				"insert_after": "custom_microsoft_status",
 				"read_only": 1,
 				# A SharePoint web URL carries the site, library, folders and file name, percent-
@@ -320,7 +319,10 @@ def create_file_custom_fields(only_definitions=False):
 				# name. At 140 the write failed AFTER the upload, the job died before recording
 				# the attempt, and the hourly retry uploaded the file again, every hour, as
 				# "name (1).pdf", "name (2).pdf", ... Nothing queries it: width, no index.
-				"length": 1000,
+				# Small Text, not a long Data: a varchar(1000) here beside the indexed
+				# local_url varchar(768) took a busy tabFile (ROW_FORMAT=COMPRESSED, other
+				# apps' columns and indexes) past InnoDB's 8126-byte row limit, and migrate
+				# failed. TEXT has no width to outgrow and does not count against the limit.
 			},
 			{
 				"fieldname": "custom_microsoft_error",
