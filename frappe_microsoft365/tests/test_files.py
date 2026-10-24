@@ -919,6 +919,15 @@ class TestSettings(BaseTestCase):
 		self.assertEqual(wide, ["custom_microsoft_local_url"])
 
 
+	def test_file_list_shows_the_sharepoint_status(self):
+		# Whether a file has moved should be visible in the File list, not only on the form.
+		from frappe_microsoft365.setup import create_file_custom_fields
+
+		create_file_custom_fields()
+		frappe.clear_cache(doctype="File")
+		status = frappe.get_meta("File").get_field("custom_microsoft_status")
+		self.assertTrue(status.in_list_view)
+
 class TestUninstall(FilesTestCase):
 	def _moved(self, content=None):
 		f = self.attach(content=content, name="report.csv")

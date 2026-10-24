@@ -304,6 +304,9 @@ def create_file_custom_fields(only_definitions=False):
 				"options": FILE_STATUS_OPTIONS,
 				"insert_after": "custom_microsoft_section",
 				"read_only": 1,
+				# In the File list, so what has moved is visible at a glance. The status rather
+				# than an "Uploaded to SharePoint" tick: Archived and Failed fit no yes/no.
+				"in_list_view": 1,
 				"in_standard_filter": 1,
 				"search_index": 1,
 				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
