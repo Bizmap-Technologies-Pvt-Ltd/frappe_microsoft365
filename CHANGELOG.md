@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased — SharePoint document storage
+## 1.1.0 — 2026-10-24
 
-SharePoint document storage was built by David Eleben (@eleben) in his fork
+SharePoint document storage, built by David Eleben (@eleben) in his fork
 (`eleben/frappe_microsoft365`, branch `feature/sharepoint-files`) and brought into this app as a
-capability, with the changes listed under *Changed from the original*.
+capability, with the changes listed under *Changed from the original*. Tested on real tenants
+by @eleben and @kgrininger.
+
+After updating, run `bench --site <site> migrate` and `bench build --app frappe_microsoft365`
+(`bench update` does both). Document storage stays off until *SharePoint document storage* is
+ticked in Microsoft Settings; the [user guide](docs/sharepoint-user-guide.md) has the setup.
 
 ### Added
 
