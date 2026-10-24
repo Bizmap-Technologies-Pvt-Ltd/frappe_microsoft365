@@ -55,3 +55,6 @@ jspm_packages/
 .aider*
 
 .omc/
+
+# Redis snapshots from local test runs
+dump.rdb

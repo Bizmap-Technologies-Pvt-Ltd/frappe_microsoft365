@@ -14,13 +14,19 @@
   "use_mail",
   "mail_flow",
   "use_sso",
-  "capabilities_help",
+  "use_files",
+  "files_summary",
   "app_section",
   "tenant_id",
   "client_id",
   "client_secret",
   "column_break_app",
   "redirect_uri",
+  "app_access_section",
+  "app_access_help",
+  "app_client_id",
+  "column_break_app_access",
+  "app_client_secret",
   "scopes_section",
   "effective_scopes_display",
   "default_scopes",
@@ -43,7 +49,7 @@
    "fieldname": "capabilities_section",
    "fieldtype": "Section Break",
    "label": "Capabilities",
-   "description": "Pick what you want. The Azure permissions follow from what you tick."
+   "description": "Pick what you want. The Azure permissions follow from what you tick.<br>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified."
   },
   {
    "fieldname": "use_calendar",
@@ -95,10 +101,17 @@
    "description": "Adds a Microsoft button to the login page."
   },
   {
-   "fieldname": "capabilities_help",
+   "fieldname": "use_files",
+   "fieldtype": "Check",
+   "label": "SharePoint document storage",
+   "default": "0",
+   "description": "Store attachments of chosen DocTypes in SharePoint / Teams instead of on this server. Uses an application permission (Sites.Selected), not anyone's sign-in."
+  },
+  {
+   "fieldname": "files_summary",
    "fieldtype": "HTML",
-   "label": "Capabilities Help",
-   "options": "<div class='text-muted' style='font-size:12px'>Use <b>Set Up</b> to create what each capability needs. Nothing existing is ever modified.</div>"
+   "label": "SharePoint Attachments Summary",
+   "depends_on": "use_files"
   },
   {
    "fieldname": "app_section",
@@ -137,6 +150,35 @@
    "description": "Register this exact URI in Azure. Blank uses the site default."
   },
   {
+   "fieldname": "app_access_section",
+   "fieldtype": "Section Break",
+   "label": "Application Access",
+   "collapsible": 1,
+   "depends_on": "eval:doc.use_files",
+   "description": "Optional. Capabilities that run as the app itself (SharePoint document storage) use the registration above unless you enter a separate one here. Microsoft recommends keeping application and delegated permissions in separate app registrations."
+  },
+  {
+   "fieldname": "app_access_help",
+   "fieldtype": "HTML",
+   "options": "<div class='text-muted small'>Leave both empty to use the main registration. A separate registration needs no redirect URI: nobody signs in to it.</div>"
+  },
+  {
+   "fieldname": "app_client_id",
+   "fieldtype": "Data",
+   "label": "Application Client ID"
+  },
+  {
+   "fieldname": "column_break_app_access",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "app_client_secret",
+   "fieldtype": "Password",
+   "label": "Application Client Secret Value",
+   "depends_on": "app_client_id",
+   "mandatory_depends_on": "app_client_id"
+  },
+  {
    "fieldname": "scopes_section",
    "fieldtype": "Section Break",
    "label": "Delegated Scopes",
@@ -164,7 +206,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-09-13 00:00:00",
+ "modified": "2026-10-22 00:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Settings",
  "owner": "Administrator",

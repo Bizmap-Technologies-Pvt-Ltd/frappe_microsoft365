@@ -35,26 +35,54 @@ class MicrosoftSettings(Document):
 
 		self._reject_the_secret_id()
 		self._drop_capabilities_that_lost_their_prerequisite()
+		self._refuse_capabilities_this_frappe_cannot_run()
+
+	def on_update(self):
+		from frappe_microsoft365 import capabilities
+		from frappe_microsoft365.microsoft_graph import clear_app_token_cache
+
+		# The tenant, client or secret may just have changed; a token minted under the old ones
+		# must not be served again.
+		clear_app_token_cache()
+		before = self.get_doc_before_save()
+		capabilities.apply_changes(before, self)
+		if bool((before or {}).get("use_files")) != bool(self.use_files):
+			# Which forms get the Files panel follows this tick; see refresh_desk_boot.
+			from frappe_microsoft365.microsoft_files import refresh_desk_boot
+
+			refresh_desk_boot()
 
 	def _drop_capabilities_that_lost_their_prerequisite(self):
-		"""Transcripts are reached through the meeting behind a join URL, so they cannot work
-		without the standalone-meetings permission.
+		"""A capability that builds on another cannot work without it — transcripts, for one,
+		are reached through the meeting behind a join URL, so they need standalone meetings.
 
 		The field is hidden when its prerequisite is off, and a hidden Check keeps whatever value
 		it had — which would leave sign-in quietly asking Azure for transcript and recording
 		consent that nothing on screen admits to wanting. Clear it instead, and say so.
 		"""
-		if self.use_transcripts and not self.use_teams:
-			self.use_transcripts = 0
+		from frappe_microsoft365 import capabilities
+
+		for capability in capabilities.ticked(self):
+			missing = [r for r in capability.requires if not self.get(capabilities.get(r).field)]
+			if not missing:
+				continue
+			self.set(capability.field, 0)
 			frappe.msgprint(
-				_(
-					"Meeting transcripts and recordings were turned off: they need "
-					"<b>Standalone Teams meetings</b>, which resolves a join link to the meeting "
-					"they belong to."
+				_("{0} was turned off: it builds on {1}.").format(
+					_(capability.label),
+					", ".join("<b>{0}</b>".format(_(capabilities.get(r).label)) for r in missing),
 				),
 				indicator="orange",
 				alert=True,
 			)
+
+	def _refuse_capabilities_this_frappe_cannot_run(self):
+		from frappe_microsoft365 import capabilities
+
+		major = capabilities.frappe_major_version()
+		for capability in capabilities.ticked(self):
+			if major and major < capability.min_frappe:
+				frappe.throw(capabilities.unmet(capability, self, major))
 
 	def _reject_the_secret_id(self):
 		"""Azure shows a secret's Value and its Secret ID together, and only the Value works.

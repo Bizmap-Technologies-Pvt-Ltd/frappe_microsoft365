@@ -27,7 +27,30 @@ doc_events = {
 		"on_update": "frappe_microsoft365.microsoft_calendar_sync.event_on_update",
 		"on_trash": "frappe_microsoft365.microsoft_calendar_sync.event_on_trash",
 	},
+	# SharePoint document storage. Each handler returns at once unless Document Storage is on
+	# and the document's DocType is mapped, so the "*" entries cost one cached read.
+	"File": {
+		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
+		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
+	},
+	"*": {
+		"on_trash": "frappe_microsoft365.microsoft_files.on_doc_trash",
+		"after_rename": "frappe_microsoft365.microsoft_files.on_doc_rename",
+	},
 }
+
+# A moved attachment reads its bytes from SharePoint (v16; v15 ignores this hook).
+extend_doctype_class = {
+	"File": ["frappe_microsoft365.file_extension.SharePointFile"],
+}
+
+# The folder link is bookkeeping: it must never stop someone deleting the record it points at.
+ignore_links_on_delete = ["SharePoint Folder"]
+
+boot_session = "frappe_microsoft365.microsoft_files.boot_session"
+
+# Old /files and /private/files links of attachments that moved to SharePoint redirect to them.
+before_request = ["frappe_microsoft365.microsoft_files.redirect_moved_file"]
 
 scheduler_events = {
 	"cron": {
@@ -38,6 +61,10 @@ scheduler_events = {
 			"frappe_microsoft365.microsoft_meeting_artifacts.fetch_pending",
 		],
 	},
+	"hourly": [
+		# Files whose move to SharePoint is pending or failed; capped at MAX_ATTEMPTS each.
+		"frappe_microsoft365.microsoft_files.retry_pending",
+	],
 }
 
 # Apps
@@ -64,7 +91,10 @@ scheduler_events = {
 # The doctor's shared renderer. Read-only UI; this app never changes how mail is sent.
 # A bundle, not a plain /assets path: bundles get a new file name on every build, so browsers
 # load the new version after a deploy instead of a copy cached for a year.
-app_include_js = ["microsoft_doctor.bundle.js"]
+app_include_js = [
+	"microsoft_doctor.bundle.js",
+	"microsoft_files.bundle.js",
+]
 
 # include js, css files in header of web template
 # web_include_css = "/assets/frappe_microsoft365/css/frappe_microsoft365.css"
@@ -134,7 +164,7 @@ doctype_js = {
 # Uninstallation
 # ------------
 
-# before_uninstall = "frappe_microsoft365.uninstall.before_uninstall"
+before_uninstall = "frappe_microsoft365.uninstall.before_uninstall"
 # after_uninstall = "frappe_microsoft365.uninstall.after_uninstall"
 
 # Integration Setup

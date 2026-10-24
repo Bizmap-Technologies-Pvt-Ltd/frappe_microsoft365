@@ -130,11 +130,19 @@ explained first. See
 
 ## What happens if I uninstall it?
 
+The site is left as it was before the app, with nothing to clean up by hand:
+
+- Attachments stored in SharePoint are either brought back to the server (after checking there
+  is room) or turned into links to their SharePoint copies, whichever Microsoft Settings says.
+  Nothing is removed until every attachment opens again; with no choice made the uninstall stops
+  and asks (see [SharePoint document storage](sharepoint-files.md#uninstalling)).
+- Every custom field the app added to `Event` and `File` is deleted, and its column dropped.
+- `Microsoft Settings`, `Microsoft Calendar` connections, SharePoint mappings and folder links go
+  with the app, as do its cached tokens.
+
 Your mail setup keeps working. The `Connected App`, `Social Login Key` and `Email Account`
 records are Frappe's own doctypes, this app never modified how mail is sent, and none of that is
-removed with it. `Microsoft Settings` and your `Microsoft Calendar` connections go with the app.
-The custom fields it adds to `Event` carry no module, so a plain uninstall leaves them behind —
-delete them by hand if you want them gone.
+removed. `bench uninstall-app --dry-run` reports what would happen and changes nothing.
 
 ---
 
@@ -284,8 +292,17 @@ project's own README — check them for current scope.
   B2C, with configurable OAuth and JWKS endpoints.
 
 This app's scope is Outlook calendar two-way sync, Teams meetings, RSVP, transcripts and
-recordings, plus setup and diagnostics for Outlook mail OAuth and Microsoft sign-in. For
-group-to-role provisioning or SharePoint groups, those apps are where to look.
+recordings, storing a DocType's attachments in SharePoint or a Teams channel
+([SharePoint document storage](sharepoint-files.md)), plus setup and diagnostics for Outlook
+mail OAuth and Microsoft sign-in. For group-to-role provisioning, or for creating and managing
+Microsoft 365 Groups and their sites, those apps are where to look.
+
+## Can attachments be stored in SharePoint or Teams instead of on the server?
+
+Yes. Create a SharePoint Mapping for the DocType; each record gets a folder in
+the site or channel you choose, attachments move there, and files added from Teams appear on the
+record. It needs the `Sites.Selected` application permission and a per-site grant, never access
+to the whole tenant. See [SharePoint document storage](sharepoint-files.md).
 
 ## Can another app call this one instead of writing its own Graph code?
 
