@@ -256,6 +256,12 @@ and Write on both for upload and folder creation. The effective Anchor Folder is
 parent for stored and directly listed SharePoint items. If the current resolver changes anchor or
 explicit path, is removed, or no longer agrees with the stored physical folder, access and
 automatic moves stop with a reconciliation diagnostic. PR1 does not move or reconcile files.
+The panel and direct-item open also check the source's stored File bindings before using a
+currently resolved folder. A relink therefore cannot bypass the binding through a Graph-only
+listing, even when both anchors point at the same physical folder. Restore and leave-in-SharePoint
+uninstall actions validate the binding before downloading bytes or replacing a File URL.
+Folder creation locks the anchor record until the transaction finishes and rechecks the latest
+committed folder row, so concurrent source uploads share one canonical folder context.
 Existing unbound Files keep the old default behavior; an unbound legacy File is not adopted into
 a new resolver context. A copy of a stored File is created as a denied, unbound File and needs
 explicit reconciliation, rather than inheriting the original's storage authority.

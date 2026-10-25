@@ -561,13 +561,14 @@ def ensure_path(drive_id, segments):
 # --- record folders ----------------------------------------------------------------------
 
 
-def get_folder(doctype, name):
+def get_folder(doctype, name, for_update=False):
 	"""The SharePoint Folder record for a document, or None."""
 	return frappe.db.get_value(
 		"SharePoint Folder",
 		{"reference_doctype": doctype, "reference_name": name},
 		["name", "reference_doctype", "drive_id", "item_id", "web_url", "folder_name", "folder_path"],
 		as_dict=True,
+		for_update=for_update,
 	)
 
 
@@ -585,13 +586,17 @@ def ensure_target_folder(target):
 		_assert_target_path(target, existing)
 		return frappe._dict(existing)
 	with _anchor_lock(target):
-		# Distinct source jobs that share an anchor serialize and recheck here.
-		existing = get_folder(target.anchor_doctype, target.anchor_name)
+		# The database lock outlives the filesystem lock until commit/rollback. A second
+		# worker must not create another row while the first folder is still uncommitted.
+		frappe.db.get_value(target.anchor_doctype, target.anchor_name, "name", for_update=True)
+		# A locking read sees the latest committed row even if an earlier lookup opened
+		# a repeatable-read snapshot before the other worker committed its folder.
+		existing = get_folder(target.anchor_doctype, target.anchor_name, for_update=True)
 		if existing:
 			_assert_target_path(target, existing)
 			return frappe._dict(existing)
 		values = target_folder_values(target)
-		existing = get_folder(target.anchor_doctype, target.anchor_name)
+		existing = get_folder(target.anchor_doctype, target.anchor_name, for_update=True)
 		if existing:
 			return frappe._dict(existing)
 		return frappe._dict(add_folder_row(target.anchor_doctype, target.anchor_name, values).as_dict())
@@ -1430,7 +1435,7 @@ def on_file_trash(doc, method=None):
 		return
 	try:
 		binding = storage_target.parse_binding(doc.get(storage_target.BINDING_FIELD))
-		target = current_file_target(doc, permission="write")
+		target = storage_target.validate_file_context(doc, permission="write")
 		if target and target.dynamic and not binding:
 			frappe.throw(
 				_("This legacy SharePoint File has no resolver-binding history; remote deletion is blocked."),
@@ -1750,6 +1755,18 @@ def _check_record(doctype, name, ptype="read"):
 	if not target:
 		frappe.throw(_("{0} is not mapped to SharePoint in Microsoft Settings.").format(_(doctype)))
 	storage_target.authorize_target(target, ptype)
+	# The panel and open_item can read Graph-only items, but must not bypass a File's
+	# historical binding by resolving its source to another anchor with the same folder.
+	for row in frappe.get_all(
+		"File",
+		filters={"attached_to_doctype": doctype, "attached_to_name": name},
+		or_filters={
+			storage_target.BINDING_FIELD: ["is", "set"],
+			"custom_microsoft_item_id": ["is", "set"],
+		},
+		fields=["attached_to_doctype", "attached_to_name", storage_target.BINDING_FIELD],
+	):
+		storage_target.validate_file_context(row, permission=ptype, require_folder=False)
 	return target
 
 

@@ -674,8 +674,50 @@ class TestUpload(FilesTestCase):
 			state["anchor"] = second_anchor.name
 			with self.assertRaises(storage_target.StorageTargetError):
 				files.assert_stored_file_access(frappe.get_doc("File", f.name))
+			# Panel/Graph-only entry points must not bypass the same historical binding.
+			with patch.object(graph, "graph_paged") as listing, patch.object(files, "_stream") as stream:
+				with self.assertRaises(storage_target.StorageTargetError):
+					files.list_folder(MAPPED, self.todo.name)
+				with self.assertRaises(storage_target.StorageTargetError):
+					files.open_item(MAPPED, self.todo.name, "ITEM-" + f.file_name)
+			listing.assert_not_called()
+			stream.assert_not_called()
+			for action in (files.bring_back, files.leave_in_sharepoint):
+				with self.subTest(action=action.__name__), patch.object(graph, "graph_request") as request:
+					with self.assertRaises(storage_target.StorageTargetError):
+						action(f.name)
+				request.assert_not_called()
 			with self.assertRaises(storage_target.StorageTargetError):
 				storage_target.assert_binding_matches(frappe.get_doc("File", f.name), None)
+
+	def test_folder_creation_rechecks_current_database_state_under_anchor_lock(self):
+		from frappe_microsoft365 import storage_target
+
+		target = storage_target.resolve_storage_target(MAPPED, self.todo.name)
+		canonical = frappe._dict(name="committed-folder", drive_id="DRIVE", item_id="FOLDER")
+		# A stale pre-lock snapshot must not trigger another Graph folder or DB row.
+		with patch.object(files, "get_folder", side_effect=[None, canonical]) as lookup, patch.object(
+			files, "target_folder_values"
+		) as create, patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as lock:
+			self.assertEqual(files.ensure_target_folder(target), canonical)
+		lock.assert_called_once_with(MAPPED, self.todo.name, "name", for_update=True)
+		self.assertEqual(lookup.call_args_list[-1].kwargs, {"for_update": True})
+		create.assert_not_called()
+
+	def test_dynamic_remote_delete_uses_resolved_stored_folder(self):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.delete_remote = "On"
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "retention anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		with test_storage_providers(providers):
+			f = self.attach()
+			files.upload_file(f.name)
+			f.reload()
+			files.on_file_trash(f)
+		self.assertIn(("DELETE", f"/drives/DRIVE/items/{f.custom_microsoft_item_id}"), self.graph.calls)
 
 	def test_dynamic_retry_after_graph_accepts_file_reuses_the_same_item(self):
 		from frappe_microsoft365 import storage_target
