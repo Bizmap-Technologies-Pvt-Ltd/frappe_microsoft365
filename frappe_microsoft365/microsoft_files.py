@@ -718,7 +718,8 @@ def bind_file_target(file_doc, target):
 		)
 	value = storage_target.binding_for(target)
 	frappe.db.set_value("File", file_doc.name, storage_target.BINDING_FIELD, value, update_modified=False)
-	frappe.db.commit()  # Persist the logical target before the first external Graph write.
+	# Persist the logical target before the first external Graph write.
+	frappe.db.commit()  # nosemgrep
 	file_doc.set(storage_target.BINDING_FIELD, value)
 	return storage_target.parse_binding(value)
 
@@ -738,7 +739,8 @@ def bind_target_folder(file_doc, target, folder):
 		binding["folder"] = physical
 		value = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 		frappe.db.set_value("File", file_doc.name, storage_target.BINDING_FIELD, value, update_modified=False)
-		frappe.db.commit()  # Folder identity is durable before external file upload.
+		# Folder identity must be durable before external file upload.
+		frappe.db.commit()  # nosemgrep
 		file_doc.set(storage_target.BINDING_FIELD, value)
 
 
