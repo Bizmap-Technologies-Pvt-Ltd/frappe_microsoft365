@@ -197,6 +197,74 @@ application call. It signs in with the *Application Access* registration on Micr
 when one is entered, otherwise with the main one; the token is cached per site and dropped
 whenever Microsoft Settings is saved.
 
+## Dynamic storage targets
+
+A consuming app can make attachments on one DocType use a different record as their storage
+anchor, without changing `File.attached_to_doctype` or `File.attached_to_name`. Register one
+server-side provider per source DocType in that app's `hooks.py`:
+
+```python
+microsoft365_storage_target_resolver = {
+    "Activity": "my_app.storage.resolve_activity_target",
+}
+```
+
+The provider is called with `(source_doctype, source_name)`. Return `None` when this particular
+record opts out, or return the final existing anchor and an optional path relative to the
+anchor mapping's Base Folder:
+
+```python
+def resolve_activity_target(source_doctype, source_name):
+    activity = frappe.get_doc(source_doctype, source_name)
+    if not activity.service_case:
+        return None
+
+    return {
+        "anchor_doctype": "Service Case",
+        "anchor_name": activity.service_case,
+        "path_segments": ["Activities", activity.name],
+    }
+```
+
+Omit `path_segments` to use the anchor mapping's usual Base Folder and Folder Name Pattern.
+Explicit segments are normalized as folder names; empty, relative, or slash-containing segments
+are rejected. Providers must be deterministic and read-only. They must return the final anchor,
+not another record that a second provider redirects. Multiple providers for one source DocType,
+missing anchors, invalid responses, recursion, and provider errors fail closed. Graph IDs and
+client-selected anchors are never accepted.
+
+### Binding, permissions, and relinks
+
+Resolver-managed Files have a hidden, server-owned `File.custom_microsoft_storage_binding` v1
+snapshot. Its canonical JSON is
+
+```json
+{"anchor":["Service Case","SC-0042"],"folder":{"drive_id":"...","item_id":"..."},"path":{"mode":"explicit","segments":["Activities","ACT-123"]},"v":1}
+```
+
+`File.attached_to_doctype/name` remain the authoritative Source, so the snapshot does not repeat
+them. The logical snapshot is written when the new File is inserted, before its after-commit
+worker can make a Graph request. After the anchor folder is found or created, its drive and item
+IDs are added and committed before file bytes are uploaded. A retry resumes that same binding;
+it never substitutes a newly resolved target. `path.mode` is `default` when the anchor's regular
+folder pattern applies, or `explicit` with normalized `segments`. Default mode deliberately
+does not freeze the rendered folder name, so ordinary pattern and record renames keep their
+existing semantics.
+
+Stored resolver-bound Files require Read on both Source and Anchor for listing/opening/content,
+and Write on both for upload and folder creation. The effective Anchor Folder is checked as the
+parent for stored and directly listed SharePoint items. If the current resolver changes anchor or
+explicit path, is removed, or no longer agrees with the stored physical folder, access and
+automatic moves stop with a reconciliation diagnostic. PR1 does not move or reconcile files.
+Existing unbound Files keep the old default behavior; an unbound legacy File is not adopted into
+a new resolver context. A copy of a stored File is created as a denied, unbound File and needs
+explicit reconciliation, rather than inheriting the original's storage authority.
+
+Dynamic source DocTypes are added to the existing Files panel boot list automatically; they use
+the existing default panel placement unless the consumer app provides its own form placement.
+SharePoint items uploaded directly by users remain Graph items and do not create Frappe File
+rows.
+
 ## Frappe v15
 
 Storage needs Frappe v16, and Microsoft Settings refuses the tickbox on v15. Server-side code that

@@ -30,7 +30,9 @@ Graph contract used (all v1.0, see docs/graph-api-reference.md):
 * ``DELETE /drives/{drive-id}/items/{item-id}`` — to the site recycle bin
 """
 
+import hashlib
 import ipaddress
+import json
 import mimetypes
 import os
 import re
@@ -46,6 +48,7 @@ from werkzeug.wrappers import Response
 from frappe_microsoft365 import capabilities
 from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.microsoft_graph import APP, MsGraphConflict, MsGraphError, MsGraphNotFound
+from frappe_microsoft365 import storage_target
 
 # --- constants ---------------------------------------------------------------------------
 
@@ -133,6 +136,13 @@ def storage_option(fieldname, doctype=None):
 	return frappe.get_cached_doc("SharePoint Settings").get(fieldname)
 
 
+def storage_option_for_file(fieldname, file_doc):
+	"""Use a stored File binding's mapping for retained/delete policy."""
+	binding = storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD))
+	doctype = binding["anchor"][0] if binding else file_doc.get("attached_to_doctype")
+	return storage_option(fieldname, doctype)
+
+
 def files_enabled(settings=None):
 	return capabilities.is_enabled("files", settings or _settings())
 
@@ -197,11 +207,18 @@ def can_create_folder(doctype, name, user=None):
 	ERP, which is an administrator's decision unless the mapping says otherwise.
 	"""
 	user = user or frappe.session.user
-	row = mapping_for(doctype)
-	if not row or not frappe.has_permission(doctype, "write", doc=name, user=user):
+	try:
+		target = storage_target.resolve_storage_target(doctype, name)
+	except Exception:
+		return False
+	if not target:
+		return False
+	if not frappe.has_permission(doctype, "write", doc=name, user=user):
+		return False
+	if not frappe.has_permission(target.anchor_doctype, "write", doc=target.anchor_name, user=user):
 		return False
 	roles = set(frappe.get_roles(user))
-	return "System Manager" in roles or bool(roles & set(row.get("folder_roles") or []))
+	return "System Manager" in roles or bool(roles & set(target.mapping.get("folder_roles") or []))
 
 
 def clear_mapping_cache():
@@ -231,7 +248,10 @@ def mapped_doctypes(settings=None):
 	settings = settings or _settings()
 	if not files_enabled(settings):
 		return []
-	return sorted({row.reference_doctype for row in _mappings() if row.enabled})
+	return sorted(
+		{row.reference_doctype for row in _mappings() if row.enabled}
+		| set(storage_target.source_doctypes())
+	)
 
 
 @frappe.whitelist()
@@ -551,24 +571,41 @@ def get_folder(doctype, name):
 	)
 
 
-def ensure_folder(doctype, name):
-	"""The folder for a record, created in SharePoint (and recorded here) on first use."""
-	existing = get_folder(doctype, name)
+def ensure_folder(doctype, name, target=None):
+	"""Resolve a source and create one serialized folder for its canonical anchor."""
+	target = target or storage_target.resolve_storage_target(doctype, name)
+	if not target:
+		frappe.throw(_("{0} has no SharePoint storage target.").format(_(doctype)), storage_target.StorageTargetError)
+	return ensure_target_folder(target)
+
+
+def ensure_target_folder(target):
+	existing = get_folder(target.anchor_doctype, target.anchor_name)
 	if existing:
-		return existing
+		_assert_target_path(target, existing)
+		return frappe._dict(existing)
+	with _anchor_lock(target):
+		# Distinct source jobs that share an anchor serialize and recheck here.
+		existing = get_folder(target.anchor_doctype, target.anchor_name)
+		if existing:
+			_assert_target_path(target, existing)
+			return frappe._dict(existing)
+		values = target_folder_values(target)
+		existing = get_folder(target.anchor_doctype, target.anchor_name)
+		if existing:
+			return frappe._dict(existing)
+		return frappe._dict(add_folder_row(target.anchor_doctype, target.anchor_name, values).as_dict())
 
-	row = mapping_for(doctype)
-	if not row:
-		frappe.throw(_("{0} is not mapped to SharePoint in Microsoft Settings.").format(_(doctype)))
 
-	values = new_folder_values(row, doctype, name)
-
-	# A second job may have finished first; one record per document, whoever wins.
-	existing = get_folder(doctype, name)
-	if existing:
-		return existing
-
-	return frappe._dict(add_folder_row(doctype, name, values).as_dict())
+def _assert_target_path(target, folder):
+	if target.path_segments is None:
+		return
+	expected = "/".join([*base_segments(target.mapping), *target.path_segments])
+	if folder.folder_path != expected:
+		frappe.throw(
+			_("The anchor already has a different SharePoint path; automatic folder moves are disabled."),
+			storage_target.StorageTargetError,
+		)
 
 
 def add_folder_row(doctype, name, values):
@@ -622,6 +659,82 @@ def new_folder_values(row, doctype, name):
 		"web_url": item.get("webUrl"),
 		"folder_path": "/".join(segments),
 	}
+
+
+def target_folder_values(target):
+	"""Create the anchor folder using the default pattern or explicit resolver segments."""
+	if target.folder:
+		return target.folder
+	if target.path_segments is None:
+		return new_folder_values(target.mapping, target.anchor_doctype, target.anchor_name)
+	_site_id, drive_id = resolve_drive(target.mapping)
+	segments = [*base_segments(target.mapping), *target.path_segments]
+	item = ensure_path(drive_id, segments)
+	return {
+		"folder_name": item.get("name") or segments[-1],
+		"drive_id": drive_id,
+		"item_id": item["id"],
+		"web_url": item.get("webUrl"),
+		"folder_path": "/".join(segments),
+	}
+
+
+def _anchor_lock(target):
+	identity = f"{target.anchor_doctype}\0{target.anchor_name}"
+	key = hashlib.sha256(identity.encode()).hexdigest()
+	from frappe.utils.synchronization import filelock
+
+	return filelock(f"microsoft365-storage-anchor-{key}", timeout=120)
+
+
+def current_file_target(file_doc, permission=None):
+	"""Resolve and validate the current logical target and persistent File binding."""
+	target = storage_target.resolve_storage_target(
+		file_doc.get("attached_to_doctype"), file_doc.get("attached_to_name")
+	)
+	storage_target.assert_binding_matches(file_doc, target)
+	if target and permission:
+		storage_target.authorize_target(target, permission)
+	return target
+
+
+def bind_file_target(file_doc, target):
+	"""Durably bind resolver-managed Files before any Graph folder/upload request."""
+	if not target.dynamic:
+		return None
+	existing = storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD))
+	if existing:
+		storage_target.assert_binding_matches(file_doc, target)
+		return existing
+	if file_doc.get("custom_microsoft_item_id") or file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED):
+		frappe.throw(
+			_("This legacy SharePoint File has no resolver-binding history; reconciliation is required."),
+			storage_target.StorageTargetError,
+		)
+	value = storage_target.binding_for(target)
+	frappe.db.set_value("File", file_doc.name, storage_target.BINDING_FIELD, value, update_modified=False)
+	frappe.db.commit()  # Persist the logical target before the first external Graph write.
+	file_doc.set(storage_target.BINDING_FIELD, value)
+	return storage_target.parse_binding(value)
+
+
+def bind_target_folder(file_doc, target, folder):
+	"""Persist the resolved physical folder ID before uploading any bytes."""
+	if not target.dynamic:
+		return
+	binding = storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD))
+	physical = {"drive_id": folder.drive_id, "item_id": folder.item_id}
+	if binding["folder"] and binding["folder"] != physical:
+		frappe.throw(
+			_("The File's original SharePoint folder changed; automatic moves are blocked and reconciliation is required."),
+			storage_target.StorageTargetError,
+		)
+	if binding["folder"] is None:
+		binding["folder"] = physical
+		value = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+		frappe.db.set_value("File", file_doc.name, storage_target.BINDING_FIELD, value, update_modified=False)
+		frappe.db.commit()  # Folder identity is durable before external file upload.
+		file_doc.set(storage_target.BINDING_FIELD, value)
 
 
 def existing_folder_values(row, location):
@@ -697,6 +810,7 @@ def queue_record(doctype, name):
 			"attached_to_name",
 			"attached_to_field",
 			"is_folder",
+			storage_target.BINDING_FIELD,
 		],
 	):
 		if not _eligible(frappe._dict(row), settings):
@@ -740,7 +854,7 @@ def is_link(file_doc):
 	return (file_doc.file_url or "").startswith(("http://", "https://"))
 
 
-def _eligible(file_doc, settings=None):
+def _eligible(file_doc, settings=None, allow_unbound_dynamic=False):
 	"""Should this File be stored in SharePoint at all? Pure apart from settings."""
 	settings = settings or _settings()
 	if not files_enabled(settings) or file_doc.is_folder:
@@ -752,10 +866,11 @@ def _eligible(file_doc, settings=None):
 	# attachments move.
 	if file_doc.attached_to_field:
 		return False
-	row = mapping_for(file_doc.attached_to_doctype, settings)
-	if not row:
+	target = storage_target.resolve_storage_target(file_doc.attached_to_doctype, file_doc.attached_to_name)
+	storage_target.assert_binding_matches(file_doc, target, require_dynamic_proof=not allow_unbound_dynamic)
+	if not target:
 		return False
-	if is_on_demand(row) and not get_folder(file_doc.attached_to_doctype, file_doc.attached_to_name):
+	if is_on_demand(target.mapping) and not get_folder(target.anchor_doctype, target.anchor_name):
 		# Nobody has asked for this record to live in SharePoint yet.
 		return False
 	if is_local(file_doc):
@@ -766,8 +881,52 @@ def _eligible(file_doc, settings=None):
 def on_file_insert(doc, method=None):
 	"""File.after_insert: queue the move. Never fails the upload itself."""
 	try:
-		if not _eligible(doc):
+		# Frappe copies all custom columns when create_attachment_copy() clones a File. A
+		# resolver-bound/Stored attachment cannot inherit that authority in a different owner
+		# context; leave an explicit denied copy for later manual reconciliation.
+		if doc.flags.get("copy_from_existing_file") and (
+			doc.get("custom_microsoft_status") in (STORED, ARCHIVED)
+		):
+			# The binding itself is no_copy, so inspect the original File referenced by the copied
+			# open_file URL as well as the destination context. A legacy/default copy keeps its
+			# historical shared-item behavior; resolver authority never transfers implicitly.
+			try:
+				original_binding = frappe.db.get_value(
+					"File", {"file_url": doc.file_url}, storage_target.BINDING_FIELD
+				)
+				if not original_binding and doc.get("custom_microsoft_drive_id") and doc.get("custom_microsoft_item_id"):
+					original_binding = frappe.db.get_value(
+						"File",
+						{
+							"name": ["!=", doc.name],
+							"custom_microsoft_drive_id": doc.custom_microsoft_drive_id,
+							"custom_microsoft_item_id": doc.custom_microsoft_item_id,
+						},
+						storage_target.BINDING_FIELD,
+					)
+				target = storage_target.resolve_storage_target(doc.attached_to_doctype, doc.attached_to_name)
+				resolver_managed = bool(original_binding or (target and target.dynamic))
+			except Exception:
+				resolver_managed = True
+			if resolver_managed:
+				doc.db_set(
+					{
+						storage_target.BINDING_FIELD: None,
+						"custom_microsoft_status": FAILED,
+						"custom_microsoft_error": _(
+							"A resolver-bound SharePoint attachment copy needs explicit storage reconciliation; its original binding was not copied."
+						),
+						"custom_microsoft_attempts": MAX_ATTEMPTS,
+						"custom_microsoft_drive_id": None,
+						"custom_microsoft_item_id": None,
+						"file_url": stored_url(doc.name),
+					},
+					update_modified=False,
+				)
 			return
+		if not _eligible(doc, allow_unbound_dynamic=True):
+			return
+		target = storage_target.resolve_storage_target(doc.attached_to_doctype, doc.attached_to_name)
 		# A copy (File.create_attachment_copy) arrives with the original's SharePoint fields. A new
 		# File has never been uploaded itself, so ids it carries are not its own to resume from.
 		doc.db_set(
@@ -777,12 +936,24 @@ def on_file_insert(doc, method=None):
 				"custom_microsoft_attempts": 0,
 				"custom_microsoft_drive_id": None,
 				"custom_microsoft_item_id": None,
+				storage_target.BINDING_FIELD: storage_target.binding_for(target) if target and target.dynamic else None,
 			},
 			update_modified=False,
 		)
 		enqueue_upload(doc.name)
 	except Exception:
 		frappe.log_error(title=_("Microsoft 365: could not queue file for SharePoint"))
+
+
+def validate_storage_binding(doc, method=None):
+	"""Prevent client writes to the server-managed storage context snapshot."""
+	if not has_file_fields():
+		return
+	if doc.is_new():
+		doc.set(storage_target.BINDING_FIELD, None)
+		return
+	if doc.has_value_changed(storage_target.BINDING_FIELD):
+		frappe.throw(_("Microsoft 365 storage bindings are managed by the server."), frappe.PermissionError)
 
 
 def enqueue_upload(file_name):
@@ -798,10 +969,27 @@ def enqueue_upload(file_name):
 
 def upload_file(file_name):
 	"""Background job: put one File into its record's folder. Idempotent; safe to re-run."""
+	from frappe.utils.synchronization import filelock
+
+	key = hashlib.sha256(file_name.encode()).hexdigest()
+	with filelock(f"microsoft365-storage-file-{key}", timeout=120):
+		return _upload_file_locked(file_name)
+
+
+def _upload_file_locked(file_name):
 	if not frappe.db.exists("File", file_name):
 		return
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED) or not _eligible(file_doc):
+	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED):
+		return
+	try:
+		target = current_file_target(file_doc)
+		if not _eligible(file_doc) or not target:
+			return
+		storage_target.authorize_target(target, "write", user=file_doc.owner)
+	except Exception as e:
+		attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
+		_record_failure(file_name, attempts, e)
 		return
 
 	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
@@ -812,19 +1000,26 @@ def upload_file(file_name):
 
 	# A savepoint, not a full rollback, on failure: a half-recorded folder must not survive, but
 	# neither should the caller's own unrelated writes be thrown away with it.
-	frappe.db.savepoint("microsoft365_upload")
 	try:
-		folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
-		item = _already_uploaded(file_doc, folder)
+		# Each commit here is intentional: logical binding first, folder binding second,
+		# then the upload savepoint starts only after both are durable.
+		bind_file_target(file_doc, target)
+		folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name, target)
+		bind_target_folder(file_doc, target, folder)
+		frappe.db.savepoint("microsoft365_upload_external")
+		item = _already_uploaded(file_doc, folder, target)
 		if not item:
 			try:
-				item = _upload(file_doc, folder)
+				item = _upload(file_doc, folder, target)
 			except MsGraphNotFound:
 				_forget_message()
 				# Someone deleted or moved the record's folder out of the library. Recreate it once.
+				if target.dynamic:
+					raise
 				_forget_folder(folder)
-				folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
-				item = _upload(file_doc, folder)
+				folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name, target)
+				bind_target_folder(file_doc, target, folder)
+				item = _upload(file_doc, folder, target)
 			# The bytes are in SharePoint now. Say so durably before anything else can fail, or
 			# a retry uploads them again and SharePoint keeps both, as "name (1).pdf".
 			frappe.db.set_value(
@@ -835,12 +1030,16 @@ def upload_file(file_name):
 			)
 			frappe.db.commit()  # nosemgrep
 	except Exception as e:
-		frappe.db.rollback(save_point="microsoft365_upload")
+		try:
+			frappe.db.rollback(save_point="microsoft365_upload_external")
+		except Exception:
+			# Failure may precede the post-binding savepoint; the durable binding must survive.
+			pass
 		_record_failure(file_name, attempts, e)
 		return
 
 	local_url = file_doc.file_url if is_local(file_doc) else None
-	keep_local = bool(storage_option("files_keep_local_copy", file_doc.attached_to_doctype))
+	keep_local = bool(storage_option_for_file("files_keep_local_copy", file_doc))
 	values = {
 		"custom_microsoft_status": STORED if local_url else ARCHIVED,
 		"custom_microsoft_drive_id": _drive_of(item, folder),
@@ -857,6 +1056,12 @@ def upload_file(file_name):
 		values["custom_microsoft_local_url"] = local_url
 	frappe.db.savepoint("microsoft365_record")
 	try:
+		web_url = values.get("custom_microsoft_web_url")
+		if web_url and len(web_url.encode("utf-8")) > 65535:
+			frappe.throw(
+				_("The SharePoint file URL is too long to store in File.custom_microsoft_web_url."),
+				frappe.ValidationError,
+			)
 		frappe.db.set_value("File", file_name, values, update_modified=False)
 		# The row must point at SharePoint, durably, before the copy on disk is removed.
 		frappe.db.commit()  # nosemgrep
@@ -876,11 +1081,14 @@ def _drive_of(item, folder):
 	return item.get("parentReference", {}).get("driveId") or folder.drive_id
 
 
-def _already_uploaded(file_doc, folder):
+def _already_uploaded(file_doc, folder, target=None):
 	"""The driveItem an earlier attempt uploaded before it failed, if it is still in the folder."""
 	item_id = file_doc.get("custom_microsoft_item_id")
 	drive_id = file_doc.get("custom_microsoft_drive_id")
 	if not (item_id and drive_id):
+		if target and target.dynamic:
+			name = _dynamic_file_name(file_doc)
+			return _get_by_path(folder.drive_id, [name], parent_id=folder.item_id)
 		return None
 	try:
 		item = graph.graph_request(
@@ -995,25 +1203,54 @@ def _repoint_links(file_doc, old_url, new_url):
 	)
 
 
-def _upload(file_doc, folder):
+def _dynamic_file_name(file_doc):
+	"""Stable collision-resistant name for crash-safe dynamic uploads and retries."""
 	name = safe_file_name(file_doc.file_name or os.path.basename(file_doc.file_url or ""))
+	stem, ext = os.path.splitext(name)
+	suffix = f" (Frappe {file_doc.name})"
+	return safe_name(stem, fallback="file", max_length=200 - len(ext) - len(suffix)) + suffix + ext
+
+
+def _upload(file_doc, folder, target=None):
+	name = (
+		_dynamic_file_name(file_doc)
+		if target and target.dynamic
+		else safe_file_name(file_doc.file_name or os.path.basename(file_doc.file_url or ""))
+	)
 	content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
 	if is_local(file_doc):
 		# get_full_path refuses anything outside the site's files directories.
 		path = file_doc.get_full_path()
 		with open(path, "rb") as fh:  # nosemgrep
 			return upload_stream(
-				folder.drive_id, folder.item_id, name, fh, os.path.getsize(path), content_type
+				folder.drive_id,
+				folder.item_id,
+				name,
+				fh,
+				os.path.getsize(path),
+				content_type,
+				conflict_behavior="replace" if target and target.dynamic else "rename",
 			)
 	with _download_link(file_doc.file_url) as (fh, size, remote_type):
-		return upload_stream(folder.drive_id, folder.item_id, name, fh, size, remote_type or content_type)
+		return upload_stream(
+			folder.drive_id,
+			folder.item_id,
+			name,
+			fh,
+			size,
+			remote_type or content_type,
+			conflict_behavior="replace" if target and target.dynamic else "rename",
+		)
 
 
-def upload_stream(drive_id, parent_id, name, fh, size, content_type="application/octet-stream"):
+def upload_stream(
+	drive_id, parent_id, name, fh, size, content_type="application/octet-stream", conflict_behavior="rename"
+):
 	"""Upload a file-like object into a folder. Returns the new driveItem.
 
-	An existing file of the same name is never overwritten: Microsoft renames the new one
-	(``Spec (1).pdf``), which is what a person dropping a file into Teams would get too.
+	Default uploads never overwrite: Microsoft renames conflicts. A resolver-bound File has a
+	stable File-specific name and uses replace so a worker crash after Graph accepted bytes but
+	before its DB commit resumes the same item instead of creating another copy.
 	"""
 	target = f"/drives/{drive_id}/items/{parent_id}:/{quote(name, safe='')}:"
 	if size <= SIMPLE_UPLOAD_MAX_BYTES:
@@ -1022,7 +1259,7 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 			f"{target}/content",
 			APP,
 			data=fh.read(),
-			params={"@microsoft.graph.conflictBehavior": "rename"},
+			params={"@microsoft.graph.conflictBehavior": conflict_behavior},
 			headers={"Content-Type": content_type},
 			timeout=120,
 		)
@@ -1032,7 +1269,7 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 		f"{target}/createUploadSession",
 		APP,
 		json={
-			"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
+			"item": {"@microsoft.graph.conflictBehavior": conflict_behavior, "name": name},
 		},
 	)
 	upload_url = session["uploadUrl"]
@@ -1189,10 +1426,34 @@ def on_file_trash(doc, method=None):
 	if not item_id or not doc.get("custom_microsoft_drive_id"):
 		return
 	settings = _settings()
-	if not (files_enabled(settings) and storage_option("files_delete_remote", doc.attached_to_doctype)):
+	if not (files_enabled(settings) and storage_option_for_file("files_delete_remote", doc)):
+		return
+	try:
+		binding = storage_target.parse_binding(doc.get(storage_target.BINDING_FIELD))
+		target = current_file_target(doc, permission="write")
+		if target and target.dynamic and not binding:
+			frappe.throw(
+				_("This legacy SharePoint File has no resolver-binding history; remote deletion is blocked."),
+				storage_target.StorageTargetError,
+			)
+		if binding:
+			if not target or not binding.get("folder"):
+				return
+			if doc.custom_microsoft_drive_id != target.folder.drive_id:
+				return
+			_assert_inside(target.folder, doc.custom_microsoft_item_id)
+	except Exception:
+		frappe.log_error(title=_("Microsoft 365: retained SharePoint file binding could not be validated"))
 		return
 	# Attachment copies share the item; the last one out removes it.
-	others = frappe.db.count("File", {"custom_microsoft_item_id": item_id, "name": ["!=", doc.name]})
+	others = frappe.db.count(
+		"File",
+		{
+			"custom_microsoft_drive_id": doc.custom_microsoft_drive_id,
+			"custom_microsoft_item_id": item_id,
+			"name": ["!=", doc.name],
+		},
+	)
 	if others:
 		return
 	try:
@@ -1219,6 +1480,26 @@ def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
 	"""Any document's after_rename: keep the folder record, and rename the folder to match."""
 	if doc.doctype not in mapped_doctypes():
 		return
+	# A Frappe rename preserves record identity. Update only bindings anchored to this very
+	# record; a resolver change to another record is still a relink and remains fail closed.
+	for row in frappe.get_all(
+		"File",
+		filters={"custom_microsoft_storage_binding": ["is", "set"]},
+		fields=["name", storage_target.BINDING_FIELD],
+	):
+		try:
+			binding = storage_target.parse_binding(row.get(storage_target.BINDING_FIELD))
+		except storage_target.StorageTargetError:
+			continue
+		if binding and binding["anchor"] == [doc.doctype, old]:
+			binding["anchor"][1] = new
+			frappe.db.set_value(
+				"File",
+				row.name,
+				storage_target.BINDING_FIELD,
+				json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+				update_modified=False,
+			)
 	folder = get_folder(doc.doctype, old)
 	if not folder:
 		return
@@ -1257,8 +1538,7 @@ def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
 
 def retry_pending():
 	"""Hourly: re-queue files whose move is still pending or failed (up to MAX_ATTEMPTS)."""
-	doctypes = mapped_doctypes()
-	if not doctypes:
+	if not mapped_doctypes():
 		return
 	cutoff = add_to_date(now_datetime(), minutes=-RETRY_AFTER_MINUTES)
 	names = frappe.get_all(
@@ -1266,7 +1546,6 @@ def retry_pending():
 		filters={
 			"custom_microsoft_status": ["in", [PENDING, FAILED]],
 			"custom_microsoft_attempts": ["<", MAX_ATTEMPTS],
-			"attached_to_doctype": ["in", doctypes],
 			"modified": ["<", cutoff],
 		},
 		pluck="name",
@@ -1281,7 +1560,7 @@ def queue_existing(doctype: str | None = None, limit: int = 500):
 	"""Queue already-attached local files of mapped DocTypes for SharePoint. System Manager."""
 	frappe.only_for("System Manager")
 	doctypes = [doctype] if doctype else mapped_doctypes()
-	doctypes = [dt for dt in doctypes if mapping_for(dt)]
+	doctypes = [dt for dt in doctypes if mapping_for(dt) or dt in storage_target.source_doctypes()]
 	if not doctypes:
 		frappe.throw(_("No DocType is mapped to SharePoint."))
 	settings = _settings()
@@ -1299,6 +1578,7 @@ def queue_existing(doctype: str | None = None, limit: int = 500):
 			"attached_to_name",
 			"attached_to_field",
 			"is_folder",
+			storage_target.BINDING_FIELD,
 		],
 		limit=cint(limit) or 500,
 	)
@@ -1410,6 +1690,12 @@ def open_file(file: str, download: int = 0):
 	file_doc = find_file_by_url(stored_url(file))
 	if not file_doc:
 		raise frappe.PermissionError(_("You don't have permission to access this file"))
+	if file_doc.get("custom_microsoft_status") == FAILED and not file_doc.get("custom_microsoft_item_id"):
+		frappe.throw(
+			file_doc.get("custom_microsoft_error") or _("This SharePoint File needs explicit reconciliation."),
+			storage_target.StorageTargetError,
+		)
+	target = assert_stored_file_access(file_doc)
 
 	local = file_doc.get("custom_microsoft_local_url")
 	try:
@@ -1421,6 +1707,11 @@ def open_file(file: str, download: int = 0):
 		)
 	except MsGraphNotFound:
 		_forget_message()
+		if storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD)):
+			frappe.throw(
+				_("The resolver-bound SharePoint file is missing; local fallback is disabled until reconciliation."),
+				frappe.DoesNotExistError,
+			)
 		# Gone from SharePoint. A kept local copy is still the file; serve that instead.
 		if local and os.path.exists(local_path(local)):
 			if local.startswith("/private/files/"):
@@ -1455,19 +1746,34 @@ def fetch_content(drive_id, item_id):
 
 
 def _check_record(doctype, name, ptype="read"):
-	if not mapping_for(doctype):
+	target = storage_target.resolve_storage_target(doctype, name)
+	if not target:
 		frappe.throw(_("{0} is not mapped to SharePoint in Microsoft Settings.").format(_(doctype)))
-	frappe.has_permission(doctype, ptype, doc=name, throw=True)
+	storage_target.authorize_target(target, ptype)
+	return target
+
+
+def assert_stored_file_access(file_doc):
+	"""Apply persisted Source+Anchor permissions and item containment to every bound reader."""
+	target = storage_target.validate_file_context(file_doc, permission="read")
+	binding = storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD))
+	if binding:
+		if not target or not target.folder:
+			frappe.throw(_("The File's stored SharePoint folder is unavailable."), storage_target.StorageTargetError)
+		if file_doc.get("custom_microsoft_drive_id") != target.folder.drive_id:
+			frappe.throw(_("The File's stored SharePoint drive differs from its binding."), storage_target.StorageTargetError)
+		_assert_inside(target.folder, file_doc.get("custom_microsoft_item_id"))
+	return target
 
 
 @frappe.whitelist()
 def list_folder(doctype: str, name: str, subfolder: str | None = None):
 	"""What is in a record's SharePoint folder (or one of its subfolders), for the form panel."""
-	_check_record(doctype, name)
-	folder = get_folder(doctype, name)
+	target = _check_record(doctype, name)
+	folder = get_folder(target.anchor_doctype, target.anchor_name)
 	can_write = can_create_folder(doctype, name)
 	if not folder:
-		return {"exists": False, "can_create": can_write, "on_demand": is_on_demand(mapping_for(doctype))}
+		return {"exists": False, "can_create": can_write, "on_demand": is_on_demand(target.mapping)}
 
 	parent_id = folder.item_id
 	if subfolder:
@@ -1487,15 +1793,16 @@ def list_folder(doctype: str, name: str, subfolder: str | None = None):
 		return {"exists": False, "can_create": can_write, "missing": True}
 
 	linked = {
-		r.custom_microsoft_item_id: r.name
+		(r.custom_microsoft_drive_id, r.custom_microsoft_item_id): r.name
 		for r in frappe.get_all(
 			"File",
 			filters={
 				"attached_to_doctype": doctype,
 				"attached_to_name": name,
+				"custom_microsoft_drive_id": folder.drive_id,
 				"custom_microsoft_item_id": ["is", "set"],
 			},
-			fields=["name", "custom_microsoft_item_id"],
+			fields=["name", "custom_microsoft_drive_id", "custom_microsoft_item_id"],
 		)
 	}
 	out = []
@@ -1510,7 +1817,7 @@ def list_folder(doctype: str, name: str, subfolder: str | None = None):
 				"modified": item.get("lastModifiedDateTime"),
 				"modified_by": ((item.get("lastModifiedBy") or {}).get("user") or {}).get("displayName"),
 				"web_url": item.get("webUrl"),
-				"attachment": linked.get(item["id"]),
+				"attachment": linked.get((folder.drive_id, item["id"])),
 			}
 		)
 	out.sort(key=lambda i: (not i["is_folder"], (i["name"] or "").lower()))
@@ -1531,14 +1838,14 @@ def create_folder(doctype: str, name: str):
 	For an On demand mapping this is how a record starts living in SharePoint; for an Automatic
 	one it only does early what the first attachment would have done.
 	"""
-	_check_record(doctype, name, "write")
-	if not get_folder(doctype, name) and not can_create_folder(doctype, name):
+	target = _check_record(doctype, name, "write")
+	if not get_folder(target.anchor_doctype, target.anchor_name) and not can_create_folder(doctype, name):
 		raise frappe.PermissionError(
 			_(
 				"Only System Managers and the roles listed on the {0} SharePoint Mapping can create folders."
 			).format(_(doctype))
 		)
-	folder = ensure_folder(doctype, name)
+	folder = ensure_folder(doctype, name, target)
 	queued = queue_record(doctype, name)
 	return {"web_url": folder.web_url, "folder_name": folder.folder_name, "queued": queued}
 
@@ -1575,8 +1882,8 @@ def _assert_inside(folder, item_id):
 @frappe.whitelist(methods=["GET"])
 def open_item(doctype: str, name: str, item_id: str, download: int = 0):
 	"""Open any file in a record's folder — including ones added from Teams — via Frappe."""
-	_check_record(doctype, name)
-	folder = get_folder(doctype, name)
+	target = _check_record(doctype, name)
+	folder = get_folder(target.anchor_doctype, target.anchor_name)
 	if not folder:
 		frappe.throw(_("This record has no SharePoint folder yet."), frappe.DoesNotExistError)
 	_assert_inside(folder, item_id)

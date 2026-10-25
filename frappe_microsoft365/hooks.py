@@ -5,6 +5,7 @@ app_description = "Microsoft 365 integration for Frappe/ERPNext: Outlook calenda
 app_email = "suraj@bizmap.in"
 app_license = "mit"
 
+
 # ------------------------------------------------------------------------------
 # Microsoft 365 — permissions (per-user calendar scoping)
 # ------------------------------------------------------------------------------
@@ -30,6 +31,7 @@ doc_events = {
 	# SharePoint document storage. Each handler returns at once unless Document Storage is on
 	# and the document's DocType is mapped, so the "*" entries cost one cached read.
 	"File": {
+		"validate": "frappe_microsoft365.microsoft_files.validate_storage_binding",
 		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
 		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
 	},

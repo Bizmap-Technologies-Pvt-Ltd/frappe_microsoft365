@@ -5,10 +5,12 @@ upload ranges through ``microsoft_graph._http_request``), both replaced with fak
 like Graph does.
 """
 
-import os
+from contextlib import contextmanager
 from itertools import pairwise
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote, unquote
 
 import frappe
 from frappe.utils import add_to_date
@@ -144,14 +146,20 @@ class FakeGraph:
 			return {"webUrl": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"}
 		if method == "GET" and path == "/drives/DRIVE/root:/Projects/" + path.rsplit("/", 1)[-1]:
 			return {"id": "FOLDER", "folder": {}, "webUrl": "https://contoso.sharepoint.com/f"}
+		if method == "GET" and path.startswith("/drives/DRIVE/items/FOLDER:/") and params:
+			name = unquote(path.split("FOLDER:/", 1)[1].rsplit(":", 1)[0])
+			for item in self.items.values():
+				if item.get("name") == name and item.get("parent") == "FOLDER":
+					return {"id": item["id"], "name": name, "file": {}, "webUrl": item.get("webUrl"), "parentReference": {"driveId": "DRIVE", "id": "FOLDER"}}
+			raise MsGraphNotFound("404")
 		if method == "GET" and ":/Projects/" in path:
 			return {"id": "FOLDER", "folder": {}, "webUrl": "https://contoso.sharepoint.com/f"}
 		if method == "PUT" and path.endswith(":/content"):
 			if self.fail_upload:
 				raise self.fail_upload
-			name = path.split(":/", 1)[1].rsplit(":/content", 1)[0]
+			name = unquote(path.split(":/", 1)[1].rsplit(":/content", 1)[0])
 			parent = path.split("/items/", 1)[1].split(":/", 1)[0]
-			web_url = "https://contoso.sharepoint.com/" + self.web_url_padding + name
+			web_url = "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/Projects/FOLDER/" + self.web_url_padding + quote(name, safe="")
 			self.items["ITEM-" + name] = {"id": "ITEM-" + name, "name": name, "parent": parent, "webUrl": web_url}
 			return {
 				"id": "ITEM-" + name,
@@ -207,6 +215,58 @@ class FilesTestCase(BaseTestCase):
 				**extra,
 			}
 		).insert()
+
+
+_TEST_STORAGE_TARGET = {}
+_TEST_TARGETS = {}
+
+
+def resolve_test_storage_target(doctype, name):
+	target = _TEST_TARGETS.get(name)
+	if not target:
+		return None
+	return {"anchor_doctype": doctype, "anchor_name": target[0], "path_segments": target[1]}
+
+
+def resolve_mutable_test_storage_target(doctype, name):
+	if name != _TEST_STORAGE_TARGET["source"]:
+		return None
+	return {"anchor_doctype": doctype, "anchor_name": _TEST_STORAGE_TARGET["anchor"]}
+
+
+def resolve_invalid_test_storage_target(doctype, name):
+	return {"anchor_name": name}
+
+
+def resolve_missing_test_storage_target(doctype, name):
+	return {"anchor_doctype": doctype, "anchor_name": "does-not-exist"}
+
+
+def resolve_self_test_storage_target(doctype, name):
+	return {"anchor_doctype": doctype, "anchor_name": name}
+
+
+def resolve_raising_test_storage_target(doctype, name):
+	raise RuntimeError("test provider failure")
+
+
+def resolve_recursive_test_storage_target(doctype, name):
+	from frappe_microsoft365 import storage_target
+
+	return storage_target.resolve_storage_target(doctype, name)
+
+
+@contextmanager
+def test_storage_providers(providers):
+	real_get_hooks = frappe.get_hooks
+	with patch.object(
+		frappe,
+		"get_hooks",
+		side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers
+		if key == "microsoft365_storage_target_resolver"
+		else real_get_hooks(key, default=default, **kwargs),
+	):
+		yield
 
 
 # --- pure helpers ----------------------------------------------------------------------------
@@ -430,6 +490,49 @@ class TestAppOnly(BaseTestCase):
 # --- eligibility and the upload job ---------------------------------------------------------
 
 
+class TestStorageTargetResolver(FilesTestCase):
+	def test_no_provider_preserves_source_as_default_anchor(self):
+		from frappe_microsoft365 import storage_target
+
+		target = storage_target.resolve_storage_target(MAPPED, self.todo.name)
+		self.assertEqual((target.source_doctype, target.source_name), (MAPPED, self.todo.name))
+		self.assertEqual((target.anchor_doctype, target.anchor_name), (MAPPED, self.todo.name))
+		self.assertIsNone(target.path_segments)
+		self.assertFalse(target.dynamic)
+
+	def test_multiple_providers_fail_closed(self):
+		from frappe_microsoft365 import storage_target
+
+		provider = "frappe_microsoft365.tests.test_files.resolve_test_storage_target"
+		with test_storage_providers({MAPPED: [provider, provider]}), self.assertRaises(storage_target.StorageTargetError):
+			storage_target.resolve_storage_target(MAPPED, self.todo.name)
+
+	def test_invalid_response_missing_anchor_and_self_target_fail_closed(self):
+		from frappe_microsoft365 import storage_target
+
+		for provider in (
+			"frappe_microsoft365.tests.test_files.resolve_invalid_test_storage_target",
+			"frappe_microsoft365.tests.test_files.resolve_missing_test_storage_target",
+			"frappe_microsoft365.tests.test_files.resolve_self_test_storage_target",
+		):
+			with self.subTest(provider=provider), test_storage_providers({MAPPED: provider}), self.assertRaises(
+				storage_target.StorageTargetError
+			):
+				storage_target.resolve_storage_target(MAPPED, self.todo.name)
+
+	def test_provider_exception_and_recursive_resolution_fail_closed(self):
+		from frappe_microsoft365 import storage_target
+
+		for provider in (
+			"frappe_microsoft365.tests.test_files.resolve_raising_test_storage_target",
+			"frappe_microsoft365.tests.test_files.resolve_recursive_test_storage_target",
+		):
+			with self.subTest(provider=provider), test_storage_providers({MAPPED: provider}), self.assertRaises(
+				storage_target.StorageTargetError
+			):
+				storage_target.resolve_storage_target(MAPPED, self.todo.name)
+
+
 class TestUpload(FilesTestCase):
 	def test_new_attachment_is_queued(self):
 		f = self.attach()
@@ -501,6 +604,183 @@ class TestUpload(FilesTestCase):
 		folder = files.get_folder(MAPPED, self.todo.name)
 		self.assertEqual(folder.item_id, "FOLDER")
 		self.assertEqual(folder.folder_path, f"Projects/{files.safe_name(self.todo.name)}")
+
+	def test_dynamic_files_sharing_one_anchor_share_one_persisted_folder(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "canonical anchor"}).insert()
+		second_source = frappe.get_doc({"doctype": MAPPED, "description": "another source"}).insert()
+		providers = {
+			MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target",
+		}
+		self.addCleanup(setattr, __import__(__name__, fromlist=["_TEST_TARGETS"]), "_TEST_TARGETS", {})
+		_TEST_TARGETS.update({self.todo.name: (anchor.name, None), second_source.name: (anchor.name, None)})
+		get_hooks = frappe.get_hooks
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)):
+			first = self.attach(name="first.txt")
+			second = self.attach(name="second.txt", attached_to_name=second_source.name)
+			files.upload_file(first.name)
+			files.upload_file(second.name)
+			first_binding = storage_target.parse_binding(
+				frappe.db.get_value("File", first.name, storage_target.BINDING_FIELD)
+			)
+			second_binding = storage_target.parse_binding(
+				frappe.db.get_value("File", second.name, storage_target.BINDING_FIELD)
+			)
+		self.assertIsNotNone(
+			first_binding,
+			frappe.db.get_value("File", first.name, ["custom_microsoft_status", "custom_microsoft_error"], as_dict=True),
+		)
+		self.assertEqual(first_binding["anchor"], [MAPPED, anchor.name])
+		self.assertEqual(second_binding["anchor"], [MAPPED, anchor.name])
+		self.assertEqual(first_binding["path"], {"mode": "default"})
+		self.assertEqual(first_binding["folder"], {"drive_id": "DRIVE", "item_id": "FOLDER"})
+		self.assertEqual(frappe.db.count("SharePoint Folder", {"reference_doctype": MAPPED, "reference_name": anchor.name}), 1)
+
+	def test_resolver_relink_to_same_physical_folder_fails_closed(self):
+		from frappe_microsoft365 import storage_target
+
+		first_anchor = frappe.get_doc({"doctype": MAPPED, "description": "anchor one"}).insert()
+		second_anchor = frappe.get_doc({"doctype": MAPPED, "description": "anchor two"}).insert()
+		state = {"source": self.todo.name, "anchor": first_anchor.name}
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_mutable_test_storage_target"}
+		get_hooks = frappe.get_hooks
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)), patch(
+			"frappe_microsoft365.tests.test_files._TEST_STORAGE_TARGET", state
+		):
+			f = self.attach()
+			files.upload_file(f.name)
+			# Different logical identity, deliberately the same physical drive+folder.
+			files.add_folder_row(MAPPED, second_anchor.name, {"folder_name": "same", "drive_id": "DRIVE", "item_id": "FOLDER", "web_url": "https://contoso.sharepoint.com/f", "folder_path": "Projects/same"})
+			state["anchor"] = second_anchor.name
+			with self.assertRaises(storage_target.StorageTargetError):
+				files.assert_stored_file_access(frappe.get_doc("File", f.name))
+			with self.assertRaises(storage_target.StorageTargetError):
+				storage_target.assert_binding_matches(frappe.get_doc("File", f.name), None)
+
+	def test_dynamic_retry_after_graph_accepts_file_reuses_the_same_item(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "retry anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		get_hooks = frappe.get_hooks
+		class Killed(BaseException):
+			pass
+		real_stream = files.upload_stream
+		def stream_then_die(*args, **kwargs):
+			real_stream(*args, **kwargs)
+			raise Killed()
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)), patch.object(files, "upload_stream", side_effect=stream_then_die):
+			f = self.attach()
+			with self.assertRaises(Killed):
+				files.upload_file(f.name)
+			binding = storage_target.parse_binding(frappe.db.get_value("File", f.name, storage_target.BINDING_FIELD))
+			self.assertEqual(binding["folder"], {"drive_id": "DRIVE", "item_id": "FOLDER"})
+			files.upload_file(f.name)
+		self.assertEqual(len([path for method, path in self.graph.calls if method == "PUT"]), 1)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.STORED)
+
+	def test_dynamic_failed_file_can_be_requeued_with_its_stored_binding(self):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "retry queue anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		with test_storage_providers(providers):
+			f = self.attach()
+			self.graph.fail_upload = MsGraphError("temporary Graph outage")
+			files.upload_file(f.name)
+			self.graph.fail_upload = None
+			self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.FAILED)
+			self.assertEqual(files.queue_record(MAPPED, self.todo.name), 1)
+		self.assertEqual(self.enqueued.call_count, 2)
+		self.enqueued.assert_called_with(f.name)
+
+	def test_copy_of_stored_dynamic_file_is_denied_and_unbound(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "copy anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		get_hooks = frappe.get_hooks
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)):
+			original = self.attach()
+			files.upload_file(original.name)
+			copy_target = frappe.get_doc({"doctype": MAPPED, "description": "copy destination"}).insert()
+			copy = frappe.get_doc("File", original.name).create_attachment_copy(MAPPED, copy_target.name)
+			self.assertIsNone(copy.get(storage_target.BINDING_FIELD))
+			self.assertEqual(frappe.db.get_value("File", copy.name, "custom_microsoft_status"), files.FAILED)
+			with self.assertRaises(storage_target.StorageTargetError):
+				files.open_file(copy.name)
+
+	def test_copy_of_stored_default_file_keeps_legacy_shared_item_behavior(self):
+		original = self.attach()
+		files.upload_file(original.name)
+		destination = frappe.get_doc({"doctype": MAPPED, "description": "default copy destination"}).insert()
+		copy = frappe.get_doc("File", original.name).create_attachment_copy(MAPPED, destination.name)
+		row = frappe.get_doc("File", copy.name)
+		self.assertEqual(row.get("custom_microsoft_status"), files.STORED)
+		self.assertEqual(row.get("custom_microsoft_drive_id"), "DRIVE")
+		self.assertEqual(row.get("custom_microsoft_item_id"), "ITEM-" + original.file_name)
+		self.assertEqual(row.file_url, files.stored_url(original.name))
+		self.assertFalse(row.get("custom_microsoft_storage_binding"))
+
+	def test_dynamic_explicit_path_is_normalized_and_compared(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "explicit anchor"}).insert()
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		_TEST_TARGETS.clear()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, ["Live Test", "ORD 1"])
+		get_hooks = frappe.get_hooks
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)):
+			f = self.attach()
+			files.upload_file(f.name)
+			target = storage_target.resolve_storage_target(MAPPED, self.todo.name)
+			binding = storage_target.parse_binding(frappe.db.get_value("File", f.name, storage_target.BINDING_FIELD))
+			self.assertEqual(target.path_segments, ("Live Test", "ORD 1"))
+			self.assertEqual(binding["path"], {"mode": "explicit", "segments": ["Live Test", "ORD 1"]})
+			self.assertEqual(binding["folder"], {"drive_id": "DRIVE", "item_id": "FOLDER"})
+			self.assertEqual(files.get_folder(MAPPED, anchor.name).folder_path, "Projects/Live Test/ORD 1")
+
+	def test_bound_content_requires_source_and_anchor_read_permission(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "permission anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		get_hooks = frappe.get_hooks
+		with patch.object(frappe, "get_hooks", side_effect=lambda key=None, default="_KEEP_DEFAULT_LIST", **kwargs: providers if key == "microsoft365_storage_target_resolver" else get_hooks(key, default=default, **kwargs)):
+			f = self.attach()
+			files.upload_file(f.name)
+			checks = []
+			def permission(doctype, ptype, doc=None, user=None, throw=False):
+				checks.append((doctype, ptype, doc))
+				if doc == anchor.name:
+					raise frappe.PermissionError("anchor denied")
+				return True
+			with patch.object(frappe, "has_permission", side_effect=permission), patch.object(files, "fetch_content") as fetch:
+				with self.assertRaises(frappe.PermissionError):
+					frappe.get_doc("File", f.name).get_content()
+			fetch.assert_not_called()
+			self.assertEqual(checks, [(MAPPED, "read", self.todo.name), (MAPPED, "read", anchor.name)])
 
 	def test_attachment_comment_link_follows_the_move(self):
 		f = self.attach()
@@ -797,7 +1077,7 @@ class TestSettings(BaseTestCase):
 		configure(self)
 		boot = frappe._dict()
 		files.boot_session(boot)
-		self.assertEqual(boot.microsoft365_files_doctypes, [MAPPED])
+		self.assertIn(MAPPED, boot.microsoft365_files_doctypes)
 
 	def tab_fields(self):
 		return frappe.get_all(
@@ -816,7 +1096,7 @@ class TestSettings(BaseTestCase):
 		configure(self)
 		boot = frappe._dict()
 		files.boot_session(boot)
-		self.assertEqual(boot.microsoft365_files_panel, {MAPPED: files.PANEL_TOP})
+		self.assertEqual(boot.microsoft365_files_panel[MAPPED], files.PANEL_TOP)
 		self.assertEqual(self.tab_fields(), [])
 
 	def test_own_tab_adds_a_tab_to_the_form(self):
@@ -829,7 +1109,7 @@ class TestSettings(BaseTestCase):
 		self.assertFalse(frappe.db.has_column(MAPPED, files.FILES_HTML_FIELD))
 		boot = frappe._dict()
 		files.boot_session(boot)
-		self.assertEqual(boot.microsoft365_files_panel, {MAPPED: files.PANEL_TAB})
+		self.assertEqual(boot.microsoft365_files_panel[MAPPED], files.PANEL_TAB)
 
 		mapping.save()  # saving again changes nothing
 		self.assertEqual(len(self.tab_fields()), 2)
@@ -872,7 +1152,7 @@ class TestSettings(BaseTestCase):
 		self.panel(mapping, files.PANEL_TAB)
 		self.assertIsNone(self.cached_boot())
 		# What the saving desk is handed straight away, and what the others rebuild.
-		self.assertEqual(files.files_panel_boot()["microsoft365_files_panel"], {MAPPED: files.PANEL_TAB})
+		self.assertEqual(files.files_panel_boot()["microsoft365_files_panel"][MAPPED], files.PANEL_TAB)
 
 		self.seed_cached_boot()
 		mapping.delete()
