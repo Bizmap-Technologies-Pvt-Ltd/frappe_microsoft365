@@ -205,7 +205,7 @@ server-side provider per source DocType in that app's `hooks.py`:
 
 ```python
 microsoft365_storage_target_resolver = {
-    "Activity": "my_app.storage.resolve_activity_target",
+    "Work Note": "my_app.storage.resolve_work_note_target",
 }
 ```
 
@@ -214,15 +214,15 @@ record opts out, or return the final existing anchor and an optional path relati
 anchor mapping's Base Folder:
 
 ```python
-def resolve_activity_target(source_doctype, source_name):
-    activity = frappe.get_doc(source_doctype, source_name)
-    if not activity.service_case:
+def resolve_work_note_target(source_doctype, source_name):
+    work_note = frappe.get_doc(source_doctype, source_name)
+    if not work_note.support_case:
         return None
 
     return {
-        "anchor_doctype": "Service Case",
-        "anchor_name": activity.service_case,
-        "path_segments": ["Activities", activity.name],
+        "anchor_doctype": "Support Case",
+        "anchor_name": work_note.support_case,
+        "path_segments": ["Work Notes", work_note.name],
     }
 ```
 
@@ -239,7 +239,7 @@ Resolver-managed Files have a hidden, server-owned `File.custom_microsoft_storag
 snapshot. Its canonical JSON is
 
 ```json
-{"anchor":["Service Case","SC-0042"],"folder":{"drive_id":"...","item_id":"..."},"path":{"mode":"explicit","segments":["Activities","ACT-123"]},"v":1}
+{"anchor":["Support Case","CASE-0042"],"folder":{"drive_id":"...","item_id":"..."},"path":{"mode":"explicit","segments":["Work Notes","NOTE-123"]},"v":1}
 ```
 
 `File.attached_to_doctype/name` remain the authoritative Source, so the snapshot does not repeat

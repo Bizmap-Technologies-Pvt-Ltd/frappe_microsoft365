@@ -2080,6 +2080,10 @@ def bring_back(file_name):
 	file_doc = frappe.get_doc("File", file_name)
 	if file_doc.get("custom_microsoft_status") != STORED:
 		return file_doc.file_url
+	# Uninstall is still a byte-read path. Validate the historical Source + Anchor context
+	# before reusing a local copy or downloading from the stored Graph IDs.
+	if storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD)):
+		assert_stored_file_access(file_doc)
 
 	old_url = file_doc.file_url
 	target = file_doc.get("custom_microsoft_local_url")
@@ -2154,6 +2158,10 @@ def leave_in_sharepoint(file_name):
 	file_doc = frappe.get_doc("File", file_name)
 	if file_doc.get("custom_microsoft_status") != STORED:
 		return file_doc.file_url
+	# Do not turn a resolver-bound attachment into an unrestricted SharePoint URL when
+	# its stored logical context has been relinked or its permissions have changed.
+	if storage_target.parse_binding(file_doc.get(storage_target.BINDING_FIELD)):
+		assert_stored_file_access(file_doc)
 	old_url = file_doc.file_url
 	web_url = file_doc.get("custom_microsoft_web_url")
 	if not web_url:

@@ -3,7 +3,7 @@
 Consumer apps register one provider per source DocType in ``hooks.py``::
 
     microsoft365_storage_target_resolver = {
-        "Activity": "my_app.storage.resolve_activity_target",
+        "Work Note": "my_app.storage.resolve_work_note_target",
     }
 
 The provider receives ``(source_doctype, source_name)`` and returns ``None`` to opt out,

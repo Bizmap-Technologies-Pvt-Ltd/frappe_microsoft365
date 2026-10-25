@@ -491,6 +491,22 @@ class TestAppOnly(BaseTestCase):
 
 
 class TestStorageTargetResolver(FilesTestCase):
+	def test_explicit_path_rejects_unsafe_and_malformed_segments(self):
+		from frappe_microsoft365 import storage_target
+
+		for segments in ([], [""], [None], ["."], [".."], ["a/b"], ["a\\b"], ["  name"]):
+			with self.subTest(segments=segments), self.assertRaises(storage_target.StorageTargetError):
+				storage_target._normalize_path(segments)
+		self.assertEqual(storage_target._normalize_path(["Über Café", "Case 1"]), ("Über Café", "Case 1"))
+		self.assertEqual(len(storage_target._normalize_path(["x" * 401])[0]), 120)
+
+	def test_malformed_and_future_bindings_fail_closed(self):
+		from frappe_microsoft365 import storage_target
+
+		for raw in ("not-json", '{"v":2,"anchor":["ToDo","x"],"path":{"mode":"default"},"folder":null}'):
+			with self.subTest(raw=raw), self.assertRaises(storage_target.StorageTargetError):
+				storage_target.parse_binding(raw)
+
 	def test_no_provider_preserves_source_as_default_anchor(self):
 		from frappe_microsoft365 import storage_target
 
@@ -1258,6 +1274,24 @@ class TestUninstall(FilesTestCase):
 		with patch.object(graph, "graph_request") as gr:
 			self.assertEqual(files.bring_back(f.name), old)
 		gr.assert_not_called()
+
+	def test_uninstall_restore_does_not_bypass_dynamic_binding(self):
+		from frappe_microsoft365 import storage_target
+
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_creation = files.AUTOMATIC
+		mapping.save()
+		anchor = frappe.get_doc({"doctype": MAPPED, "description": "restore anchor"}).insert()
+		_TEST_TARGETS[self.todo.name] = (anchor.name, None)
+		providers = {MAPPED: "frappe_microsoft365.tests.test_files.resolve_test_storage_target"}
+		with test_storage_providers(providers):
+			f = self.attach()
+			files.upload_file(f.name)
+			# Current provider points elsewhere: restore must not fetch via stale item IDs.
+			_TEST_TARGETS[self.todo.name] = (self.todo.name + "-missing", None)
+			with patch.object(graph, "graph_request") as request, self.assertRaises(storage_target.StorageTargetError):
+				files.bring_back(f.name)
+		request.assert_not_called()
 
 	def _uninstall_as(self, how):
 		from frappe_microsoft365 import uninstall
