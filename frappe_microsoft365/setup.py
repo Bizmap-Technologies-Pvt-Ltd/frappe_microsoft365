@@ -379,6 +379,16 @@ def create_file_custom_fields(only_definitions=False):
 				"insert_after": "custom_microsoft_local_url",
 				"read_only": 1,
 			},
+			{
+				"fieldname": "custom_microsoft_storage_binding",
+				"fieldtype": "Small Text",
+				"label": "Storage Binding",
+				"insert_after": "custom_microsoft_attempts",
+				"hidden": 1,
+				"read_only": 1,
+				"no_copy": 1,
+				"description": "Versioned server-managed SharePoint storage context. Do not edit or copy.",
+			},
 		]
 	}
 	if only_definitions:

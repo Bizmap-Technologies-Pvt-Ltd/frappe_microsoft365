@@ -30,6 +30,9 @@ class SharePointFile:
 		if self.is_folder or self.get("content") or not self._stored_in_sharepoint():
 			return super().get_content(encodings=encodings)
 
+		# Bindings are checked for every server-side reader too (email, print, import).
+		microsoft_files.assert_stored_file_access(self)
+
 		from frappe.core.doctype.file.file import FILE_ENCODING_OPTIONS
 
 		content = microsoft_files.fetch_content(self.custom_microsoft_drive_id, self.custom_microsoft_item_id)

@@ -197,6 +197,104 @@ application call. It signs in with the *Application Access* registration on Micr
 when one is entered, otherwise with the main one; the token is cached per site and dropped
 whenever Microsoft Settings is saved.
 
+## Dynamic storage targets
+
+A consumer app can keep a File attached to its business Source while storing its bytes in a
+SharePoint folder belonging to a different Anchor Record. The attachment is not reparented:
+
+```text
+File.attached_to_doctype/name = the Frappe attachment owner (Source Record)
+Storage Anchor                = the record whose SharePoint mapping and folder are used
+```
+
+Register one deterministic, server-side resolver per Source DocType in the consumer app's
+`hooks.py`:
+
+```python
+microsoft365_storage_target_resolver = {
+    "Work Item": "my_app.storage.resolve_work_item_target",
+}
+```
+
+The provider receives `(source_doctype, source_name)`. Return `None` to opt this Source out, or
+return its final existing Anchor Record and optionally a path relative to the Anchor mapping's
+Base Folder:
+
+```python
+def resolve_work_item_target(source_doctype, source_name):
+    work_item = frappe.get_doc(source_doctype, source_name)
+    if not work_item.project:
+        return None
+
+    return {"anchor_doctype": "Project", "anchor_name": work_item.project}
+```
+
+Omit `path_segments` to use the Anchor's regular Base Folder and Folder Name Pattern. Explicit
+paths are lists of normalized folder-name segments. Providers must be read-only and deterministic;
+there must be exactly one provider for a Source DocType, and it must return the final anchor rather
+than a record redirected by another provider. Missing anchors, multiple providers, invalid results,
+provider errors, recursion and chained targets fail closed. A consumer returns logical record
+identities and path segments only; it never supplies Microsoft Graph IDs. Business relationship
+resolution stays in the consumer app.
+
+### Binding and relinks
+
+A resolver-managed File has a hidden, server-managed `File.custom_microsoft_storage_binding`
+version 1 snapshot. The canonical JSON shape is:
+
+```json
+{"anchor":["Project","PROJECT-0042"],"folder":{"drive_id":"drive-id","item_id":"folder-item-id"},"path":{"mode":"explicit","segments":["Work Items","WORK-123"]},"v":1}
+```
+
+The `anchor` contains the logical Anchor DocType and name. `path.mode` is `default` when the
+Anchor's normal pattern applies, or `explicit` with normalized `segments`. Default mode deliberately
+does not freeze a rendered folder name, preserving normal pattern and rename semantics. `folder`
+is initially `null`; once the Anchor folder is resolved, its physical `drive_id` and folder
+`item_id` are persisted there. The snapshot does not repeat the Source because
+`File.attached_to_doctype/name` remains its canonical identity.
+
+The logical binding is committed before the first external Graph write. The physical folder
+identity is committed before file bytes are uploaded. Retries reuse the same binding and do not
+silently replace it with a newly resolved target. Existing bindings are immutable through normal
+File writes. If the current resolver changes or disappears, or the stored logical/physical binding
+no longer matches, access and automated moves fail closed; PR1 does not move or reconcile files.
+Two logical Anchors may point at the same physical SharePoint folder, but their logical bindings
+remain distinct and a relink between them is still denied. Folder creation is serialized by Anchor,
+so multiple Sources sharing one Anchor use one canonical folder context.
+
+Resolver-bound reads require permission on both Source and stored Anchor. This validation applies
+to File content, listing and direct-item open paths, retry, restore and leave-in-SharePoint
+uninstall paths. Physical File references are identified by `drive_id` plus `item_id`. A copied
+resolver-bound File does not inherit the original storage authority; it remains unbound and requires
+explicit reconciliation.
+
+Existing default Files remain backward compatible. There is no mass backfill. A legacy unbound
+File without historical proof is not silently adopted into a new cross-record resolver context.
+
+### Direct SharePoint files
+
+Files created directly in SharePoint or a Teams Files view are Graph items, not Frappe attachments.
+They appear in the mapped folder listing with `attachment: None`; listing does not create a Frappe
+File or download bytes. Opening one uses the protected `open_item` route, which checks Source and
+Anchor permissions and verifies that the item is inside the resolved folder before streaming it to
+the caller. This does not create an upload/download loop or import the item into Frappe.
+
+### Consumers that attach Files after insert
+
+Some consumer flows first insert a File without `attached_to_doctype/name`, then assign its owner
+only after the File `after_insert` event has already run. The storage hook cannot resolve such an
+unattached File at insert time. After setting the final attachment owner, the consumer must notify
+the Microsoft 365 File handler/queue entry point again for registered resolver sources (for example,
+`frappe_microsoft365.microsoft_files.on_file_insert(file_doc, "after_insert")`). For an On demand
+Anchor mapping, create the Anchor folder first; otherwise the attachment is intentionally not
+queued until the folder exists.
+
+### Out of scope
+
+PR1 does not include a rule editor, a relation-rule child table, automatic folder moves,
+reconciliation, SharePoint import as a Frappe File, multiple storage targets per File,
+business-app relationship resolution in this app, or realtime fan-out.
+
 ## Frappe v15
 
 Storage needs Frappe v16, and Microsoft Settings refuses the tickbox on v15. Server-side code that
