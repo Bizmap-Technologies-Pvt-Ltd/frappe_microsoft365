@@ -1318,20 +1318,21 @@ class TestDoctorFiles(BaseTestCase):
 
 	def test_site_grant_script_names_each_site_and_only_write(self):
 		script = doctor.powershell_for_site_grant(
-			"APP-ID",
+			"9f0b1c2d-0000-4000-8000-000000000002",
 			["https://c.sharepoint.com/sites/Sales/Shared%20Documents", "https://c.sharepoint.com/teams/Ops"],
 		)
-		self.assertIn('Get-MgSite -SiteId "c.sharepoint.com:/sites/Sales"', script)
-		self.assertIn('Get-MgSite -SiteId "c.sharepoint.com:/teams/Ops"', script)
-		self.assertIn('roles = @("write")', script)
-		self.assertIn('$appId = "APP-ID"', script)
-		self.assertNotIn('FullControl")', script.split("Connect-MgGraph", 1)[1].split("\n", 1)[1])
+		self.assertIn("Get-MgSite -SiteId 'c.sharepoint.com:/sites/Sales'", script)
+		self.assertIn("Get-MgSite -SiteId 'c.sharepoint.com:/teams/Ops'", script)
+		self.assertIn("roles = @('write')", script)
+		self.assertIn("$appId = '9f0b1c2d-0000-4000-8000-000000000002'", script)
+		self.assertNotIn("FullControl')", script.split("Connect-MgGraph", 1)[1].split("\n", 1)[1])
 
 	def test_site_grant_script_runs_when_pasted(self):
 		# Pasted into a PowerShell window, a line ending inside @{ ... } leaves the shell at ">>"
 		# waiting for more, and a last line without a line break is never run.
 		script = doctor.powershell_for_site_grant(
-			"APP-ID", ["https://c.sharepoint.com/sites/Sales", "https://c.sharepoint.com/teams/Ops"]
+			"9f0b1c2d-0000-4000-8000-000000000002",
+			["https://c.sharepoint.com/sites/Sales", "https://c.sharepoint.com/teams/Ops"],
 		)
 		self.assertTrue(script.endswith("\n"))
 		for line in script.splitlines():

@@ -16,6 +16,7 @@ from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE
 from frappe_microsoft365.tests.base import BaseTestCase
 
 TENANT = "11111111-2222-3333-4444-555555555555"
+CLIENT_ID = "038b9c8e-2699-4858-b5f1-4f7a3d4077c4"
 
 
 def configure_settings(**values):
@@ -405,7 +406,7 @@ class TestApply(BaseTestCase):
 			use_mail=1,
 			use_sso=0,
 			tenant_id=TENANT,
-			client_id="client-abc",
+			client_id=CLIENT_ID,
 			client_secret="test-secret",
 			mail_flow="Delegated",
 		)

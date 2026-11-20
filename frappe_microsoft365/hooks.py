@@ -24,7 +24,11 @@ after_migrate = "frappe_microsoft365.setup.after_migrate"
 # Read-only checks run after `bench migrate`; their findings form the upgrade report.
 # Keyed by the release that introduced them; see upgrade.py.
 microsoft365_upgrade_checks = {
-	"1.1.1": [],
+	"1.1.1": [
+		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
+		"frappe_microsoft365.sign_in.upgrade_check",
+		"frappe_microsoft365.script_values.upgrade_check",
+	],
 }
 
 doc_events = {
@@ -57,6 +61,11 @@ boot_session = "frappe_microsoft365.microsoft_files.boot_session"
 
 # Old /files and /private/files links of attachments that moved to SharePoint redirect to them.
 before_request = ["frappe_microsoft365.microsoft_files.redirect_moved_file"]
+
+# Sign in with Microsoft accepts only accounts from the directory in Microsoft Settings. Frappe 16
+# calls this before the session is created; Frappe 15 has no such hook and never calls it.
+on_social_login = ["frappe_microsoft365.sign_in.on_social_login"]
+
 
 scheduler_events = {
 	"cron": {
@@ -334,10 +343,3 @@ before_uninstall = "frappe_microsoft365.uninstall.before_uninstall"
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-
-# Read-only checks run after `bench migrate`; their findings form the upgrade report.
-microsoft365_upgrade_checks = {
-	"1.1.1": [
-		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
-	],
-}

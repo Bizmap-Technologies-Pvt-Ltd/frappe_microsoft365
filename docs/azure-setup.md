@@ -13,12 +13,18 @@ The endpoint/permission contract these steps satisfy is documented in
 1. Go to the **Microsoft Entra admin center** (<https://entra.microsoft.com>) or the Azure portal →
    **Microsoft Entra ID** → **App registrations** → **New registration**.
 2. **Name:** anything recognizable, e.g. `Frappe Microsoft 365`.
-3. **Supported account types** — pick based on who signs in:
-   - *Accounts in this organizational directory only (single tenant)* — recommended when every user
-     belongs to your own tenant. Use your **Directory (tenant) ID** as the authority.
-   - *Accounts in any organizational directory (multitenant)* — only if users from other Microsoft
-     work/school tenants must connect. Multitenant apps typically authenticate against the
-     `organizations` (or `common`) authority and may require admin consent in each guest tenant.
+3. **Supported account types:** *Accounts in this organizational directory only (single
+   tenant)*, and paste your **Directory (tenant) ID** (or your tenant's domain, such as
+   `contoso.onmicrosoft.com`) into **Tenant ID** in Frappe.
+   - **Sign in with Microsoft requires single tenant.** Frappe signs in the user whose email
+     address is in Microsoft's token. On the `common` or `organizations` authority that token can
+     come from *any* organisation's directory, and whoever runs that directory chooses its users'
+     addresses — including ones that match your Frappe users. Set Up refuses to create the sign-in
+     record unless Tenant ID names your directory, the doctor reports an existing one on a
+     multi-tenant authority as a failure, and on Frappe 16 a sign-in from any other directory is
+     refused. People from partner organisations who need access should be invited into your
+     directory as guests, which keeps them inside it.
+   - App-only features (SharePoint document storage, app-only mail) need a specific tenant too.
    - Personal Microsoft accounts (consumer) are **not** supported for the Teams/transcript scopes.
 4. Leave the redirect URI blank for now (added in the next step). Click **Register**.
 

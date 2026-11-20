@@ -129,16 +129,36 @@ jobs:
         working-directory: /home/runner/frappe-bench/sites
         shell: bash
         run: |
-          # Administrators paste this script into PowerShell; check it with PowerShell's own parser.
-          ../env/bin/python -c "
-          from frappe_microsoft365.doctor import powershell_for_site_grant
-          print(powershell_for_site_grant('APP-ID', ['https://c.sharepoint.com/sites/Sales', 'https://c.sharepoint.com/teams/Ops']), end='')
-          " > /tmp/site-grant.ps1
+          # Administrators paste these scripts into PowerShell; check them with PowerShell's own
+          # parser. hostile.ps1 holds a value built to break out of a string if quoting regresses.
+          ../env/bin/python - <<'EOF'
+          from frappe_microsoft365.doctor import powershell_for_app_only, powershell_for_site_grant
+          from frappe_microsoft365.script_values import ps_literal
+
+          app = "038b9c8e-2699-4858-b5f1-4f7a3d4077c4"
+          sites = ["https://c.sharepoint.com/sites/Sales", "https://c.sharepoint.com/teams/Ops"]
+          hostile = "x$(Get-Date)\"; `whoami` \u2019 ' ;"
+          scripts = {
+              "/tmp/site-grant.ps1": powershell_for_site_grant(app, sites),
+              "/tmp/exchange.ps1": powershell_for_app_only(app, mailboxes=["support@c.com", "o'brien@c.com"], send_as=True),
+              "/tmp/hostile.ps1": "$v = " + ps_literal(hostile) + "\n",
+              "/tmp/hostile.txt": hostile,
+          }
+          for path, text in scripts.items():
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+          EOF
           pwsh -NoProfile -Command '
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile("/tmp/site-grant.ps1", [ref]$null, [ref]$errors) | Out-Null
-            if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
-            "Site Grant Script parses"'
+            foreach ($f in "/tmp/site-grant.ps1", "/tmp/exchange.ps1", "/tmp/hostile.ps1") {
+              $errors = $null
+              $ast = [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errors)
+              if ($errors) { $errors | ForEach-Object { Write-Error "${f}: $($_.Message)" }; exit 1 }
+              # Nothing we generate is ever evaluated, so no $(...) may appear anywhere in it.
+              if ($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.SubExpressionAst] }, $true).Count) { Write-Error "${f} contains a subexpression"; exit 1 }
+              "${f} parses"
+            }
+            if ($ast.EndBlock.Statements[0].Right.Expression.Value -cne (Get-Content -Raw -Encoding utf8 /tmp/hostile.txt)) { Write-Error "hostile value not kept literally"; exit 1 }
+            "hostile value stays literal"'
 
       - name: Run tests
         working-directory: /home/runner/frappe-bench
