@@ -28,6 +28,8 @@ microsoft365_upgrade_checks = {
 		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
 		"frappe_microsoft365.sign_in.upgrade_check",
 		"frappe_microsoft365.script_values.upgrade_check",
+		"frappe_microsoft365.microsoft_files.upgrade_check_file_items",
+		"frappe_microsoft365.microsoft_files.upgrade_check_shared_folders",
 	],
 }
 
@@ -55,14 +57,6 @@ doc_events = {
 # A moved attachment reads its bytes from SharePoint (v16; v15 ignores this hook).
 extend_doctype_class = {
 	"File": ["frappe_microsoft365.file_extension.SharePointFile"],
-}
-
-# Read-only checks run after `bench migrate`; their findings form the upgrade report.
-microsoft365_upgrade_checks = {
-	"1.1.1": [
-		"frappe_microsoft365.microsoft_files.upgrade_check_file_items",
-		"frappe_microsoft365.microsoft_files.upgrade_check_shared_folders",
-	],
 }
 
 # The folder link is bookkeeping: it must never stop someone deleting the record it points at.
