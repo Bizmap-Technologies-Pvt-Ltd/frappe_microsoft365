@@ -52,6 +52,17 @@ boot_session = "frappe_microsoft365.microsoft_files.boot_session"
 # Old /files and /private/files links of attachments that moved to SharePoint redirect to them.
 before_request = ["frappe_microsoft365.microsoft_files.redirect_moved_file"]
 
+# Sign in with Microsoft accepts only accounts from the directory in Microsoft Settings. Frappe 16
+# calls this before the session is created; Frappe 15 has no such hook and never calls it.
+on_social_login = ["frappe_microsoft365.sign_in.on_social_login"]
+
+# Read-only checks run after `bench migrate`; their findings form the upgrade report.
+microsoft365_upgrade_checks = {
+	"1.1.1": [
+		"frappe_microsoft365.sign_in.upgrade_check",
+	],
+}
+
 scheduler_events = {
 	"cron": {
 		"*/15 * * * *": [

@@ -28,6 +28,7 @@ from frappe.utils.password import get_decrypted_password
 from frappe_microsoft365 import capabilities as capability_registry
 from frappe_microsoft365 import doctor
 from frappe_microsoft365 import microsoft_graph as graph
+from frappe_microsoft365 import sign_in
 from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE_ACCESS
 
 #: The Connected App we create for mail. Named so it is obvious where it came from.
@@ -290,6 +291,17 @@ def plan():
 		blockers.append(
 			_("SharePoint document storage runs as the app, which needs your directory's Tenant ID, not 'common'.")
 		)
+	if "sso" in chosen and (settings.get("tenant_id") or "").strip() and not sign_in.is_single_tenant(
+		settings.get("tenant_id")
+	):
+		# Sign-in signs in whoever has the email address in Microsoft's token. On a multi-tenant
+		# authority any organisation's directory can issue that token, for any address it likes.
+		blockers.append(
+			_(
+				"Sign in with Microsoft needs your directory's Tenant ID (a GUID) or its domain, not "
+				"'{0}': with it, accounts from any organisation could sign in."
+			).format(settings.get("tenant_id").strip())
+		)
 	if not settings.get("client_secret") and ("mail" in chosen or "sso" in chosen):
 		blockers.append(
 			_("A Client Secret is required for mail and sign-in. Add it in Microsoft Settings first.")
@@ -318,6 +330,9 @@ def _create_connected_app(settings):
 
 
 def _create_social_login_key(settings):
+	# plan() already blocks this; checked again so no other caller can create an open sign-in.
+	if not sign_in.is_single_tenant(settings.get("tenant_id")):
+		frappe.throw(_("Sign in with Microsoft needs your directory's Tenant ID, not a multi-tenant authority."))
 	doc = frappe.get_doc(social_login_key_values(settings))
 	doc.insert(ignore_permissions=True)
 	return doc.name

@@ -152,8 +152,8 @@ def check_settings(settings):
 				WARN,
 				_("Tenant is set to '{0}'").format(tenant),
 				_(
-					"App-only (client credentials) access requires a specific tenant id. "
-					"'{0}' works for interactive sign-in only."
+					"App-only (client credentials) access requires a specific tenant id, and so does "
+					"Sign in with Microsoft: with '{0}', accounts from any organisation are accepted."
 				).format(tenant),
 				_("Use the Directory (tenant) ID from the Azure app registration Overview page."),
 				MS_OAUTH_DOC,
@@ -636,7 +636,6 @@ def check_social_login_key(key, settings=None):
 	out = []
 	settings = settings or {}
 	name = key.get("name") or "Office 365"
-	tenant = (settings.get("tenant_id") or "").strip()
 
 	if not key.get("enable_social_login"):
 		out.append(
@@ -663,24 +662,12 @@ def check_social_login_key(key, settings=None):
 			)
 		)
 
+	out += check_sign_in_tenant(key, settings)
+
 	for field, label in (("authorize_url", _("authorize")), ("access_token_url", _("token"))):
 		uri = (key.get(field) or "").strip()
 		if not uri:
 			continue
-
-		# Frappe's built-in Office 365 provider ships /common/ + v1.0 endpoints, which
-		# cannot work with a single-tenant app registration.
-		if "/common/" in uri and tenant and tenant.lower() not in ("common", "organizations"):
-			out.append(
-				finding(
-					f"sso.tenant_{field}",
-					FAIL,
-					_("Sign-in {0} URL points at /common/").format(label),
-					_("Your app is registered in tenant {0}, not the shared endpoint.").format(tenant),
-					_("Use https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(tenant),
-					target=name,
-				)
-			)
 		if "/oauth2/v2.0/" not in uri:
 			out.append(
 				finding(
@@ -692,6 +679,67 @@ def check_social_login_key(key, settings=None):
 					target=name,
 				)
 			)
+
+	return out
+
+
+def check_sign_in_tenant(key, settings=None):
+	"""Can accounts from another organisation's directory sign in? Pure.
+
+	``key``: dict of name, authorize_url, access_token_url. ``settings``: dict with tenant_id.
+
+	Frappe signs in whoever has the email address in Microsoft's ID token. On a multi-tenant
+	authority that token can come from any directory, whose owner picks its users' addresses,
+	so sign-in has to name the organisation's own directory — in Tenant ID and in the URLs.
+	Frappe's built-in Office 365 provider ships /common/ URLs, so a record made by hand is
+	usually open in exactly this way.
+	"""
+	from frappe_microsoft365 import sign_in
+
+	out = []
+	settings = settings or {}
+	name = key.get("name") or "Office 365"
+	tenant = (settings.get("tenant_id") or "").strip()
+	single = sign_in.is_single_tenant(tenant)
+
+	if not single:
+		out.append(
+			finding(
+				"sso.multi_tenant",
+				FAIL,
+				_("Microsoft sign-in accepts accounts from any organisation"),
+				_(
+					"Tenant ID is '{0}', which does not name your directory, so an account in "
+					"another organisation's directory with the same email address as one of your "
+					"users could sign in as them. Sign-in keeps working for now; from version 1.2.0 "
+					"it is refused until this is fixed."
+				).format(tenant or "common"),
+				_(
+					"Set Tenant ID in Microsoft Settings to the Directory (tenant) ID from the app "
+					"registration's Overview page, make the registration single-tenant, and point "
+					"the Social Login Key's URLs at https://login.microsoftonline.com/<tenant id>/oauth2/v2.0/..."
+				),
+				MS_OAUTH_DOC,
+				target=name,
+			)
+		)
+
+	for field, label in (("authorize_url", _("authorize")), ("access_token_url", _("token"))):
+		segment = sign_in.authority_tenant(key.get(field))
+		if segment is None or segment.lower() not in sign_in.MULTI_TENANT:
+			continue
+		out.append(
+			finding(
+				f"sso.tenant_{field}",
+				FAIL,
+				_("Sign-in {0} URL points at /{1}/").format(label, segment or "common"),
+				_("That endpoint signs in accounts from any organisation's directory, not only yours."),
+				_("Use https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(
+					tenant if single else "<tenant id>"
+				),
+				target=name,
+			)
+		)
 
 	return out
 
@@ -1630,6 +1678,16 @@ def run_diagnostics():
 					_("Use Set Up on Microsoft Settings to create the Social Login Key."),
 				)
 			)
+	elif frappe.db.exists("Social Login Key", {"social_login_provider": "Office 365"}):
+		# Sign-in not ticked, but a Microsoft sign-in record exists anyway — typically one made
+		# by hand before this app. Whether it lets other organisations in still matters.
+		key = frappe.db.get_value(
+			"Social Login Key",
+			{"social_login_provider": "Office 365"},
+			["name", "authorize_url", "access_token_url"],
+			as_dict=True,
+		)
+		findings += check_sign_in_tenant(key, settings)
 
 	if wants_mail and not oauth_accounts:
 		findings.append(
