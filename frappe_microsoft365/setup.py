@@ -360,10 +360,21 @@ def create_file_custom_fields(only_definitions=False):
 				"length": 255,
 			},
 			{
+				# The record folder the upload job put the item in. Only the app writes it (see
+				# microsoft_files.on_file_validate), so opening a file can check it against the
+				# SharePoint Folder rows without asking Graph where the item is.
+				"fieldname": "custom_microsoft_folder_id",
+				"fieldtype": "Data",
+				"label": "Folder ID",
+				"insert_after": "custom_microsoft_item_id",
+				"read_only": 1,
+				"length": 255,
+			},
+			{
 				"fieldname": "custom_microsoft_local_url",
 				"fieldtype": "Data",
 				"label": "Original URL",
-				"insert_after": "custom_microsoft_item_id",
+				"insert_after": "custom_microsoft_folder_id",
 				"read_only": 1,
 				"search_index": 1,
 				# The local file URL before the move: as long as the file name. Indexed, because

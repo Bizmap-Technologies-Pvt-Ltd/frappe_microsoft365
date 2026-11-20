@@ -815,6 +815,86 @@ def _eligible(file_doc, settings=None):
 	return bool(storage_option("files_archive_links")) and is_link(file_doc)
 
 
+#: The File fields that say where an attachment lives in SharePoint. Only the app writes them,
+#: always with frappe.db.set_value / db_set, which do not run validate; on_file_validate refuses
+#: them from anyone else.
+PROTECTED_FILE_FIELDS = (
+	"custom_microsoft_status",
+	"custom_microsoft_web_url",
+	"custom_microsoft_error",
+	"custom_microsoft_drive_id",
+	"custom_microsoft_item_id",
+	"custom_microsoft_folder_id",
+	"custom_microsoft_local_url",
+	"custom_microsoft_attempts",
+)
+
+
+def is_open_url(url):
+	"""Whether a file_url hands the file to open_file. Pure."""
+	from urllib.parse import unquote
+
+	return OPEN_METHOD in unquote(url or "").lower()
+
+
+def _same(a, b):
+	return str(a or "") == str(b or "")
+
+
+def on_file_validate(doc, method=None):
+	"""File.validate: only this app says where a File lives in SharePoint.
+
+	open_file, File.get_content and on_file_trash act on the drive and item a File names, as the
+	app, so a File anyone could point at any item would let them read or delete anything the app
+	can reach. Frappe does not enforce read_only over the API, and every user can create Files.
+	Refused here, on insert and on update: setting or changing any PROTECTED_FILE_FIELDS, and a
+	file_url that is, or was, the open_file address.
+
+	The app itself never comes through here: it writes these fields with frappe.db.set_value and
+	db_set, which skip validate. The one change allowed is a copy made by
+	File.create_attachment_copy (or Duplicate): a new File that repeats, field for field, a File
+	the user may read, as copies of a moved attachment have to.
+	"""
+	fields = PROTECTED_FILE_FIELDS if has_file_fields() else ()
+	before = None
+	if not doc.is_new():
+		before = doc.get_doc_before_save() or frappe.db.get_value(
+			"File", doc.name, ["file_url", *fields], as_dict=True
+		)
+	before = before or {}
+
+	changed = [f for f in fields if not _same(doc.get(f), before.get(f))]
+	url_changed = not _same(doc.file_url, before.get("file_url"))
+	if url_changed and (is_open_url(doc.file_url) or is_open_url(before.get("file_url"))):
+		changed.append("file_url")
+	if not changed:
+		return
+	if doc.is_new() and _copies_a_readable_file(doc, fields):
+		return
+	frappe.throw(
+		_("Where a file is stored in SharePoint is set by the Microsoft 365 app only ({0}).").format(
+			", ".join(changed)
+		),
+		frappe.PermissionError,
+	)
+
+
+def _copies_a_readable_file(doc, fields):
+	"""Is this new File a copy of an existing one the user may read? See on_file_validate."""
+	if not doc.file_url:
+		return False
+	for source in frappe.get_all(
+		"File",
+		filters={"file_url": doc.file_url, "name": ["!=", doc.name or ""]},
+		fields=["name", *fields],
+	):
+		if not all(_same(doc.get(f), source.get(f)) for f in fields):
+			continue
+		if doc.flags.ignore_permissions or frappe.has_permission("File", "read", doc=source.name):
+			return True
+	return False
+
+
 def on_file_insert(doc, method=None):
 	"""File.after_insert: queue the move. Never fails the upload itself."""
 	try:
@@ -889,7 +969,11 @@ def upload_file(file_name):
 			frappe.db.set_value(
 				"File",
 				file_name,
-				{"custom_microsoft_drive_id": _drive_of(item, folder), "custom_microsoft_item_id": item["id"]},
+				{
+					"custom_microsoft_drive_id": _drive_of(item, folder),
+					"custom_microsoft_item_id": item["id"],
+					"custom_microsoft_folder_id": folder.item_id,
+				},
 				update_modified=False,
 			)
 			frappe.db.commit()  # nosemgrep
@@ -904,6 +988,7 @@ def upload_file(file_name):
 		"custom_microsoft_status": STORED if local_url else ARCHIVED,
 		"custom_microsoft_drive_id": _drive_of(item, folder),
 		"custom_microsoft_item_id": item["id"],
+		"custom_microsoft_folder_id": folder.item_id,
 		"custom_microsoft_web_url": item.get("webUrl"),
 		"custom_microsoft_error": None,
 		"custom_microsoft_attempts": attempts,
@@ -1255,9 +1340,16 @@ def _remove_local_copy(local_url):
 
 
 def on_file_trash(doc, method=None):
-	"""File.on_trash: optionally send the SharePoint copy to the site's recycle bin."""
+	"""File.on_trash: optionally send the SharePoint copy to the site's recycle bin.
+
+	Only an item the app uploaded itself (Stored or Archived, in a record folder; see
+	assert_app_item) is ever deleted. Failed or Pending rows may hold the id of a partial upload,
+	which is left alone.
+	"""
 	item_id = doc.get("custom_microsoft_item_id")
 	if not item_id or not doc.get("custom_microsoft_drive_id"):
+		return
+	if doc.get("custom_microsoft_status") not in (STORED, ARCHIVED):
 		return
 	settings = _settings()
 	if not (files_enabled(settings) and storage_option("files_delete_remote", doc.attached_to_doctype)):
@@ -1267,7 +1359,16 @@ def on_file_trash(doc, method=None):
 	if others:
 		return
 	try:
+		assert_app_item(doc)
 		graph.graph_request("DELETE", f"/drives/{doc.custom_microsoft_drive_id}/items/{item_id}", APP)
+	except frappe.PermissionError:
+		_forget_message()
+		frappe.log_error(
+			title=_("Microsoft 365: SharePoint item not removed"),
+			message=_(
+				"File {0} names an item outside every record folder; it was left in SharePoint."
+			).format(doc.name),
+		)
 	except MsGraphNotFound:
 		_forget_message()
 		pass
@@ -1465,6 +1566,59 @@ def _stream(drive_id, item_id, filename, download=False):
 	return response
 
 
+def assert_app_item(file_doc):
+	"""Refuse to read or delete a File's SharePoint item unless the app put it in a record folder.
+
+	A File the upload job moved records the folder it went into, and only the app writes that
+	(see on_file_validate), so checking it against the SharePoint Folder rows costs no Graph call.
+	Files moved before that was recorded are checked by asking SharePoint where the item is: one
+	request for a file directly in its folder, one more per level of subfolder.
+
+	Raises PermissionError when the item is anywhere else, and MsGraphNotFound when SharePoint has
+	no such item at all.
+	"""
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	item_id = file_doc.get("custom_microsoft_item_id")
+	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
+		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
+
+	known = set(frappe.get_all("SharePoint Folder", filters={"drive_id": drive_id}, pluck="item_id"))
+	# A record folder is never a file of its own, whatever a File row says.
+	if item_id not in known:
+		folder_id = file_doc.get("custom_microsoft_folder_id")
+		if folder_id and folder_id in known:
+			return
+		if _inside_known_folder(drive_id, item_id, known):
+			return
+	raise frappe.PermissionError(_("{0} is not in a record's SharePoint folder.").format(file_doc.file_name))
+
+
+def _inside_known_folder(drive_id, item_id, known):
+	"""Ask SharePoint whether a file sits in one of the ``known`` folders, at any depth."""
+	item = graph.graph_request(
+		"GET", f"/drives/{drive_id}/items/{item_id}", APP, params={"$select": "id,file,parentReference"}
+	)
+	if "file" not in item:
+		return False
+	for _hop in range(MAX_FOLDER_DEPTH):
+		parent = item.get("parentReference") or {}
+		if parent.get("driveId") and parent["driveId"] != drive_id:
+			return False
+		current = parent.get("id")
+		if not current:
+			return False
+		if current in known:
+			return True
+		try:
+			item = graph.graph_request(
+				"GET", f"/drives/{drive_id}/items/{current}", APP, params={"$select": "id,parentReference"}
+			)
+		except MsGraphNotFound:
+			_forget_message()
+			return False
+	return False
+
+
 @frappe.whitelist(methods=["GET"])
 def open_file(file: str, download: int = 0):
 	"""Open a File that was moved to SharePoint. The file_url of every moved File points here.
@@ -1481,9 +1635,12 @@ def open_file(file: str, download: int = 0):
 	file_doc = find_file_by_url(stored_url(file))
 	if not file_doc:
 		raise frappe.PermissionError(_("You don't have permission to access this file"))
+	if file_doc.get("custom_microsoft_status") != STORED:
+		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
 	local = file_doc.get("custom_microsoft_local_url")
 	try:
+		assert_app_item(file_doc)
 		response = _stream(
 			file_doc.custom_microsoft_drive_id,
 			file_doc.custom_microsoft_item_id,
@@ -2003,6 +2160,121 @@ def upgrade_check_shared_folders():
 					"People who can read any of these records see every file in that folder. On the SharePoint Mapping, delete the Folders rows of the records that should not have it; their next attachment gets a folder of its own. Move their files in SharePoint first if needed."
 				),
 				target=rows[0].reference_doctype,
+			)
+		)
+	return out
+
+
+def upgrade_check_file_items():
+	"""Files whose SharePoint item cannot be shown to sit in a known record folder.
+
+	From 1.1.1 a File's SharePoint fields can only be set by the app, and opening, reading or
+	deleting a moved file checks that its item is in a record folder. Rows written before could
+	have been edited by anyone; this lists the ones that do not look like the app's own work, so
+	an admin can review them. Read only and without Graph: where a row records no folder (every
+	file moved before 1.1.1), its SharePoint address is compared with the folders' addresses.
+	"""
+	from frappe_microsoft365.doctor import FAIL, WARN, finding
+
+	if not has_file_fields():
+		return []
+	has_folder_id = frappe.get_meta("File").has_field("custom_microsoft_folder_id")
+	fields = [
+		"name",
+		"file_url",
+		"custom_microsoft_status",
+		"custom_microsoft_drive_id",
+		"custom_microsoft_item_id",
+		"custom_microsoft_web_url",
+	]
+	if has_folder_id:
+		fields.append("custom_microsoft_folder_id")
+	rows = [
+		frappe._dict(
+			name=r.name,
+			file_url=r.file_url,
+			status=r.custom_microsoft_status,
+			drive_id=r.custom_microsoft_drive_id,
+			item_id=r.custom_microsoft_item_id,
+			web_url=r.custom_microsoft_web_url,
+			folder_id=r.get("custom_microsoft_folder_id"),
+		)
+		for r in frappe.get_all(
+			"File",
+			or_filters={
+				"custom_microsoft_status": ["in", [STORED, ARCHIVED]],
+				"file_url": ["like", f"%{OPEN_METHOD}%"],
+			},
+			fields=fields,
+			order_by="name asc",
+		)
+	]
+	if not rows:
+		return []
+
+	folders = frappe.get_all("SharePoint Folder", fields=["drive_id", "item_id", "web_url"])
+	folder_ids = {(f.drive_id, f.item_id) for f in folders if f.item_id}
+	folder_urls = {(f.drive_id, (f.web_url or "").rstrip("/").lower()) for f in folders if f.web_url}
+
+	def under_known_folder(row):
+		if row.folder_id and (row.drive_id, row.folder_id) in folder_ids:
+			return True
+		url = (row.web_url or "").rstrip("/").lower()
+		while "/" in url:
+			url = url.rsplit("/", 1)[0]
+			if (row.drive_id, url) in folder_urls:
+				return True
+		return False
+
+	is_folder, odd_status, outside = [], [], []
+	for row in rows:
+		if (row.drive_id, row.item_id) in folder_ids:
+			is_folder.append(row)
+		elif row.status not in (STORED, ARCHIVED) or not (row.drive_id and row.item_id):
+			odd_status.append(row)
+		elif row.status == STORED and not is_open_url(row.file_url):
+			odd_status.append(row)
+		elif not under_known_folder(row):
+			outside.append(row)
+
+	fix = _(
+		"Open each File and compare its Item ID and Open in SharePoint address with the record it is attached to. Files the app moved itself are fine; a File that names someone else's item should be deleted. Until then the app refuses to open or delete what it names unless SharePoint confirms the item is in a record folder."
+	)
+	out = []
+	if is_folder:
+		out.append(
+			finding(
+				"upgrade.sharepoint_file_items",
+				FAIL,
+				_("{0} File(s) name a record's SharePoint folder as their item").format(len(is_folder)),
+				_names(is_folder),
+				fix,
+			)
+		)
+	if odd_status:
+		out.append(
+			finding(
+				"upgrade.sharepoint_file_items",
+				WARN,
+				_("{0} File(s) carry SharePoint fields the app would not have written").format(
+					len(odd_status)
+				),
+				_(
+					"They point at the app's open address without being marked Stored, or are marked Stored or Archived without an item: {0}"
+				).format(_names(odd_status)),
+				fix,
+			)
+		)
+	if outside:
+		out.append(
+			finding(
+				"upgrade.sharepoint_file_items",
+				WARN,
+				_("{0} File(s) in SharePoint are not under any known record folder").format(len(outside)),
+				_(
+					"Judged by their recorded SharePoint address, so a folder renamed or removed since the move also shows up here: {0}"
+				).format(_names(outside)),
+				fix,
 			)
 		)
 	return out

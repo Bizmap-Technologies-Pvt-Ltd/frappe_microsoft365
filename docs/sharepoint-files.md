@@ -59,6 +59,11 @@ Nothing is ever deleted from SharePoint by default. Removing an attachment in Fr
 SharePoint copy alone. **Remove from SharePoint when the attachment is deleted** changes that, and
 even then the file goes to the site's recycle bin. Deleting a record keeps its folder too.
 
+Where a File lives in SharePoint is the app's to say. The *Microsoft 365* fields on File and the
+`open_file` address cannot be set or changed through the form or the API (a copy of a moved
+attachment, which repeats them, is the exception), and the app only opens, reads or deletes an
+item that is in a record's folder.
+
 ### Options, site-wide and per DocType
 
 **SharePoint Settings** holds the defaults for every mapped DocType. Two of them can be set

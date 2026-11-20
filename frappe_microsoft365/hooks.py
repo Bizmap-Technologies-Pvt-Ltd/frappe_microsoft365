@@ -30,6 +30,9 @@ doc_events = {
 	# SharePoint document storage. Each handler returns at once unless Document Storage is on
 	# and the document's DocType is mapped, so the "*" entries cost one cached read.
 	"File": {
+		# Not gated on the capability: Files already in SharePoint keep opening after it is
+		# switched off, so their fields stay protected too.
+		"validate": "frappe_microsoft365.microsoft_files.on_file_validate",
 		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
 		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
 	},
@@ -47,6 +50,7 @@ extend_doctype_class = {
 # Read-only checks run after `bench migrate`; their findings form the upgrade report.
 microsoft365_upgrade_checks = {
 	"1.1.1": [
+		"frappe_microsoft365.microsoft_files.upgrade_check_file_items",
 		"frappe_microsoft365.microsoft_files.upgrade_check_shared_folders",
 	],
 }

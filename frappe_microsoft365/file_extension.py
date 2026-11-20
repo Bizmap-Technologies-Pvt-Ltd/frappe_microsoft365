@@ -32,6 +32,8 @@ class SharePointFile:
 
 		from frappe.core.doctype.file.file import FILE_ENCODING_OPTIONS
 
+		# The same check open_file makes: only an item the app put in a record folder is read.
+		microsoft_files.assert_app_item(self)
 		content = microsoft_files.fetch_content(self.custom_microsoft_drive_id, self.custom_microsoft_item_id)
 		if not content.startswith(OLE_FILE_SIGNATURE):
 			for encoding in encodings or FILE_ENCODING_OPTIONS:
