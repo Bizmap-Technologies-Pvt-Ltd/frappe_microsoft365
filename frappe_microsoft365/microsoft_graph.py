@@ -59,7 +59,8 @@ CALLBACK_METHOD = (
 MAX_RETRY_AFTER_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 2
 
-#: Safety valve for link-following loops (nextLink / deltaLink paging).
+#: Safety valve for link-following loops (nextLink / deltaLink paging). For a delta it is a
+#: per-run budget, not a limit: the calendar sync stores where it stopped and carries on.
 MAX_PAGES = 50
 
 #: Connection pool for the shared session, sized for a single worker process: Graph and the
@@ -669,24 +670,33 @@ def graph_paged(path, auth, headers=None, max_pages=MAX_PAGES):
 	return items
 
 
-def graph_delta(path, auth, headers=None, max_pages=MAX_PAGES):
-	"""Follow a delta query to the end. Returns ``(items, delta_link)``.
+def graph_delta(path, auth, headers=None, max_pages=None):
+	"""Follow a delta query for up to ``max_pages`` pages. Returns ``(items, delta_link, next_link)``.
 
 	``delta_link`` is the ``@odata.deltaLink`` to pass back on the next run; it is only
 	returned once every page has been consumed, so a partial read never advances the
 	watermark. Raises MsGraphResyncRequired (410) when the token is no longer valid.
+
+	``next_link`` is set instead when the page cap stopped the read before the end: it is where
+	the next run has to carry on from. Dropping it is what made a large calendar re-read the
+	same first pages on every run and never reach the rest. Exactly one of the two is set,
+	unless Graph ended the read with neither, which is answered with ``(items, None, None)``.
 	"""
 	items = []
 	next_path = path
 	delta_link = None
-	for _page in range(max_pages):
+	# Resolved at call time, so the cap is the module's current value rather than the one it had
+	# when this function was defined.
+	for _page in range(max_pages or MAX_PAGES):
 		resp = graph_request("GET", next_path, auth, headers=headers)
 		items.extend(resp.get("value") or [])
 		delta_link = resp.get("@odata.deltaLink")
 		next_path = resp.get("@odata.nextLink")
 		if delta_link or not next_path:
 			break
-	return items, delta_link
+	if delta_link:
+		return items, delta_link, None
+	return items, None, next_path or None
 
 
 def whoami(calendar):

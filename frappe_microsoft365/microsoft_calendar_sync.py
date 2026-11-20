@@ -450,6 +450,8 @@ def _sync_locked(doc):
 			pull_ok = False
 			messages.append(f"Pull failed: {e}")
 			frappe.log_error(title=f"MS Calendar pull failed: {calendar_name}")
+		if doc.flags.pull_warning:
+			messages.append(doc.flags.pull_warning)
 
 	if doc.push_to_microsoft_calendar:
 		try:
@@ -480,12 +482,17 @@ def _sync_locked(doc):
 	# meeting all over again. The watermark belongs with them.
 	frappe.db.commit()  # nosemgrep
 
+	summary = f"Pulled {pulled}, deleted {deleted}, pushed {pushed}."
+	if doc.flags.pull_unfinished:
+		# Not an error: a large calendar is read over several runs, and this says so.
+		summary += " " + _("More changes are waiting in Microsoft; the next sync carries on from here.")
+
 	return {
 		"ok": not messages,
 		"pulled": pulled,
 		"deleted": deleted,
 		"pushed": pushed,
-		"message": "; ".join(messages) or f"Pulled {pulled}, deleted {deleted}, pushed {pushed}.",
+		"message": "; ".join(messages) or summary,
 	}
 
 
@@ -503,7 +510,9 @@ def background_reasons(doc):
 
 	reasons = []
 	if doc.pull_from_microsoft_calendar:
-		if not doc.delta_link:
+		if doc.get("delta_next_link"):
+			reasons.append(_("The last sync stopped part-way through a large calendar and carries on from there."))
+		elif not doc.delta_link:
 			reasons.append(_("This is a first sync, so the whole calendar window is read."))
 		elif _delta_window_is_stale(doc):
 			reasons.append(_("The sync window has run out, so the calendar is read again in full."))
@@ -547,34 +556,87 @@ def _pending_push_count(doc):
 
 # --- pull (Graph -> Frappe) ----------------------------------------------------------
 
-def _initial_delta_path():
-	start = _iso_utc(add_to_date(now_datetime(), days=-WINDOW_PAST_DAYS))
-	end = _iso_utc(add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS))
+def _initial_delta_path(now=None):
+	now = now or now_datetime()
+	start = _iso_utc(add_to_date(now, days=-WINDOW_PAST_DAYS))
+	end = _iso_utc(add_to_date(now, days=WINDOW_FUTURE_DAYS))
 	return (
 		f"/me/calendarView/delta?startDateTime={start}&endDateTime={end}"
 		f"&$select={EVENT_SELECT}"
 	)
 
 
-def _delta_window_is_stale(doc):
-	"""True when the stored delta window is close to its end and must be re-initialised."""
-	if not doc.delta_window_end:
+def _window_end_is_stale(window_end):
+	"""True when a delta window ending at ``window_end`` is too close to its end to keep using."""
+	if not window_end:
 		return True
 	margin = add_to_date(now_datetime(), days=WINDOW_REFRESH_MARGIN_DAYS)
-	return get_datetime(doc.delta_window_end) <= margin
+	return get_datetime(window_end) <= margin
+
+
+def _delta_window_is_stale(doc):
+	"""True when the stored delta window is close to its end and must be re-initialised."""
+	return _window_end_is_stale(doc.delta_window_end)
+
+
+def _has_resume_point_fields():
+	"""Whether this site has migrated the resume-point columns yet.
+
+	The sync is scheduled, so it can run between the code update and `bench migrate`. Writing a
+	column that does not exist yet would fail the whole pull; without it the pull simply behaves
+	as it did before — each run reads as far as the page cap allows.
+	"""
+	return frappe.get_meta("Microsoft Calendar").has_field("delta_next_link")
+
+
+def _start_of_pull(doc):
+	"""Where this run's pull starts: ``(path, round_window_end)``.
+
+	A *round* is one full delta read, from its first page to the page that carries the
+	deltaLink. A large calendar can take several runs to get through one, so where it stopped
+	is kept as a resume point and the next run carries on from there instead of starting over.
+
+	``round_window_end`` is set when the round re-initialises the window, and is the end of the
+	window it asked Graph for — stored as ``delta_window_end`` once the round completes. It is
+	None for an incremental round, which keeps the window the stored deltaLink already has.
+	"""
+	resume = doc.get("delta_next_link")
+	resume_window_end = doc.get("delta_next_window_end")
+	if resume:
+		if resume_window_end:
+			# Carrying on with a first read. Only worth it while that window is still good.
+			if not _window_end_is_stale(resume_window_end):
+				return resume, get_datetime(resume_window_end)
+		elif doc.delta_link and not _delta_window_is_stale(doc):
+			return resume, None
+
+	if doc.delta_link and not _delta_window_is_stale(doc):
+		return doc.delta_link, None
+	return _new_round()
+
+
+def _new_round():
+	now = now_datetime()
+	return _initial_delta_path(now), add_to_date(now, days=WINDOW_FUTURE_DAYS)
 
 
 def _pull(doc):
-	"""Pull changes from Microsoft into Frappe. Returns (upserted, deleted)."""
-	reuse_delta = doc.delta_link and not _delta_window_is_stale(doc)
-	path = doc.delta_link if reuse_delta else _initial_delta_path()
+	"""Pull changes from Microsoft into Frappe. Returns (upserted, deleted).
+
+	Reads at most graph.MAX_PAGES pages per run. When that is not enough the round is left
+	unfinished: the link to the next page is stored as the resume point and the next run
+	carries on from it, so a large calendar catches up over a few runs instead of re-reading
+	the same first pages forever. ``doc.flags.pull_unfinished`` tells the caller this happened.
+	"""
+	path, round_window_end = _start_of_pull(doc)
 
 	try:
-		items, delta_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
+		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 	except MsGraphResyncRequired:
-		# Token expired or the mailbox was moved: start the window again from scratch.
-		items, delta_link = graph.graph_delta(_initial_delta_path(), doc.name, headers=UTC_PREFER)
-		reuse_delta = False
+		# Token expired or the mailbox was moved: start the window again from scratch. A resume
+		# point belongs to the round Graph has just refused, so it goes with it.
+		path, round_window_end = _new_round()
+		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 
 	# One query per 500 events instead of one per event. Asking "do I already have this one?"
 	# separately for every incoming event meant 500 round trips for a 500-event page, all of
@@ -596,13 +658,45 @@ def _pull(doc):
 	finally:
 		frappe.flags.in_microsoft_sync = False
 
-	# Only store the new watermark once every page was consumed without raising. Without a
-	# delta link we simply redo this window next run, which repeats work but loses nothing.
+	resumable = _has_resume_point_fields()
+
+	# Only store the new watermark once every page of the round was consumed without raising.
+	# Until then the old deltaLink stays exactly as it was: a round that never finishes repeats
+	# work, but never skips any.
 	if delta_link:
 		updates = {"delta_link": delta_link}
-		if not reuse_delta:
-			updates["delta_window_end"] = add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS)
+		if round_window_end:
+			updates["delta_window_end"] = round_window_end
+		if resumable:
+			updates.update({"delta_next_link": None, "delta_next_window_end": None})
 		frappe.db.set_value("Microsoft Calendar", doc.name, updates, update_modified=False)
+	elif next_link and resumable:
+		if next_link == path:
+			# Graph handed back the very page this run started from, so carrying on from it would
+			# read the same pages forever. Said out loud rather than repeated in silence.
+			raise MsGraphError(
+				_("Microsoft returned the same page again, so the calendar read is not moving forward.")
+			)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			doc.name,
+			{"delta_next_link": next_link, "delta_next_window_end": round_window_end},
+			update_modified=False,
+		)
+		doc.flags.pull_unfinished = True
+	elif next_link:
+		# Not migrated yet: nowhere to keep the resume point, so a calendar this large cannot
+		# move past its first pages until the site is migrated. Reported, not hidden.
+		doc.flags.pull_warning = _(
+			"The calendar has more changes than one sync reads. Run bench migrate so the sync can "
+			"carry on where it stopped."
+		)
+	else:
+		# Graph ended the read with neither a next page nor a deltaLink. Nothing is lost — the
+		# next run reads the same changes again — but it can never move forward like this.
+		raise MsGraphError(
+			_("Microsoft ended the calendar read without a sync link, so the next run reads it again.")
+		)
 
 	return upserted, removed
 

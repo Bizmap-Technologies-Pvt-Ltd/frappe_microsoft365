@@ -184,6 +184,7 @@ def disconnect(calendar_name: str):
 		"authorized": 0, "access_token": "", "refresh_token": "", "token_expiry": None,
 		"oauth_state": "", "oauth_state_expiry": None,
 		"delta_link": "", "delta_window_end": None, "last_error": "",
+		**_resume_point_cleared(),
 	})
 	# Tokens are also held in a request-local cache to keep a paging run from re-reading and
 	# re-decrypting them on every call. Wiping the row without wiping that cache would leave a
@@ -191,6 +192,16 @@ def disconnect(calendar_name: str):
 	# calls Graph afterwards, and exactly the kind of thing that stops being harmless quietly.
 	graph.clear_token_cache(calendar_name)
 	return {"disconnected": True}
+
+
+def _resume_point_cleared():
+	"""Values that drop an unfinished pull's resume point, on sites that have the columns."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	return {
+		fieldname: None
+		for fieldname in ("delta_next_link", "delta_next_window_end")
+		if meta.has_field(fieldname)
+	}
 
 
 @frappe.whitelist()

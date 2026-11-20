@@ -52,19 +52,34 @@ class TestGraphPaging(BaseTestCase):
 			{"value": [{"id": "b"}], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=2"},
 		]
 		with patch.object(graph, "graph_request", side_effect=pages):
-			items, delta_link = graph.graph_delta("/me/calendarView/delta", "cal")
+			items, delta_link, next_link = graph.graph_delta("/me/calendarView/delta", "cal")
 
 		self.assertEqual([i["id"] for i in items], ["a", "b"])
 		self.assertEqual(delta_link, "https://graph.microsoft.com/v1.0/delta?token=2")
+		self.assertIsNone(next_link)
 
 	def test_delta_link_is_none_when_paging_is_cut_short(self):
 		"""A truncated read must NOT hand back a watermark, or the rest is skipped forever."""
 		endless = {"value": [{"id": "x"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"}
 		with patch.object(graph, "graph_request", return_value=endless):
-			items, delta_link = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
+			items, delta_link, _next = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
 
 		self.assertEqual(len(items), 2)
 		self.assertIsNone(delta_link)
+
+	def test_a_read_cut_short_hands_back_where_it_stopped(self):
+		"""Regression (#18): the page cap used to throw the nextLink away, so the next run started
+		over from the first page and never got past it."""
+		pages = [
+			{"value": [{"id": "a"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2"},
+			{"value": [{"id": "b"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/page3"},
+		]
+		with patch.object(graph, "graph_request", side_effect=pages):
+			items, delta_link, next_link = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
+
+		self.assertEqual([i["id"] for i in items], ["a", "b"])
+		self.assertIsNone(delta_link)
+		self.assertEqual(next_link, "https://graph.microsoft.com/v1.0/page3")
 
 
 class TestGraphRequestBehaviour(BaseTestCase):

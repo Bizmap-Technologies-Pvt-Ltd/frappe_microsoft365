@@ -51,8 +51,14 @@ Worth knowing before you trust it with a real calendar:
   on the Microsoft Calendar and is the sync watermark.
 - **A failed pull never advances the watermark.** If Graph errors halfway, the next run repeats
   that window instead of skipping it. The reason is written to **Last Sync Error** on the form.
-- **Every page is read.** Collection reads follow `@odata.nextLink` to the end, so a calendar
-  with hundreds of events in the window imports completely, not just the first page.
+- **Every page is read, over as many runs as it takes.** The pull follows `@odata.nextLink` for
+  up to 50 pages (about 2,500 events) per run. A larger first sync or backlog stores where it
+  stopped and the next run carries on from there; the delta link only moves once the last page
+  has been read. If Microsoft stops handing out links that move forward, it says so in
+  **Last Sync Error**.
+- **Events only go to their owner's calendar.** An Event is pushed, patched or deleted in
+  Microsoft only when its owner is the user of the Microsoft Calendar it links to. Linking an
+  Event to somebody else's connection is refused on save, for System Managers too.
 - **Origin decides who wins.** An Event that originated in Frappe keeps
   `custom_pulled_from_microsoft = 0` for life: the pull refreshes its subject, times and
   location from Outlook but never overwrites its description (Graph only returns a truncated

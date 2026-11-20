@@ -30,7 +30,9 @@
   "last_sync_seconds",
   "last_error",
   "delta_link",
-  "delta_window_end"
+  "delta_window_end",
+  "delta_next_link",
+  "delta_next_window_end"
  ],
  "fields": [
   {
@@ -200,11 +202,29 @@
    "read_only": 1,
    "hidden": 1,
    "no_copy": 1
+  },
+  {
+   "fieldname": "delta_next_link",
+   "fieldtype": "Small Text",
+   "label": "Delta Resume Link",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1,
+   "description": "Where an unfinished pull carries on from on the next run. Set by the sync only."
+  },
+  {
+   "fieldname": "delta_next_window_end",
+   "fieldtype": "Datetime",
+   "label": "Delta Resume Window End",
+   "read_only": 1,
+   "hidden": 1,
+   "no_copy": 1,
+   "description": "The window end of an unfinished first read, applied when it completes. Set by the sync only."
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-06-28 00:00:00",
+ "modified": "2026-11-21 00:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Calendar",
  "naming_rule": "By fieldname",
