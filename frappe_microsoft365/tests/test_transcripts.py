@@ -23,7 +23,9 @@ ATTRIBUTION_REFUSAL = (
 	f"Microsoft Graph GET {PATH} failed (403): Forbidden: Speaker-attributed transcript content "
 	"is disabled for this tenant. Retry with Accept 'application/vnd.microsoft.graph.transcript+text'."
 )
-TENANT_SWITCH_REFUSAL = f"Microsoft Graph GET {PATH} failed (403): Forbidden: GraphAccessToTranscriptsDisabled"
+TENANT_SWITCH_REFUSAL = (
+	f"Microsoft Graph GET {PATH} failed (403): Forbidden: GraphAccessToTranscriptsDisabled"
+)
 BARE_403 = f"Microsoft Graph GET {PATH} failed (403): Forbidden"
 
 
@@ -123,9 +125,15 @@ class TestTranscriptContent(ArtifactsTestCase):
 		self.assertEqual(result["format"], ms.PLAIN_TEXT_FORMAT)
 
 	def test_join_url_lookup_says_which_format_it_returns(self):
-		with patch.object(ms, "_resolve_online_meeting_id", return_value="meeting-1"), patch.object(
-			ms, "list_transcripts", return_value=[{"id": "t1", "created_date_time": "2026-09-12T11:00:00Z"}]
-		), _graph(MsGraphError(ATTRIBUTION_REFUSAL), FakeResponse(PLAIN, ms.PLAIN_TEXT_FORMAT)):
+		with (
+			patch.object(ms, "_resolve_online_meeting_id", return_value="meeting-1"),
+			patch.object(
+				ms,
+				"list_transcripts",
+				return_value=[{"id": "t1", "created_date_time": "2026-09-12T11:00:00Z"}],
+			),
+			_graph(MsGraphError(ATTRIBUTION_REFUSAL), FakeResponse(PLAIN, ms.PLAIN_TEXT_FORMAT)),
+		):
 			result = ms.get_transcripts_for_join_url(CALENDAR, "https://teams.microsoft.com/l/x")
 
 		self.assertEqual(result["latest_vtt"], PLAIN)
@@ -147,7 +155,7 @@ class TestPlainTextTranscriptIsAttached(ArtifactsTestCase):
 		hash before the extension when another File already took the name, so exact names would
 		depend on what earlier tests left behind."""
 		self.assertEqual(len(names), len(expected), names)
-		for name, (stem, extension) in zip(names, expected):
+		for name, (stem, extension) in zip(names, expected, strict=True):
 			self.assertTrue(name.startswith(stem) and name.endswith(extension), (name, stem, extension))
 
 	def _fetch_with_attribution_off(self, event, transcripts):
@@ -157,9 +165,11 @@ class TestPlainTextTranscriptIsAttached(ArtifactsTestCase):
 			# Distinct bodies: Frappe renames a File whose content matches one already stored.
 			body = f"{PLAIN}{transcript['id']}\n"
 			answers += [MsGraphError(ATTRIBUTION_REFUSAL), FakeResponse(body, ms.PLAIN_TEXT_FORMAT)]
-		with patch.object(ms, "list_transcripts", return_value=transcripts), patch.object(
-			ms, "list_recordings", return_value=[]
-		), _graph(*answers):
+		with (
+			patch.object(ms, "list_transcripts", return_value=transcripts),
+			patch.object(ms, "list_recordings", return_value=[]),
+			_graph(*answers),
+		):
 			return artifacts.fetch_meeting_artifacts(event.name)
 
 	def test_it_is_stored_as_txt_and_the_fetch_counts_as_done(self):
