@@ -2095,3 +2095,123 @@ class TestALargeCalendarCatchesUp(SyncTestCase):
 
 		self.assertFalse(self._stored("delta_next_link"))
 		self.assertFalse(self._stored("delta_next_window_end"))
+
+
+class TestSyncStateIsServerManaged(SyncTestCase):
+	"""The delta links are called with the owner's token, so nobody may set them from outside."""
+
+	def setUp(self):
+		super().setUp()
+		self.person = _ensure_user("m365-owner-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", self.person)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": f"{GRAPH}/me/calendarView/delta?$deltatoken=real",
+				"delta_window_end": add_to_date(now_datetime(), days=90),
+			},
+		)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def test_the_owner_cannot_change_delta_link_through_the_api(self):
+		"""Regression: read_only is a form setting; the API wrote whatever it was sent."""
+		from frappe.client import set_value
+
+		frappe.set_user(self.person)
+		for field, value in (
+			("delta_link", "http://169.254.169.254/latest/meta-data"),
+			("delta_window_end", "2099-01-01 00:00:00"),
+			("delta_next_link", "https://attacker.example/x"),
+			("delta_next_window_end", "2099-01-01 00:00:00"),
+		):
+			set_value("Microsoft Calendar", CALENDAR, field, value)
+
+		frappe.set_user("Administrator")
+		stored = frappe.db.get_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			["delta_link", "delta_window_end", "delta_next_link", "delta_next_window_end"],
+			as_dict=True,
+		)
+		self.assertEqual(stored.delta_link, f"{GRAPH}/me/calendarView/delta?$deltatoken=real")
+		self.assertNotEqual(str(stored.delta_window_end)[:4], "2099")
+		self.assertFalse(stored.delta_next_link)
+		self.assertFalse(stored.delta_next_window_end)
+
+	def test_a_new_connection_cannot_be_created_with_sync_state(self):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Microsoft Calendar",
+				"account_name": "_Test MS Calendar seeded",
+				"user": "Administrator",
+				"delta_link": "https://attacker.example/x",
+				"delta_window_end": "2099-01-01 00:00:00",
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Microsoft Calendar", doc.name, force=True, ignore_permissions=True)
+
+		self.assertFalse(frappe.db.get_value("Microsoft Calendar", doc.name, "delta_link"))
+		self.assertFalse(frappe.db.get_value("Microsoft Calendar", doc.name, "delta_window_end"))
+
+	def test_an_ordinary_save_keeps_the_sync_state(self):
+		doc = frappe.get_doc("Microsoft Calendar", CALENDAR)
+		doc.pull_from_microsoft_calendar = 0
+		doc.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"),
+			f"{GRAPH}/me/calendarView/delta?$deltatoken=real",
+		)
+
+	def test_a_form_opened_before_a_sync_does_not_roll_the_watermark_back(self):
+		stale_form = frappe.get_doc("Microsoft Calendar", CALENDAR)
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, "delta_link", f"{GRAPH}/me/calendarView/delta?$deltatoken=newer",
+			update_modified=False,
+		)
+
+		stale_form.pull_from_microsoft_calendar = 0
+		stale_form.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"),
+			f"{GRAPH}/me/calendarView/delta?$deltatoken=newer",
+		)
+
+
+class TestClearNonGraphDeltaLinksPatch(SyncTestCase):
+	def test_clears_only_links_that_are_not_graph_and_is_idempotent(self):
+		from frappe_microsoft365.patches import clear_non_graph_delta_links
+
+		good = f"{GRAPH}/me/calendarView/delta?$deltatoken=ok"
+		other = frappe.get_doc(
+			{"doctype": "Microsoft Calendar", "account_name": "_Test MS Calendar good", "user": "Administrator"}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Microsoft Calendar", other.name, force=True, ignore_permissions=True)
+		window_end = add_to_date(now_datetime(), days=90)
+		frappe.db.set_value("Microsoft Calendar", other.name, {"delta_link": good, "delta_window_end": window_end})
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": "http://169.254.169.254/latest/meta-data",
+				"delta_window_end": window_end,
+				"delta_next_link": "https://graph.microsoft.com.attacker.example/x",
+				"delta_next_window_end": window_end,
+			},
+		)
+
+		clear_non_graph_delta_links.execute()
+		clear_non_graph_delta_links.execute()
+
+		cleared = frappe.db.get_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			["delta_link", "delta_window_end", "delta_next_link", "delta_next_window_end"],
+			as_dict=True,
+		)
+		self.assertFalse(any(cleared.values()), cleared)
+		self.assertEqual(frappe.db.get_value("Microsoft Calendar", other.name, "delta_link"), good)
+		self.assertTrue(frappe.db.get_value("Microsoft Calendar", other.name, "delta_window_end"))

@@ -15,11 +15,44 @@ from frappe_microsoft365 import microsoft_graph as graph
 #: An authorize link that is never followed should not stay usable forever.
 OAUTH_STATE_TTL_MINUTES = 15
 
+#: Sync state that only the sync engine writes, always with frappe.db.set_value. The form shows
+#: them read-only, but Frappe does not enforce read_only over the API, and the delta links are
+#: URLs the worker later calls with the user's token attached — so a save never changes them.
+SERVER_MANAGED_FIELDS = (
+	"delta_link",
+	"delta_window_end",
+	"delta_next_link",
+	"delta_next_window_end",
+)
+
 
 class MicrosoftCalendar(Document):
 	def before_insert(self):
 		if not self.user:
 			self.user = frappe.session.user
+
+	def validate(self):
+		self._keep_server_managed_fields()
+
+	def _keep_server_managed_fields(self):
+		"""Put the sync state back to what is stored, whatever the save carried.
+
+		Restored rather than refused: a form opened before a sync finished carries the old
+		values back on its next save, and that is no reason to fail the save — nor to let it
+		roll the watermark back. A new connection starts with no sync state at all.
+		"""
+		meta = frappe.get_meta(self.doctype)
+		fieldnames = [f for f in SERVER_MANAGED_FIELDS if meta.has_field(f)]
+		if self.is_new():
+			stored = {}
+		else:
+			# Read from the database when there is no snapshot (validate run by hand), never
+			# assumed empty: blanking these on an ordinary save would restart the sync.
+			stored = self.get_doc_before_save() or frappe.db.get_value(
+				self.doctype, self.name, fieldnames, as_dict=True
+			) or {}
+		for fieldname in fieldnames:
+			self.set(fieldname, stored.get(fieldname))
 
 	def get_access_token(self):
 		return graph.get_valid_access_token(self.name)
