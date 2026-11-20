@@ -495,20 +495,20 @@ def _get_by_path(drive_id, segments, parent_id=None):
 		return None
 
 
-def _create_folder(drive_id, parent_id, name):
-	"""Create a folder, or return the one a concurrent job created a moment earlier."""
+def _create_folder(drive_id, parent_id, name, conflict="fail"):
+	"""Create a folder.
+
+	With ``conflict="fail"`` (base folders, the connection probe) a folder that is already there
+	under that name is returned instead: a base folder is shared by every record, and a concurrent
+	job may have created it a moment earlier. With ``"rename"`` SharePoint always creates a new
+	folder, naming it ``Name 1`` when ``Name`` is taken; record folders are made that way.
+	"""
 	parent = f"/drives/{drive_id}/items/{parent_id}" if parent_id else f"/drives/{drive_id}/root"
+	body = {"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": conflict}
+	if conflict != "fail":
+		return graph.graph_request("POST", f"{parent}/children", APP, json=body)
 	try:
-		return graph.graph_request(
-			"POST",
-			f"{parent}/children",
-			APP,
-			json={
-				"name": name,
-				"folder": {},
-				"@microsoft.graph.conflictBehavior": "fail",
-			},
-		)
+		return graph.graph_request("POST", f"{parent}/children", APP, json=body)
 	except MsGraphConflict:
 		_forget_message()
 		existing = _get_by_path(drive_id, [name], parent_id=parent_id)
@@ -552,7 +552,12 @@ def get_folder(doctype, name):
 
 
 def ensure_folder(doctype, name):
-	"""The folder for a record, created in SharePoint (and recorded here) on first use."""
+	"""The folder for a record, created in SharePoint (and recorded here) on first use.
+
+	Commits when it creates one. Each call that creates makes a new folder (see
+	new_folder_values), so the record of it has to outlive whatever the caller does next: rolled
+	back with a failed upload, the retry would make a second folder beside the first.
+	"""
 	existing = get_folder(doctype, name)
 	if existing:
 		return existing
@@ -561,14 +566,26 @@ def ensure_folder(doctype, name):
 	if not row:
 		frappe.throw(_("{0} is not mapped to SharePoint in Microsoft Settings.").format(_(doctype)))
 
-	values = new_folder_values(row, doctype, name)
+	from frappe.utils.synchronization import filelock
 
-	# A second job may have finished first; one record per document, whoever wins.
-	existing = get_folder(doctype, name)
-	if existing:
-		return existing
+	# Several attachments of one record are uploaded by parallel jobs. One at a time here, or
+	# each would create its own folder.
+	with filelock(_folder_lock_name(doctype, name), timeout=60):
+		# A fresh transaction, so that a folder another job committed while this one waited is seen.
+		frappe.db.commit()  # nosemgrep
+		existing = get_folder(doctype, name)
+		if existing:
+			return existing
+		record = add_folder_row(doctype, name, new_folder_values(row, doctype, name))
+		frappe.db.commit()  # nosemgrep: the folder exists in SharePoint now; see the docstring
+	return frappe._dict(record.as_dict())
 
-	return frappe._dict(add_folder_row(doctype, name, values).as_dict())
+
+def _folder_lock_name(doctype, name):
+	"""A lock file name for one record. Hashed: record names may hold slashes and other characters."""
+	import hashlib
+
+	return "microsoft365-folder-" + hashlib.md5(f"{doctype}\0{name}".encode()).hexdigest()
 
 
 def add_folder_row(doctype, name, values):
@@ -585,6 +602,7 @@ def add_folder_row(doctype, name, values):
 		)[0][0]
 		or 0
 	)
+	assert_folder_unclaimed(values.get("item_id"), doctype, name)
 	record = frappe.get_doc(
 		{
 			"doctype": "SharePoint Folder",
@@ -608,13 +626,47 @@ def touch_mapping(doctype):
 	frappe.db.set_value("SharePoint Mapping", doctype, "modified", now_datetime(), update_modified=False)
 
 
+def assert_folder_unclaimed(item_id, doctype, name):
+	"""Refuse a folder that is already another record's folder.
+
+	Whoever can read a record sees and opens everything in its folder, so two records on one
+	folder would each show the other's files.
+	"""
+	if not item_id:
+		return
+	for other in frappe.get_all(
+		"SharePoint Folder",
+		filters={"item_id": item_id},
+		fields=["reference_doctype", "reference_name"],
+	):
+		if (other.reference_doctype, other.reference_name) != (doctype, name):
+			frappe.throw(
+				_(
+					"That SharePoint folder is already the folder of {0} {1}. Each record needs a folder of its own."
+				).format(_(other.reference_doctype), other.reference_name),
+				frappe.DuplicateEntryError,
+			)
+
+
 def new_folder_values(row, doctype, name):
-	"""Create (or find) the record's folder where its mapping says, and return the fields to store."""
+	"""Create the record's own folder where its mapping says, and return the fields to store.
+
+	Always a new folder. One already there under the same name belongs to someone else: another
+	record with the same title, or a name that is the same once cleaned for SharePoint, or a
+	deleted record whose folder was kept. So SharePoint is asked to pick a free name (``PRJ-0001
+	1``) rather than hand that folder over. Using a folder that already exists is something an
+	administrator does on purpose, with Existing Folder on the mapping's Folders table.
+	"""
 	_site_id, drive_id = resolve_drive(row)
 	doc = frappe.get_doc(doctype, name)
 	folder_name = render_pattern(row.folder_pattern, doc)
-	segments = [*base_segments(row), folder_name]
-	item = ensure_path(drive_id, segments)
+	base = base_segments(row)
+	parent_id = ensure_path(drive_id, base)["id"] if base else None
+	item = _create_folder(drive_id, parent_id, folder_name, conflict="rename")
+	if "folder" not in item:
+		frappe.throw(_("SharePoint did not create the folder {0}.").format(folder_name), MsGraphError)
+	folder_name = item.get("name") or folder_name
+	segments = [*base, folder_name]
 	return {
 		"folder_name": folder_name,
 		"drive_id": drive_id,
@@ -810,11 +862,18 @@ def upload_file(file_name):
 	frappe.db.set_value("File", file_name, "custom_microsoft_attempts", attempts, update_modified=False)
 	frappe.db.commit()  # nosemgrep
 
-	# A savepoint, not a full rollback, on failure: a half-recorded folder must not survive, but
-	# neither should the caller's own unrelated writes be thrown away with it.
-	frappe.db.savepoint("microsoft365_upload")
+	# ensure_folder commits the folder it creates (see there), so it runs before the savepoint.
 	try:
 		folder = ensure_folder(file_doc.attached_to_doctype, file_doc.attached_to_name)
+	except Exception as e:
+		frappe.db.rollback()
+		_record_failure(file_name, attempts, e)
+		return
+
+	# A savepoint, not a full rollback, on failure: the caller's own unrelated writes must not be
+	# thrown away with the upload's.
+	frappe.db.savepoint("microsoft365_upload")
+	try:
 		item = _already_uploaded(file_doc, folder)
 		if not item:
 			try:
@@ -835,7 +894,7 @@ def upload_file(file_name):
 			)
 			frappe.db.commit()  # nosemgrep
 	except Exception as e:
-		frappe.db.rollback(save_point="microsoft365_upload")
+		_rollback_to("microsoft365_upload")
 		_record_failure(file_name, attempts, e)
 		return
 
@@ -870,6 +929,18 @@ def upload_file(file_name):
 		_repoint_links(file_doc, local_url, values["file_url"])
 	if local_url and not keep_local:
 		_remove_local_copy(local_url)
+
+
+def _rollback_to(savepoint):
+	"""Roll back to a savepoint, or the whole transaction if a commit since has released it.
+
+	ensure_folder commits when it has to recreate a folder mid-upload, and MariaDB forgets
+	savepoints on commit.
+	"""
+	try:
+		frappe.db.rollback(save_point=savepoint)
+	except Exception:
+		frappe.db.rollback()
 
 
 def _drive_of(item, folder):
@@ -1880,3 +1951,58 @@ def leave_in_sharepoint(file_name):
 			update_modified=False,
 		)
 	return web_url
+
+
+# --- upgrade checks (read only; run after `bench migrate`) -------------------------------------
+
+#: How many names an upgrade finding lists before it says "and N more".
+UPGRADE_LIST_LIMIT = 20
+
+
+def _names(rows):
+	names = [r if isinstance(r, str) else r.name for r in rows]
+	shown = ", ".join(names[:UPGRADE_LIST_LIMIT])
+	if len(names) > UPGRADE_LIST_LIMIT:
+		shown += " " + _("and {0} more").format(len(names) - UPGRADE_LIST_LIMIT)
+	return shown
+
+
+def upgrade_check_shared_folders():
+	"""SharePoint Folder rows of different records that point at one folder.
+
+	Until 1.1.1 a record could be given a folder that was already another record's (same title,
+	names equal once cleaned, a deleted record's kept folder). Each record's readers see the whole
+	folder, so such records show each other's files. The app cannot tell which record the folder
+	belongs to, so it only reports them. Read only.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	groups = {}
+	for row in frappe.get_all(
+		"SharePoint Folder",
+		filters={"item_id": ["is", "set"]},
+		fields=["item_id", "reference_doctype", "reference_name", "folder_path"],
+		order_by="reference_doctype asc, reference_name asc",
+	):
+		groups.setdefault(row.item_id, []).append(row)
+
+	out = []
+	for rows in groups.values():
+		records = sorted({(r.reference_doctype, r.reference_name) for r in rows})
+		if len(records) < 2:
+			continue
+		out.append(
+			finding(
+				"upgrade.sharepoint_shared_folders",
+				WARN,
+				_("{0} records share the SharePoint folder {1}").format(
+					len(records), rows[0].folder_path or rows[0].item_id
+				),
+				", ".join(f"{_(dt)} {name}" for dt, name in records),
+				_(
+					"People who can read any of these records see every file in that folder. On the SharePoint Mapping, delete the Folders rows of the records that should not have it; their next attachment gets a folder of its own. Move their files in SharePoint first if needed."
+				),
+				target=rows[0].reference_doctype,
+			)
+		)
+	return out

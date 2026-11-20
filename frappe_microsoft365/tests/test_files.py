@@ -116,6 +116,9 @@ def configure(test, **overrides):
 	return mapping
 
 
+LIBRARY_URL = "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"
+
+
 class FakeGraph:
 	"""Answers the Graph calls microsoft_files makes, and records them."""
 
@@ -124,6 +127,8 @@ class FakeGraph:
 		self.items = {"FOLDER": {"id": "FOLDER", "parent": "BASE"}, "BASE": {"id": "BASE", "parent": "ROOT"}}
 		self.fail_upload = None
 		self.web_url_padding = ""
+		# Folders created through POST .../children, by parent: name -> id.
+		self.children = {}
 
 	def __call__(
 		self,
@@ -142,6 +147,10 @@ class FakeGraph:
 		self.calls.append((method, path))
 		if method == "GET" and path == "/drives/DRIVE":
 			return {"webUrl": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"}
+		if method == "GET" and path == "/drives/DRIVE/root:/Projects:":
+			return {"id": "BASE", "folder": {}, "webUrl": LIBRARY_URL + "/Projects"}
+		if method == "POST" and path.endswith("/children"):
+			return self.create_folder(path, json)
 		if method == "GET" and path == "/drives/DRIVE/root:/Projects/" + path.rsplit("/", 1)[-1]:
 			return {"id": "FOLDER", "folder": {}, "webUrl": "https://contoso.sharepoint.com/f"}
 		if method == "GET" and ":/Projects/" in path:
@@ -171,6 +180,42 @@ class FakeGraph:
 				"parentReference": {"driveId": "DRIVE", "id": item.get("parent")},
 			}
 		raise AssertionError(f"unexpected Graph call {method} {path}")
+
+	def create_folder(self, path, body):
+		"""POST .../children as Graph answers it, conflictBehavior included."""
+		parent = (
+			"ROOT" if path == "/drives/DRIVE/root/children" else path.split("/items/", 1)[1].split("/")[0]
+		)
+		taken = self.children.setdefault(parent, {})
+		name = body["name"]
+		behaviour = body.get("@microsoft.graph.conflictBehavior")
+		if name in taken:
+			if behaviour == "fail":
+				from frappe_microsoft365.microsoft_graph import MsGraphConflict
+
+				raise MsGraphConflict("409 nameAlreadyExists")
+			if behaviour == "rename":
+				n = 1
+				while f"{name} {n}" in taken:
+					n += 1
+				name = f"{name} {n}"
+		# The first record folder is FOLDER, which the other fakes know; later ones are new ids.
+		created = sum(len(c) for c in self.children.values())
+		item_id = (
+			"FOLDER"
+			if not created and "FOLDER" not in self.children.get(parent, {}).values()
+			else f"FOLDER-{created + 1}"
+		)
+		taken[name] = item_id
+		web_url = LIBRARY_URL + ("/Projects/" if parent == "BASE" else "/") + name
+		self.items[item_id] = {"id": item_id, "name": name, "parent": parent, "webUrl": web_url}
+		return {
+			"id": item_id,
+			"name": name,
+			"folder": {"childCount": 0},
+			"webUrl": web_url,
+			"parentReference": {"driveId": "DRIVE", "id": parent},
+		}
 
 
 class FilesTestCase(BaseTestCase):
@@ -524,11 +569,8 @@ class TestUpload(FilesTestCase):
 		mapping.use_base_folder = 0
 		mapping.save()
 		self.assertEqual(files.base_segments(files.mapping_for(MAPPED)), [])
-		with patch.object(
-			files, "ensure_path", return_value={"id": "TOP", "webUrl": "https://contoso.sharepoint.com/top"}
-		) as ensure:
-			folder = files.ensure_folder(MAPPED, self.todo.name)
-		ensure.assert_called_once_with("DRIVE", [files.safe_name(self.todo.name)])
+		folder = files.ensure_folder(MAPPED, self.todo.name)
+		self.assertIn(("POST", "/drives/DRIVE/root/children"), self.graph.calls)
 		self.assertEqual(folder.folder_path, files.safe_name(self.todo.name))
 
 	def test_old_links_redirect_to_the_moved_file(self):
@@ -1410,3 +1452,118 @@ class TestInlineTypes(BaseTestCase):
 			response = files._stream("DRIVE", "ITEM", "report")
 		self.assertIn("attachment", response.headers["Content-Disposition"])
 		self.assertEqual(response.content_type, "application/octet-stream")
+
+
+# --- only the app says where a File lives in SharePoint ------------------------------------------
+
+
+class TestOwnFolders(FilesTestCase):
+	def folder_of(self, todo):
+		return files.ensure_folder(MAPPED, todo.name)
+
+	def by_title(self):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_pattern = "{title}"
+		mapping.save()
+
+	def test_two_records_with_the_same_title_get_different_folders(self):
+		self.by_title()
+		one = frappe.get_doc({"doctype": "ToDo", "description": "Same title"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "Same title"}).insert()
+		a, b = self.folder_of(one), self.folder_of(two)
+		self.assertNotEqual(a.item_id, b.item_id)
+		self.assertEqual((a.folder_name, b.folder_name), ("Same title", "Same title 1"))
+		self.assertEqual(b.folder_path, "Projects/Same title 1")
+
+	def test_names_that_collide_after_cleaning_get_different_folders(self):
+		self.by_title()
+		one = frappe.get_doc({"doctype": "ToDo", "description": "A/B"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "A-B"}).insert()
+		self.assertNotEqual(self.folder_of(one).item_id, self.folder_of(two).item_id)
+
+	def test_a_new_record_does_not_inherit_a_deleted_records_folder(self):
+		name = f"S4-{frappe.generate_hash(length=6)}"
+		old = frappe.get_doc({"doctype": "ToDo", "description": "old"}).insert(set_name=name)
+		kept = self.folder_of(old)
+		frappe.delete_doc(MAPPED, name, force=True)
+		new = frappe.get_doc({"doctype": "ToDo", "description": "new"}).insert(set_name=name)
+		self.assertNotEqual(self.folder_of(new).item_id, kept.item_id)
+
+	def test_base_folders_are_still_shared(self):
+		one = frappe.get_doc({"doctype": "ToDo", "description": "one"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "two"}).insert()
+		self.folder_of(one), self.folder_of(two)
+		posts = [p for m, p in self.graph.calls if m == "POST"]
+		self.assertEqual(posts, ["/drives/DRIVE/items/BASE/children"] * 2)
+
+	def test_the_app_never_records_another_records_folder(self):
+		self.folder_of(self.todo)
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		with self.assertRaises(frappe.DuplicateEntryError):
+			files.add_folder_row(MAPPED, other.name, {"drive_id": "DRIVE", "item_id": "FOLDER"})
+
+
+class TestLinkedFolders(FilesTestCase):
+	def add_row(self, todo, **row):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.append("folders", {"reference_name": todo.name, **row})
+		mapping.save()
+		return frappe.get_doc("SharePoint Folder", {"parent": MAPPED, "reference_name": todo.name})
+
+	def test_an_admin_cannot_link_another_records_folder(self):
+		self.add_row(self.todo, existing_folder="Projects/Already there")
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		with self.assertRaises(frappe.DuplicateEntryError):
+			self.add_row(other, existing_folder="Projects/Already there")
+
+	def test_ids_typed_into_a_new_row_are_not_used(self):
+		row = self.add_row(self.todo, item_id="BASE", drive_id="DRIVE")
+		self.assertNotEqual(row.item_id, "BASE")
+		self.assertIn(("POST", "/drives/DRIVE/items/BASE/children"), self.graph.calls)
+
+	def test_the_folder_of_a_saved_row_cannot_be_changed(self):
+		files.create_folder(MAPPED, self.todo.name)
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folders[0].item_id = "BASE"
+		with self.assertRaises(frappe.PermissionError):
+			mapping.save()
+
+
+class TestSharedFoldersCheck(FilesTestCase):
+	def folder_row(self, reference_name, item_id):
+		"""A Folders row as 1.1.0 could leave it, written past every check."""
+		frappe.get_doc(
+			{
+				"doctype": "SharePoint Folder",
+				"parent": MAPPED,
+				"parenttype": "SharePoint Mapping",
+				"parentfield": "folders",
+				"reference_doctype": MAPPED,
+				"reference_name": reference_name,
+				"drive_id": "DRIVE",
+				"item_id": item_id,
+				"folder_path": f"Projects/{item_id}",
+			}
+		).db_insert()
+
+	def test_records_sharing_a_folder_are_reported(self):
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		self.folder_row(self.todo.name, "SHARED-1")
+		self.folder_row(other.name, "SHARED-1")
+		self.folder_row(other.name + "-x", "OWN-1")
+		found = [f for f in files.upgrade_check_shared_folders() if "SHARED-1" in f["title"]]
+		self.assertEqual(len(found), 1)
+		self.assertEqual(found[0]["check"], "upgrade.sharepoint_shared_folders")
+		self.assertEqual(found[0]["status"], doctor.WARN)
+		self.assertIn(self.todo.name, found[0]["detail"])
+		self.assertIn(other.name, found[0]["detail"])
+		self.assertFalse([f for f in files.upgrade_check_shared_folders() if "OWN-1" in f["title"]])
+
+	def test_the_check_is_registered_for_the_upgrade_report(self):
+		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_shared_folders", upgrade_checks())
+
+
+def upgrade_checks():
+	"""Every check listed under microsoft365_upgrade_checks, whatever the release."""
+	checks = frappe.get_hooks("microsoft365_upgrade_checks")
+	return [path for paths in checks.values() for path in (paths if isinstance(paths, list) else [paths])]

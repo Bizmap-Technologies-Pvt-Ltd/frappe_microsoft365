@@ -159,7 +159,7 @@ After saving, use the buttons at the top of the mapping: **Test**, **Site Grant 
 - leave **Existing Folder** empty, and the folder is created where the mapping says; or
 - paste the address of a folder that already exists, from the browser or *Copy link* in SharePoint or Teams, or its path in the library such as `Projects/PROJ-0001`, to link it.
 
-The record's attachments still on the server then move into the folder. Each record can have one folder. Deleting a row and saving removes only the link: the folder and its files stay in SharePoint, and files already stored there keep opening.
+The record's attachments still on the server then move into the folder. Each record can have one folder, and a folder belongs to one record: linking a folder that is already another record's is refused. Deleting a row and saving removes only the link: the folder and its files stay in SharePoint, and files already stored there keep opening.
 
 **Check a file's status.** Open an attachment's File record and expand **Microsoft 365**:
 
