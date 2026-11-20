@@ -396,3 +396,31 @@ class TestTokensOnlyGoToGraph(BaseTestCase):
 		for url in self.REFUSED + (None, "", 42):
 			with self.subTest(url=url):
 				self.assertFalse(graph.is_graph_url(url))
+
+
+class TestSafeError(BaseTestCase):
+	def _resp(self, body):
+		from unittest.mock import MagicMock
+
+		resp = MagicMock(reason="Forbidden")
+		resp.json.return_value = body
+		return resp
+
+	def test_a_nested_code_is_kept_beside_the_outer_one(self):
+		resp = self._resp(
+			{
+				"error": {
+					"code": "Forbidden",
+					"message": "Speaker-attributed transcript content is disabled.",
+					"innerError": {"code": "SpeakerAttributionNotAllowed", "request-id": "x"},
+				}
+			}
+		)
+		self.assertEqual(
+			graph._safe_error(resp),
+			"Forbidden (SpeakerAttributionNotAllowed): Speaker-attributed transcript content is disabled.",
+		)
+
+	def test_an_inner_error_without_a_code_changes_nothing(self):
+		resp = self._resp({"error": {"code": "Forbidden", "message": "No.", "innerError": {"date": "x"}}})
+		self.assertEqual(graph._safe_error(resp), "Forbidden: No.")

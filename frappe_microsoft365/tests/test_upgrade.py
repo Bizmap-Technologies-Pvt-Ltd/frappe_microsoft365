@@ -404,3 +404,58 @@ class TestDisplay(UpgradeTestCase):
 	def test_unreadable_report_is_ignored(self):
 		upgrade._save(upgrade.REPORT_FIELD, "{not json")
 		self.assertIsNone(upgrade.get_report())
+
+
+class TestEveryCheckIsRegistered(BaseTestCase):
+	"""A check that is written but not listed in hooks.py never runs, and nothing else notices.
+
+	It has happened once already: three branches each added the hook, a merge kept all three
+	assignments, and Python keeps only the last.
+	"""
+
+	def test_every_upgrade_check_function_is_in_the_hook(self):
+		import ast
+		import os
+
+		package = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+		defined = set()
+		for root, dirs, files in os.walk(package):
+			dirs[:] = [d for d in dirs if d not in ("tests", "node_modules", "public")]
+			for name in files:
+				if not name.endswith(".py"):
+					continue
+				path = os.path.join(root, name)
+				with open(path, encoding="utf-8") as f:
+					tree = ast.parse(f.read())
+				module = os.path.relpath(path, os.path.dirname(package))[:-3].replace(os.sep, ".")
+				defined.update(
+					f"{module}.{node.name}"
+					for node in tree.body
+					if isinstance(node, ast.FunctionDef) and node.name.startswith("upgrade_check")
+				)
+
+		registered = {path for paths in upgrade_hooks().values() for path in paths}
+		self.assertTrue(defined)
+		self.assertEqual(defined - registered, set())
+
+	def test_hooks_assign_the_check_list_once(self):
+		import ast
+		import os
+
+		hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks.py")
+		with open(hooks, encoding="utf-8") as f:
+			tree = ast.parse(f.read())
+		assigned = [
+			target.id
+			for node in tree.body
+			if isinstance(node, ast.Assign)
+			for target in node.targets
+			if isinstance(target, ast.Name) and target.id == "microsoft365_upgrade_checks"
+		]
+		self.assertEqual(len(assigned), 1)
+
+
+def upgrade_hooks():
+	from frappe_microsoft365 import hooks
+
+	return hooks.microsoft365_upgrade_checks

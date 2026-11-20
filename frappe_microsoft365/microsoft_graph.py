@@ -687,10 +687,17 @@ def _safe_error(resp):
 	Both halves matter: the code is what you search for, and the message is the only part
 	that says WHICH property Graph objected to. "ErrorPropertyValidationFailure" on its own
 	sends people hunting through a payload by hand.
+
+	Some APIs put the specific code in ``innerError`` under a generic outer one ("Forbidden" with
+	SpeakerAttributionNotAllowed inside), so a nested code is kept beside the outer one.
 	"""
 	try:
 		err = (resp.json() or {}).get("error", {})
 		code = (err.get("code") or "").strip()
+		inner = err.get("innerError") or err.get("innererror") or {}
+		inner_code = (inner.get("code") or "").strip() if isinstance(inner, dict) else ""
+		if inner_code and inner_code != code:
+			code = f"{code} ({inner_code})" if code else inner_code
 		message = (err.get("message") or "").strip()
 		if code and message and message != code:
 			return f"{code}: {message}"
