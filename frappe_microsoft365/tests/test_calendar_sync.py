@@ -689,12 +689,13 @@ class TestEventSaveOffRequest(SyncTestCase):
 		self.assertEqual(len(jobs), 1)
 		self.assertEqual(jobs[0][1]["calendar_name"], CALENDAR)
 		self.assertEqual(jobs[0][1]["ms_event_id"], "ms-bye")
+		self.assertEqual(jobs[0][1]["event_owner"], "Administrator")
 		self.assertEqual(jobs[0][1]["job_id"], "m365-event-delete-ms-bye")
 		self.assertTrue(jobs[0][1]["enqueue_after_commit"])
 
 	def test_the_queued_delete_runs_with_no_event_left_to_read(self):
 		with patch.object(graph, "graph_request") as mocked:
-			sync.delete_event_in_graph(CALENDAR, "ms-already-deleted")
+			sync.delete_event_in_graph(CALENDAR, "ms-already-deleted", event_owner="Administrator")
 
 		self.assertEqual(mocked.call_args[0][0], "DELETE")
 		self.assertIn("ms-already-deleted", mocked.call_args[0][1])
@@ -1715,3 +1716,217 @@ class TestOurOwnSeriesDoesNotComeBack(SyncTestCase):
 		outcome = sync._upsert_event(self.calendar, self._occurrence("AAMk-not-ours"))
 
 		self.assertEqual(outcome, "created")
+
+
+def _ensure_user(email):
+	if not frappe.db.exists("User", email):
+		frappe.get_doc({
+			"doctype": "User", "email": email, "first_name": email.split("@")[0],
+			"send_welcome_email": 0, "roles": [{"role": "Desk User"}],
+		}).insert(ignore_permissions=True)
+	return email
+
+
+class TestEventsOnlyGoToTheirOwnersCalendar(SyncTestCase):
+	"""An Event is only ever written to the Microsoft calendar of the person who owns it.
+
+	Linking an Event to a calendar used to be enough to send it from that calendar's mailbox —
+	invitations included, in that person's name — whoever had linked it.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		queue = patch.object(sync.background, "health", return_value=HEALTHY_QUEUE)
+		queue.start()
+		self.addCleanup(queue.stop)
+		self.colleague = _ensure_user("m365-colleague-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "push_to_microsoft_calendar", 1)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.addCleanup(frappe.clear_document_cache, "Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def _give_calendar_to(self, user):
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", user)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+
+	def test_a_user_cannot_link_an_event_to_someone_elses_calendar(self):
+		"""Regression: this save used to create the meeting in the calendar owner's mailbox."""
+		frappe.set_user(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			with self.assertRaises(frappe.PermissionError):
+				self._local_event()
+
+		mocked.assert_not_called()
+
+	def test_a_system_manager_cannot_either(self):
+		"""Admins manage connections; they do not send as somebody else."""
+		self._give_calendar_to(self.colleague)
+		self.assertIn("System Manager", frappe.get_roles("Administrator"))
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			with self.assertRaises(frappe.PermissionError):
+				self._local_event()
+
+		mocked.assert_not_called()
+
+	def test_the_owner_can_link_their_own_calendar(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-own"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			event = self._local_event()
+
+		self.assertEqual(mocked.call_args[0][0], "POST")
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "ms-own")
+
+	def test_sending_a_different_owner_with_the_save_does_not_get_round_it(self):
+		"""The stored owner decides, not the one the request carries."""
+		self._give_calendar_to(self.colleague)
+		with patch.object(frappe, "enqueue"):
+			event = self._local_event(custom_sync_with_microsoft_calendar=0, custom_microsoft_calendar=None)
+
+		event.owner = self.colleague
+		event.custom_sync_with_microsoft_calendar = 1
+		event.custom_microsoft_calendar = CALENDAR
+		with patch.object(graph, "graph_request") as mocked, patch.object(frappe, "enqueue"):
+			with self.assertRaises(frappe.PermissionError):
+				event.save(ignore_permissions=True)
+
+		mocked.assert_not_called()
+
+	def test_a_queued_patch_does_nothing_once_the_owner_no_longer_matches(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event(ms_id="ms-changed-hands")
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request") as mocked:
+			sync.patch_event_in_graph(event.name)
+
+		mocked.assert_not_called()
+
+	def test_a_save_after_the_calendar_changed_hands_sends_nothing(self):
+		"""on_update re-checks: other code can save with validation skipped."""
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event(ms_id="ms-skip-validate")
+		self._give_calendar_to(self.colleague)
+
+		event.subject = "Edited"
+		event.flags.ignore_validate = True
+		with patch.object(frappe, "enqueue") as enqueued, patch.object(graph, "graph_request") as mocked:
+			event.save(ignore_permissions=True)
+
+		mocked.assert_not_called()
+		self.assertEqual(
+			[c for c in enqueued.call_args_list if "patch_event_in_graph" in str(c)], []
+		)
+
+	def test_the_scheduled_push_skips_events_owned_by_someone_else(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event()
+		frappe.db.set_value("Event", event.name, "custom_microsoft_event_id", None)
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe.db, "commit"
+		):
+			pushed = sync._push(self.calendar)
+
+		self.assertEqual(pushed, 0)
+		mocked.assert_not_called()
+		self.assertEqual(sync._pending_push_count(self.calendar), 0)
+
+	def test_deleting_another_users_public_event_does_not_delete_it_in_their_mailbox(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request", return_value={"id": "ms-pub"}):
+			event = self._local_event(event_type="Public")
+		frappe.set_user("Administrator")
+
+		with patch.object(frappe, "enqueue") as enqueued, patch.object(graph, "graph_request") as mocked:
+			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)
+
+		mocked.assert_not_called()
+		self.assertEqual([c for c in enqueued.call_args_list if "delete_event_in_graph" in str(c)], [])
+
+	def test_the_owner_deleting_their_own_event_still_removes_it(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request", return_value={"id": "ms-mine"}):
+			event = self._local_event()
+
+		with patch.object(frappe, "enqueue") as enqueued:
+			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)
+
+		jobs = [c for c in enqueued.call_args_list if "delete_event_in_graph" in str(c)]
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0][1]["event_owner"], self.colleague)
+
+	def test_a_delete_job_for_a_calendar_that_changed_hands_does_nothing(self):
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request") as mocked:
+			sync.delete_event_in_graph(CALENDAR, "ms-gone", event_owner="Administrator")
+			sync.delete_event_in_graph(CALENDAR, "ms-gone")
+
+		mocked.assert_not_called()
+
+	def test_pulled_events_keep_working(self):
+		"""A mirror is owned by the calendar's user, so it passes, and stays editable."""
+		self._give_calendar_to(self.colleague)
+		self._pull_with([ms_event(event_id="ms-pulled-owner")])
+		event = self._event_for("ms-pulled-owner")
+		self.assertEqual(frappe.db.get_value("Event", event.name, "owner"), self.colleague)
+
+		event.reload()
+		event.location = "Elsewhere"
+		with patch.object(graph, "graph_request") as mocked, patch.object(frappe, "enqueue"):
+			event.save(ignore_permissions=True)
+		mocked.assert_not_called()
+
+
+class TestUpgradeCheckEventOwners(SyncTestCase):
+	def test_nothing_to_report_on_a_clean_site(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			self._local_event()
+
+		self.assertEqual(
+			[f for f in sync.upgrade_check_event_owners() if f["target"] == CALENDAR], []
+		)
+
+	def test_counts_mismatched_events_per_calendar_and_changes_nothing(self):
+		from frappe_microsoft365 import doctor
+
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			first = self._local_event(ms_id="ms-up-1")
+			second = self._local_event()
+		colleague = _ensure_user("m365-colleague-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", colleague)
+
+		findings = [f for f in sync.upgrade_check_event_owners() if f["target"] == CALENDAR]
+
+		self.assertEqual(len(findings), 1)
+		finding = findings[0]
+		self.assertEqual(finding["check"], "upgrade.calendar_event_owner")
+		self.assertEqual(finding["status"], doctor.WARN)
+		self.assertTrue(finding["title"].startswith("2 "))
+		self.assertIn(first.name, finding["detail"])
+		self.assertIn(second.name, finding["detail"])
+		# Read-only: the links are still there.
+		self.assertEqual(frappe.db.get_value("Event", first.name, "custom_microsoft_calendar"), CALENDAR)
+
+	def test_registered_for_the_release(self):
+		checks = frappe.get_hooks("microsoft365_upgrade_checks", app_name="frappe_microsoft365")
+		self.assertIn(
+			"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
+			checks.get("1.1.1") or [],
+		)
+
