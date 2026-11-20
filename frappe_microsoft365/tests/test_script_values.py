@@ -172,6 +172,37 @@ class TestUpgradeReport(BaseTestCase):
 			self.assertEqual(script_values.upgrade_check(), [])
 
 
+class TestSiteGrantNamesTheAppOnlyRegistration(BaseTestCase):
+	def test_app_only_client_id_wins_when_set(self):
+		self.assertEqual(doctor.site_grant_client_id({"client_id": MAIN, "app_client_id": APP_ONLY}), APP_ONLY)
+		self.assertEqual(doctor.site_grant_client_id({"client_id": MAIN, "app_client_id": " "}), MAIN)
+
+	def test_the_generated_script_names_it(self):
+		settings = frappe._dict(client_id=MAIN, app_client_id=APP_ONLY)
+		with patch.object(frappe, "get_cached_doc", return_value=settings), patch.object(
+			frappe, "get_all", return_value=[SITE]
+		):
+			script = doctor.site_grant_powershell()["script"]
+
+		self.assertIn(f"$appId = '{APP_ONLY}'", script)
+		self.assertNotIn(MAIN, script)
+
+	def test_doctor_checks_the_app_access_secret(self):
+		base = {"client_id": MAIN, "tenant_id": "11111111-2222-3333-4444-555555555555"}
+
+		missing = doctor.check_credentials({**base, "app_client_id": APP_ONLY})
+		secret_id = doctor.check_credentials({**base, "app_client_id": APP_ONLY, "app_client_secret": MAIN})
+		not_guid = doctor.check_credentials({**base, "app_client_id": "app", "has_app_client_secret": True})
+		fine = doctor.check_credentials({**base, "app_client_id": APP_ONLY, "app_client_secret": "Abc~def"})
+		unused = doctor.check_credentials(base)
+
+		self.assertIn("settings.app_client_secret", {f["check"] for f in missing})
+		self.assertIn("settings.app_secret_is_the_id", {f["check"] for f in secret_id})
+		self.assertIn("settings.app_client_id_shape", {f["check"] for f in not_guid})
+		self.assertFalse([f for f in fine if f["check"].startswith("settings.app_")])
+		self.assertFalse([f for f in unused if f["check"].startswith("settings.app_")])
+
+
 class TestExchangeScriptRunsAsPasted(BaseTestCase):
 	def test_signs_in_to_graph_before_using_it(self):
 		script = doctor.powershell_for_app_only(MAIN, mailboxes=["support@contoso.com"])

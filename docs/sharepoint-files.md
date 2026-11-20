@@ -124,13 +124,18 @@ asks for `Sites.ReadWrite.All`.
    *SharePoint Settings* gives one script for every mapped site.) For each site it runs:
 
    ```powershell
-   Connect-MgGraph -Scopes "Sites.FullControl.All"
-   $site = Get-MgSite -SiteId "contoso.sharepoint.com:/sites/Sales"
+   Connect-MgGraph -Scopes 'Sites.FullControl.All'
+   $site = Get-MgSite -SiteId 'contoso.sharepoint.com:/sites/Sales'
    New-MgSitePermission -SiteId $site.Id -BodyParameter @{
-       roles = @("write")
-       grantedToIdentities = @(@{ application = @{ id = "<client id>"; displayName = "Frappe" } })
+       roles = @('write')
+       grantedToIdentities = @(@{ application = @{ id = '<client id>'; displayName = 'Frappe' } })
    }
    ```
+
+   The client id is the *Application Access* registration's when one is set, since that is the
+   app SharePoint calls are made as, and the main registration's otherwise. Every value is
+   written as a single-quoted string, which PowerShell never expands, and the site address must
+   be on `<tenant>.sharepoint.com`.
 
 5. **Test** on the mapping (or *Troubleshoot → Test SharePoint Connection* on Microsoft Settings
    or SharePoint Settings, for all of them). It signs in as the app, resolves the site and library, and creates and

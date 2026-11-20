@@ -340,6 +340,8 @@ def check_credentials(settings):
 			)
 		)
 
+	out += _check_app_access_credentials(settings)
+
 	redirect = (settings.get("redirect_uri") or "").strip()
 	if redirect and CALLBACK_METHOD.rsplit(".", 1)[-1] not in redirect:
 		out.append(
@@ -352,6 +354,57 @@ def check_credentials(settings):
 			)
 		)
 
+	return out
+
+
+def _check_app_access_credentials(settings):
+	"""The optional Application access registration, which SharePoint calls are made as.
+
+	Its secret is checked as carefully as the main one: with a client id and no secret every
+	SharePoint call fails, and the Secret ID pasted for the Value fails the same way it does on
+	the main registration — only later, and on a background job nobody is watching.
+	"""
+	out = []
+	app_client_id = (settings.get("app_client_id") or "").strip()
+	app_secret = (settings.get("app_client_secret") or "").strip()
+	if not app_client_id:
+		return out
+
+	if not looks_like_guid(app_client_id):
+		out.append(
+			finding(
+				"settings.app_client_id_shape",
+				FAIL,
+				_("The Application access Client ID is not a GUID"),
+				_("Found: {0}").format(app_client_id),
+				_("Copy Application (client) ID from that app registration's Overview page."),
+			)
+		)
+
+	if not (app_secret or settings.get("has_app_client_secret")):
+		out.append(
+			finding(
+				"settings.app_client_secret",
+				FAIL,
+				_("Application access has a Client ID but no client secret"),
+				_("Every call made as the app, such as SharePoint document storage, is refused until it has one."),
+				_("Create a secret on that app registration and paste its Value into Application Client Secret Value."),
+			)
+		)
+	elif app_secret and not MASKED.match(app_secret) and looks_like_guid(app_secret):
+		out.append(
+			finding(
+				"settings.app_secret_is_the_id",
+				FAIL,
+				_("The Application Client Secret looks like the Secret ID"),
+				_("A GUID was entered, and a secret value is never a GUID."),
+				_(
+					"In Azure, Certificates & secrets shows Value next to Secret ID. Copy the "
+					"Value column, creating a new secret if it is no longer shown."
+				),
+				MS_OAUTH_DOC,
+			)
+		)
 	return out
 
 
@@ -1460,6 +1513,15 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 	return "\n".join(lines) + "\n"
 
 
+def site_grant_client_id(settings):
+	"""The registration the Site Grant Script must name: the one SharePoint calls are made as.
+
+	Mirrors microsoft_graph.app_credentials, which uses the Application access registration when
+	its client id is filled in and the main one otherwise.
+	"""
+	return (settings.get("app_client_id") or "").strip() or (settings.get("client_id") or "").strip()
+
+
 # --- Exchange PowerShell for app-only access ------------------------------------------
 
 def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None, send_as=False, include_undo=True):
@@ -1563,6 +1625,11 @@ def _settings_config():
 	secret = get_decrypted_password(
 		"Microsoft Settings", "Microsoft Settings", "client_secret", raise_exception=False
 	)
+	app_secret = None
+	if settings.get("app_client_id"):
+		app_secret = get_decrypted_password(
+			"Microsoft Settings", "Microsoft Settings", "app_client_secret", raise_exception=False
+		)
 	return {
 		"enabled": settings.enabled,
 		"tenant_id": settings.tenant_id,
@@ -1581,6 +1648,9 @@ def _settings_config():
 		"default_scopes": settings.get("default_scopes") or "",
 		"authorized_scopes": settings.get("authorized_scopes") or "",
 		"use_files": settings.get("use_files"),
+		"app_client_id": settings.get("app_client_id") or "",
+		"app_client_secret": app_secret,
+		"has_app_client_secret": bool(app_secret),
 	}
 
 
@@ -1824,4 +1894,4 @@ def site_grant_powershell(mapping: str | None = None):
 			urls.append(url)
 	if not urls:
 		frappe.throw(_("Create a SharePoint Mapping with a SharePoint site first."))
-	return {"script": powershell_for_site_grant(settings.client_id, urls), "sites": urls}
+	return {"script": powershell_for_site_grant(site_grant_client_id(settings), urls), "sites": urls}
