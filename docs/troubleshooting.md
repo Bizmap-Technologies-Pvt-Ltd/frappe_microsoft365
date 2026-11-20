@@ -83,7 +83,7 @@ Three causes account for most of the reports.
 - [`Microsoft has not finished processing this meeting.`](#still-processing)
 - [`Microsoft still has no transcript or recording a day after this meeting`](#nothing-found)
 - [`This meeting is too old, but the files may still exist.`](#meeting-expired)
-- [Speaker names missing from the `.vtt`](#speaker-attribution)
+- [Speaker names missing from the transcript](#speaker-attribution)
 - [`Microsoft gave us the transcript, but Frappe could not store the file`](#transcript-not-stored)
 - [`This meeting has not started yet.` / `This event has no Teams meeting.`](#meeting-preconditions)
 - [`The Microsoft Calendar … is switched off` / `… is not signed in to Microsoft`](#calendar-off-or-unauthorised)
@@ -567,31 +567,40 @@ states that the related tenant administrator controls *"take effect at the end o
 
 ### `403 Forbidden: Speaker-attributed transcript content is disabled for this tenant` (`SpeakerAttributionNotAllowed`)
 
-A **second** tenant switch, separate from the one above, and one this app runs into by default.
+A **second** tenant switch, separate from the one above. Since 1.1.1 this app handles it by itself,
+so you normally see its effect rather than the error: the transcript arrives as a `.txt` without
+speaker names instead of a `.vtt` with them.
 
 **What it means.** Graph serves transcript content in two formats: `text/vtt`, which carries
 `<v Speaker>` voice tags, and `application/vnd.microsoft.graph.transcript+text`, which is the same
-transcript without speaker information. When the tenant administrator has disabled speaker
-attribution, asking for the **attributed** format returns this 403. The unattributed format still
-works — Microsoft's message even says so: *"Retry with Accept
+timestamped transcript without speaker information. When the tenant administrator has disabled
+speaker attribution, asking for the **attributed** format returns this 403. The unattributed format
+is never blocked by that setting — Microsoft's message even says so: *"Retry with Accept
 'application/vnd.microsoft.graph.transcript+text'."*
 
-**This app asks for `text/vtt`.** That is the format it attaches to the Event, and it is selected
-with the `$format` query parameter. The unattributed format can only be selected with the `Accept`
-header, so there is no way to fall back to it from here. On a tenant with attribution off, the
-transcript fetch fails at the content step — after the list call succeeded, which makes it look
-like a permission that half works.
+**What the app does.** It asks for `text/vtt` first (with the `$format` query parameter). When that
+is refused with a 403, it asks once more for the unattributed format — with the `Accept` header,
+the only way Graph accepts that format — and attaches the result to the Event as
+`teams-transcript-<date>.txt` (`…-part-1.txt`, `…-part-2.txt` for a meeting transcribed in
+parts). Everything else is unchanged: every part is attached, a later fetch replaces the earlier
+files, and the catch-up job's backoff is the same.
 
-**Fix.** Teams admin center → **Meetings** → **Meeting settings** → **Transcript API access** →
-**Configure** → turn **Include speaker attribution** **On**. It is off by default and only
-available once **Microsoft Graph access** is on. In PowerShell:
+**When you still see this error.** Only if the plain-text request failed as well — and then the
+message you are shown is that second refusal, because attribution cannot be its cause. Read it as
+the transcript permission or the [Graph access switch](#transcripts-disabled-for-tenant).
+
+**Want speaker names back?** Teams admin center → **Meetings** → **Meeting settings** →
+**Transcript API access** → **Configure** → turn **Include speaker attribution** **On**. It is off
+by default and only available once **Microsoft Graph access** is on. In PowerShell:
 
 ```powershell
 Set-CsTeamsMeetingConfiguration -Identity Global -EnableAttributedTranscripts $true
 ```
 
-**Only `/content` is affected.** Listing transcripts still works with attribution off, which is why
-the Event can show that a transcript exists and then fail to fetch it.
+Then delete the `.txt` from the Event and press **Get Transcript & Recording**; the next fetch
+attaches a `.vtt`.
+
+**Only `/content` is affected.** Listing transcripts works with attribution off either way.
 
 <a id="403-after-consent"></a>
 
@@ -779,14 +788,15 @@ in.
 
 <a id="speaker-attribution"></a>
 
-### Speaker names missing from the `.vtt` — the transcript is text with nobody's name against it
+### Speaker names missing — the transcript is text with nobody's name against it
 
-Two possibilities, and they look different in the log:
+Two possibilities, and the file extension tells them apart:
 
-- **The fetch failed outright** with a 403 → that is
-  [`SpeakerAttributionNotAllowed`](#speakerattributionnotallowed), and the fix is the **Include
+- **The Event has a `.txt`, not a `.vtt`** → the tenant has speaker attribution off, and the app
+  fell back to the unattributed format. See
+  [`SpeakerAttributionNotAllowed`](#speakerattributionnotallowed); the fix is the **Include
   speaker attribution** toggle.
-- **The fetch succeeded and the names are absent** → the transcript was generated before the
+- **The Event has a `.vtt` and the names are absent** → the transcript was generated before the
   setting was turned on, or in a tenant where it was off at the time. The setting affects
   transcripts produced after the change; existing ones do not gain names retrospectively.
 

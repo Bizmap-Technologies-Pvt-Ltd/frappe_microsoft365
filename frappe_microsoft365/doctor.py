@@ -852,13 +852,15 @@ def error_patterns():
 		# listing succeeds — the switch is already on — so every generic transcript rule below
 		# would send somebody to fix something that is not broken. A literal code, so unlike
 		# those it can never swallow a match that belongs to the rule above it.
-		r"SpeakerAttributionNotAllowed",
+		# Graph keeps the code in innerError, so the message Microsoft sends with it is matched
+		# too: that is the part of the error this app's messages actually carry.
+		r"SpeakerAttributionNotAllowed|Speaker-attributed transcript content is disabled",
 		_("Speaker attribution is off for this tenant"),
 		_(
-			"The transcript is fetched in the attributed format, which this tenant does not "
-			"allow. Teams admin center > Meetings > Meeting settings > Transcript API access > "
-			"Configure > Include speaker attribution On. Listing transcripts keeps working "
-			"without it; only fetching the text fails."
+			"This tenant does not allow speaker names in transcripts, so the app falls back to "
+			"a plain-text .txt transcript without them. For names, in the Teams admin center: "
+			"Meetings > Meeting settings > Transcript API access > Configure > Include speaker "
+			"attribution On."
 		),
 	),
 	(

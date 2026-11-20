@@ -50,7 +50,8 @@ Microsoft Graph.
   `Calendars.ReadWrite` and nothing else — Microsoft mints the link as part of the event.
 - **The invitation side.** Organiser, the attendee list with everyone's reply, and
   Accept / Tentative / Decline on invitations you received.
-- **Transcripts and recordings.** The transcript is attached to the Event as a `.vtt`. A
+- **Transcripts and recordings.** The transcript is attached to the Event as a `.vtt` (a `.txt`
+  without speaker names on tenants that switch speaker attribution off). A
   recording stays with Microsoft and streams through Frappe on demand rather than filling your
   file store.
 - **Sign in with Microsoft**, and **Outlook mail over OAuth** — it provisions the `Connected App`
