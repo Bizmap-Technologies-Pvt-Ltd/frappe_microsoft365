@@ -38,7 +38,7 @@ SITE_NAME = re.compile(r"^[A-Za-z0-9._~%-]+$")
 
 #: PowerShell ends a single-quoted string at any of these, not only at the ASCII apostrophe, and
 #: inside one each of them is escaped by doubling it.
-_SINGLE_QUOTES = "'‘’‚‛"
+_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 
 def ps_literal(value):
@@ -66,9 +66,9 @@ def validate_client_id(value, label=None):
 	value = (value or "").strip()
 	if not is_client_id(value):
 		frappe.throw(
-			_("{0} must be the Application (client) ID from the app registration's Overview page, a GUID such as 00000000-0000-0000-0000-000000000000.").format(
-				label or _("Client ID")
-			),
+			_(
+				"{0} must be the Application (client) ID from the app registration's Overview page, a GUID such as 00000000-0000-0000-0000-000000000000."
+			).format(label or _("Client ID")),
 			title=_("Not a client ID"),
 		)
 	return value
@@ -79,9 +79,9 @@ def validate_mailbox(value):
 	value = (value or "").strip()
 	if not is_mailbox(value):
 		frappe.throw(
-			_("{0} is not a mailbox address. Enter addresses such as support@contoso.com, one per line.").format(
-				frappe.bold(escape_html(value))
-			),
+			_(
+				"{0} is not a mailbox address. Enter addresses such as support@contoso.com, one per line."
+			).format(frappe.bold(escape_html(value))),
 			title=_("Not a mailbox"),
 		)
 	return value
@@ -159,8 +159,12 @@ def upgrade_check():
 					"upgrade.script_values",
 					WARN,
 					_("Microsoft Settings: {0} is not a GUID").format(label),
-					_("Found {0}. Saving Microsoft Settings, or generating a setup script, now requires the Application (client) ID, which is always a GUID.").format(value),
-					_("Copy Application (client) ID from the app registration's Overview page into {0}.").format(label),
+					_(
+						"Found {0}. Saving Microsoft Settings, or generating a setup script, now requires the Application (client) ID, which is always a GUID."
+					).format(value),
+					_(
+						"Copy Application (client) ID from the app registration's Overview page into {0}."
+					).format(label),
 					target="Microsoft Settings",
 				)
 			)
@@ -174,10 +178,12 @@ def upgrade_check():
 						"upgrade.script_values",
 						WARN,
 						_("SharePoint Mapping {0}: the site address will be refused").format(row.name),
-						_("{0} {1} The mapping cannot be saved again, and no Site Grant Script is generated, until it is corrected.").format(
-							row.site_url, problem
+						_(
+							"{0} {1} The mapping cannot be saved again, and no Site Grant Script is generated, until it is corrected."
+						).format(row.site_url, problem),
+						_(
+							"Open the mapping and paste the site's address, e.g. https://contoso.sharepoint.com/sites/Sales."
 						),
-						_("Open the mapping and paste the site's address, e.g. https://contoso.sharepoint.com/sites/Sales."),
 						target=row.name,
 					)
 				)

@@ -22,7 +22,9 @@ from frappe_microsoft365 import sign_in
 
 
 def execute():
-	if not frappe.db.exists("DocType", "Microsoft Settings") or not frappe.db.table_exists("Social Login Key"):
+	if not frappe.db.exists("DocType", "Microsoft Settings") or not frappe.db.table_exists(
+		"Social Login Key"
+	):
 		return
 
 	tenant = frappe.db.get_single_value("Microsoft Settings", "tenant_id")

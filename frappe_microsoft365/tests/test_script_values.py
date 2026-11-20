@@ -52,7 +52,11 @@ class TestValidation(BaseTestCase):
 				script_values.validate_mailbox(bad)
 
 	def test_site_urls_must_be_sharepoint_online(self):
-		for good in (SITE, "contoso.sharepoint.com/teams/Ops", "https://contoso.sharepoint.com/sites/A_b-c.d/Shared%20Documents/x"):
+		for good in (
+			SITE,
+			"contoso.sharepoint.com/teams/Ops",
+			"https://contoso.sharepoint.com/sites/A_b-c.d/Shared%20Documents/x",
+		):
 			self.assertIsNone(script_values.site_url_problem(good), good)
 		for bad in (
 			'https://contoso.sharepoint.com/sites/Sales"$(whoami)',
@@ -84,7 +88,10 @@ class TestScriptsRefuseOrQuote(BaseTestCase):
 		self.assertIn("# Remove-MailboxPermission -Identity 'o''brien@contoso.com' -User", script)
 
 	def test_a_hostile_site_url_is_refused(self):
-		for bad in ('https://c.sharepoint.com/sites/S"$(whoami)', 'https://c.sharepoint.com";$(whoami)/sites/S'):
+		for bad in (
+			'https://c.sharepoint.com/sites/S"$(whoami)',
+			'https://c.sharepoint.com";$(whoami)/sites/S',
+		):
 			with self.assertRaises(frappe.ValidationError):
 				doctor.powershell_for_site_grant(MAIN, [bad])
 
@@ -99,7 +106,10 @@ class TestScriptsRefuseOrQuote(BaseTestCase):
 		grant = doctor.powershell_for_site_grant(MAIN, [SITE + "/Shared%20Documents/Forms/AllItems.aspx"])
 		exchange = doctor.powershell_for_app_only(MAIN, mailboxes=["support@contoso.com"], send_as=True)
 
-		for script, values in ((grant, (MAIN, "contoso.sharepoint.com")), (exchange, (MAIN, "support@contoso.com"))):
+		for script, values in (
+			(grant, (MAIN, "contoso.sharepoint.com")),
+			(exchange, (MAIN, "support@contoso.com")),
+		):
 			for line in script.splitlines():
 				for value in values:
 					if value in line and not line.lstrip().startswith("#"):
@@ -107,7 +117,9 @@ class TestScriptsRefuseOrQuote(BaseTestCase):
 						self.assertNotIn(f'"{value}', line, line)
 
 	def test_only_the_site_address_reaches_the_comment(self):
-		script = doctor.powershell_for_site_grant(MAIN, [SITE + "/Shared%20Documents/Forms/AllItems.aspx?x=1"])
+		script = doctor.powershell_for_site_grant(
+			MAIN, [SITE + "/Shared%20Documents/Forms/AllItems.aspx?x=1"]
+		)
 
 		self.assertIn(f"# {SITE}\n", script)
 		self.assertNotIn("AllItems", script)
@@ -142,20 +154,26 @@ class TestSaveTimeValidation(BaseTestCase):
 
 class TestUpgradeReport(BaseTestCase):
 	def test_lists_saved_values_that_would_now_be_refused(self):
-		before = {f: frappe.db.get_single_value("Microsoft Settings", f) for f in ("client_id", "app_client_id")}
-		self.addCleanup(lambda: [frappe.db.set_single_value("Microsoft Settings", f, v) for f, v in before.items()])
+		before = {
+			f: frappe.db.get_single_value("Microsoft Settings", f) for f in ("client_id", "app_client_id")
+		}
+		self.addCleanup(
+			lambda: [frappe.db.set_single_value("Microsoft Settings", f, v) for f, v in before.items()]
+		)
 		frappe.db.set_single_value("Microsoft Settings", "client_id", "client-abc")
 		frappe.db.set_single_value("Microsoft Settings", "app_client_id", APP_ONLY)
 
 		with patch.object(
 			frappe,
 			"get_all",
-			side_effect=lambda doctype, **kw: [
-				frappe._dict(name="ToDo", site_url="https://c.sharepoint.com/sites/a$(x)"),
-				frappe._dict(name="Note", site_url=SITE),
-			]
-			if doctype == "SharePoint Mapping"
-			else [],
+			side_effect=lambda doctype, **kw: (
+				[
+					frappe._dict(name="ToDo", site_url="https://c.sharepoint.com/sites/a$(x)"),
+					frappe._dict(name="Note", site_url=SITE),
+				]
+				if doctype == "SharePoint Mapping"
+				else []
+			),
 		):
 			found = script_values.upgrade_check()
 
@@ -174,13 +192,16 @@ class TestUpgradeReport(BaseTestCase):
 
 class TestSiteGrantNamesTheAppOnlyRegistration(BaseTestCase):
 	def test_app_only_client_id_wins_when_set(self):
-		self.assertEqual(doctor.site_grant_client_id({"client_id": MAIN, "app_client_id": APP_ONLY}), APP_ONLY)
+		self.assertEqual(
+			doctor.site_grant_client_id({"client_id": MAIN, "app_client_id": APP_ONLY}), APP_ONLY
+		)
 		self.assertEqual(doctor.site_grant_client_id({"client_id": MAIN, "app_client_id": " "}), MAIN)
 
 	def test_the_generated_script_names_it(self):
 		settings = frappe._dict(client_id=MAIN, app_client_id=APP_ONLY)
-		with patch.object(frappe, "get_cached_doc", return_value=settings), patch.object(
-			frappe, "get_all", return_value=[SITE]
+		with (
+			patch.object(frappe, "get_cached_doc", return_value=settings),
+			patch.object(frappe, "get_all", return_value=[SITE]),
 		):
 			script = doctor.site_grant_powershell()["script"]
 
@@ -224,7 +245,9 @@ class TestExchangeScriptRunsAsPasted(BaseTestCase):
 		self.assertIn("if (-not $exoSp) { $exoSp = New-ServicePrincipal -AppId $appId", script)
 
 	def test_every_statement_is_on_one_line(self):
-		script = doctor.powershell_for_app_only(MAIN, mailboxes=["a@contoso.com"], send_as=True, include_undo=False)
+		script = doctor.powershell_for_app_only(
+			MAIN, mailboxes=["a@contoso.com"], send_as=True, include_undo=False
+		)
 		self.assertTrue(script.endswith("\n"), "a last line without a line break is never run")
 		for line in script.splitlines():
 			code = line.split("#", 1)[0].rstrip()

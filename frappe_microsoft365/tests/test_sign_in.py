@@ -49,7 +49,9 @@ class SignInTestCase(BaseTestCase):
 		self.addCleanup(self._drop_key)
 
 	def _drop_key(self):
-		for name in frappe.get_all("Social Login Key", filters={"social_login_provider": "Office 365"}, pluck="name"):
+		for name in frappe.get_all(
+			"Social Login Key", filters={"social_login_provider": "Office 365"}, pluck="name"
+		):
 			frappe.delete_doc("Social Login Key", name, force=True, ignore_permissions=True)
 
 	def _key(self, authorize=COMMON_AUTHORIZE, token=COMMON_TOKEN, client_id=CLIENT, enabled=0):
@@ -106,7 +108,9 @@ class TestProvisioningRefusesAnOpenSignIn(SignInTestCase):
 
 	def test_the_record_itself_is_never_created_on_common(self):
 		with self.assertRaises(frappe.ValidationError):
-			provisioning._create_social_login_key({"tenant_id": "common", "client_id": CLIENT, "client_secret": "x"})
+			provisioning._create_social_login_key(
+				{"tenant_id": "common", "client_id": CLIENT, "client_secret": "x"}
+			)
 		self.assertFalse(frappe.db.exists("Social Login Key", sign_in.PROVIDER))
 
 
@@ -239,8 +243,9 @@ class TestSignInHook(SignInTestCase):
 		login_manager = MagicMock()
 		claims = {"email": "administrator@example.com", "sub": "s", "tid": OTHER, "given_name": "A"}
 
-		with patch.object(frappe.local, "login_manager", login_manager, create=True), patch(
-			"frappe.utils.oauth.update_oauth_user", return_value=None
+		with (
+			patch.object(frappe.local, "login_manager", login_manager, create=True),
+			patch("frappe.utils.oauth.update_oauth_user", return_value=None),
 		):
 			with self.assertRaises(frappe.AuthenticationError):
 				oauth.login_oauth_user(claims, provider="office_365", state=oauth.create_oauth_state(None))
@@ -257,7 +262,15 @@ class TestTokenDirectory(BaseTestCase):
 		self.assertEqual(sign_in.tid_of(jwt_with({"tid": TENANT.upper()})), TENANT)
 
 	def test_opaque_or_broken_tokens_give_nothing(self):
-		for token in (None, "", "EwBwA8l6BAAU", "a.b", "a.!!!.c", jwt_with({"tid": "not-a-guid"}), jwt_with([1])):
+		for token in (
+			None,
+			"",
+			"EwBwA8l6BAAU",
+			"a.b",
+			"a.!!!.c",
+			jwt_with({"tid": "not-a-guid"}),
+			jwt_with([1]),
+		):
 			self.assertIsNone(sign_in.tid_of(token), token)
 
 
@@ -293,9 +306,15 @@ class TestFillTenantPatch(SignInTestCase):
 		fill_sign_in_tenant_id.execute()  # idempotent
 
 		self.assertEqual(self._tenant(), TENANT)
-		key = frappe.db.get_value("Social Login Key", sign_in.PROVIDER, ["authorize_url", "access_token_url"], as_dict=True)
-		self.assertEqual(key.authorize_url, f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize")
-		self.assertEqual(key.access_token_url, f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token")
+		key = frappe.db.get_value(
+			"Social Login Key", sign_in.PROVIDER, ["authorize_url", "access_token_url"], as_dict=True
+		)
+		self.assertEqual(
+			key.authorize_url, f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize"
+		)
+		self.assertEqual(
+			key.access_token_url, f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+		)
 		self.assertEqual(sign_in.upgrade_check(), [])
 
 	def test_disagreeing_tokens_change_nothing_and_are_reported(self):
@@ -367,4 +386,6 @@ class TestFillTenantPatch(SignInTestCase):
 		fill_sign_in_tenant_id.execute()
 
 		self.assertEqual(self._tenant(), TENANT)
-		self.assertEqual(frappe.db.get_value("Social Login Key", sign_in.PROVIDER, "authorize_url"), COMMON_AUTHORIZE)
+		self.assertEqual(
+			frappe.db.get_value("Social Login Key", sign_in.PROVIDER, "authorize_url"), COMMON_AUTHORIZE
+		)

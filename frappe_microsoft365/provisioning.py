@@ -26,9 +26,8 @@ from frappe import _
 from frappe.utils.password import get_decrypted_password
 
 from frappe_microsoft365 import capabilities as capability_registry
-from frappe_microsoft365 import doctor
+from frappe_microsoft365 import doctor, sign_in
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365 import sign_in
 from frappe_microsoft365.doctor import APP_ONLY_SCOPE, DELEGATED_SCOPES, OFFLINE_ACCESS
 
 #: The Connected App we create for mail. Named so it is obvious where it came from.

@@ -36,9 +36,7 @@ MULTI_TENANT = ("", "common", "organizations", "consumers")
 CONSUMER_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"
 
 GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
-DOMAIN = re.compile(
-	r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE
-)
+DOMAIN = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
 
 GUID_TENANT, DOMAIN_TENANT, MULTI_TENANT_KIND, INVALID_TENANT = "guid", "domain", "multi", "invalid"
 
