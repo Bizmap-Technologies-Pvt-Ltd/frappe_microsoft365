@@ -116,6 +116,9 @@ def configure(test, **overrides):
 	return mapping
 
 
+LIBRARY_URL = "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"
+
+
 class FakeGraph:
 	"""Answers the Graph calls microsoft_files makes, and records them."""
 
@@ -124,6 +127,8 @@ class FakeGraph:
 		self.items = {"FOLDER": {"id": "FOLDER", "parent": "BASE"}, "BASE": {"id": "BASE", "parent": "ROOT"}}
 		self.fail_upload = None
 		self.web_url_padding = ""
+		# Folders created through POST .../children, by parent: name -> id.
+		self.children = {}
 
 	def __call__(
 		self,
@@ -142,6 +147,10 @@ class FakeGraph:
 		self.calls.append((method, path))
 		if method == "GET" and path == "/drives/DRIVE":
 			return {"webUrl": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents"}
+		if method == "GET" and path == "/drives/DRIVE/root:/Projects:":
+			return {"id": "BASE", "folder": {}, "webUrl": LIBRARY_URL + "/Projects"}
+		if method == "POST" and path.endswith("/children"):
+			return self.create_folder(path, json)
 		if method == "GET" and path == "/drives/DRIVE/root:/Projects/" + path.rsplit("/", 1)[-1]:
 			return {"id": "FOLDER", "folder": {}, "webUrl": "https://contoso.sharepoint.com/f"}
 		if method == "GET" and ":/Projects/" in path:
@@ -171,6 +180,42 @@ class FakeGraph:
 				"parentReference": {"driveId": "DRIVE", "id": item.get("parent")},
 			}
 		raise AssertionError(f"unexpected Graph call {method} {path}")
+
+	def create_folder(self, path, body):
+		"""POST .../children as Graph answers it, conflictBehavior included."""
+		parent = (
+			"ROOT" if path == "/drives/DRIVE/root/children" else path.split("/items/", 1)[1].split("/")[0]
+		)
+		taken = self.children.setdefault(parent, {})
+		name = body["name"]
+		behaviour = body.get("@microsoft.graph.conflictBehavior")
+		if name in taken:
+			if behaviour == "fail":
+				from frappe_microsoft365.microsoft_graph import MsGraphConflict
+
+				raise MsGraphConflict("409 nameAlreadyExists")
+			if behaviour == "rename":
+				n = 1
+				while f"{name} {n}" in taken:
+					n += 1
+				name = f"{name} {n}"
+		# The first record folder is FOLDER, which the other fakes know; later ones are new ids.
+		created = sum(len(c) for c in self.children.values())
+		item_id = (
+			"FOLDER"
+			if not created and "FOLDER" not in self.children.get(parent, {}).values()
+			else f"FOLDER-{created + 1}"
+		)
+		taken[name] = item_id
+		web_url = LIBRARY_URL + ("/Projects/" if parent == "BASE" else "/") + name
+		self.items[item_id] = {"id": item_id, "name": name, "parent": parent, "webUrl": web_url}
+		return {
+			"id": item_id,
+			"name": name,
+			"folder": {"childCount": 0},
+			"webUrl": web_url,
+			"parentReference": {"driveId": "DRIVE", "id": parent},
+		}
 
 
 class FilesTestCase(BaseTestCase):
@@ -524,11 +569,8 @@ class TestUpload(FilesTestCase):
 		mapping.use_base_folder = 0
 		mapping.save()
 		self.assertEqual(files.base_segments(files.mapping_for(MAPPED)), [])
-		with patch.object(
-			files, "ensure_path", return_value={"id": "TOP", "webUrl": "https://contoso.sharepoint.com/top"}
-		) as ensure:
-			folder = files.ensure_folder(MAPPED, self.todo.name)
-		ensure.assert_called_once_with("DRIVE", [files.safe_name(self.todo.name)])
+		folder = files.ensure_folder(MAPPED, self.todo.name)
+		self.assertIn(("POST", "/drives/DRIVE/root/children"), self.graph.calls)
 		self.assertEqual(folder.folder_path, files.safe_name(self.todo.name))
 
 	def test_old_links_redirect_to_the_moved_file(self):
@@ -910,7 +952,12 @@ class TestSettings(BaseTestCase):
 				for df in frappe.get_meta(doctype).fields
 				if df.fieldtype == "Data"
 			]
+		# An MD5 hex digest has one width; nothing from SharePoint goes in it.
+		fixed = {"custom_microsoft_content_hash": 32}
 		for fieldname, length in fields:
+			if fieldname in fixed:
+				self.assertEqual(length, fixed[fieldname], fieldname)
+				continue
 			self.assertGreaterEqual(length or 140, 255, fieldname)
 
 	def test_file_gets_at_most_one_wide_varchar(self):
@@ -1411,3 +1458,473 @@ class TestInlineTypes(BaseTestCase):
 			response = files._stream("DRIVE", "ITEM", "report")
 		self.assertIn("attachment", response.headers["Content-Disposition"])
 		self.assertEqual(response.content_type, "application/octet-stream")
+
+
+# --- only the app says where a File lives in SharePoint ------------------------------------------
+
+
+class TestFileFieldsAreTheApps(FilesTestCase):
+	STAFF = "ms365-files-staff@example.com"
+
+	def staff(self):
+		if not frappe.db.exists("User", self.STAFF):
+			frappe.get_doc(
+				{"doctype": "User", "email": self.STAFF, "first_name": "Staff", "send_welcome_email": 0}
+			).insert(ignore_permissions=True)
+		user = frappe.get_doc("User", self.STAFF)
+		user.set("roles", [{"role": "Desk User"}])
+		user.save(ignore_permissions=True)
+		frappe.set_user(self.STAFF)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def moved(self, **extra):
+		f = self.attach(**extra)
+		files.upload_file(f.name)
+		return frappe.get_doc("File", f.name)
+
+	def test_every_sharepoint_field_is_protected(self):
+		from frappe_microsoft365.setup import create_file_custom_fields
+
+		defined = {
+			f["fieldname"]
+			for f in create_file_custom_fields(only_definitions=True)["File"]
+			if f["fieldtype"] not in ("Section Break", "Column Break")
+		}
+		self.assertEqual(set(files.PROTECTED_FILE_FIELDS), defined)
+
+	def test_a_user_cannot_create_a_file_pointing_at_sharepoint(self):
+		self.staff()
+		for fields in (
+			{"custom_microsoft_drive_id": "DRIVE", "custom_microsoft_item_id": "BASE"},
+			{"custom_microsoft_status": files.STORED},
+			{"custom_microsoft_local_url": "/private/files/someone-elses.pdf"},
+		):
+			with self.assertRaises(frappe.PermissionError):
+				frappe.get_doc(
+					{
+						"doctype": "File",
+						"file_name": "mine.txt",
+						"content": b"mine",
+						"is_private": 1,
+						**fields,
+					}
+				).insert()
+
+	def test_a_user_cannot_create_a_file_with_the_open_file_address(self):
+		self.staff()
+		with self.assertRaises(frappe.PermissionError):
+			frappe.get_doc(
+				{
+					"doctype": "File",
+					"file_name": "x.pdf",
+					"file_url": files.stored_url("abcdef"),
+					"is_private": 1,
+				}
+			).insert()
+
+	def test_not_even_an_administrator_sets_them_by_hand(self):
+		with self.assertRaises(frappe.PermissionError):
+			frappe.get_doc(
+				{
+					"doctype": "File",
+					"file_name": "x.txt",
+					"content": b"x",
+					"custom_microsoft_item_id": "BASE",
+					"custom_microsoft_drive_id": "DRIVE",
+				}
+			).insert()
+
+	def test_changing_the_item_of_a_moved_file_is_refused(self):
+		f = self.moved()
+		f.custom_microsoft_item_id = "BASE"
+		with self.assertRaises(frappe.PermissionError):
+			f.save()
+		self.assertEqual(
+			frappe.db.get_value("File", f.name, "custom_microsoft_item_id"), "ITEM-" + f.file_name
+		)
+
+	def test_pointing_a_file_at_open_file_is_refused(self):
+		f = self.attach()
+		f.reload()
+		f.file_url = files.stored_url(f.name)
+		with self.assertRaises(frappe.PermissionError):
+			f.save()
+
+	def test_saving_a_moved_file_unchanged_still_works(self):
+		f = self.moved()
+		f.save()
+
+	def test_attachment_copies_of_a_moved_file_keep_working(self):
+		f = self.moved()
+		other = frappe.get_doc({"doctype": "ToDo", "description": "copy target"}).insert()
+		copy = f.create_attachment_copy(MAPPED, other.name)
+		row = frappe.db.get_value(
+			"File",
+			copy.name,
+			["file_url", "custom_microsoft_item_id", "custom_microsoft_status"],
+			as_dict=True,
+		)
+		self.assertEqual(row.file_url, f.file_url)
+		self.assertEqual(row.custom_microsoft_item_id, f.custom_microsoft_item_id)
+		self.assertEqual(row.custom_microsoft_status, files.STORED)
+		with patch.object(files, "_stream", return_value="STREAM"):
+			self.assertEqual(files.open_file(f.name), "STREAM")
+
+	def test_a_copy_that_changes_what_it_copies_is_refused(self):
+		f = self.moved()
+		copy = frappe.copy_doc(f)
+		copy.attached_to_name = frappe.get_doc({"doctype": "ToDo", "description": "x"}).insert().name
+		copy.custom_microsoft_local_url = "/private/files/someone-elses.pdf"
+		copy.flags.copy_from_existing_file = True
+		with self.assertRaises(frappe.PermissionError):
+			copy.insert()
+
+
+class TestOnlyTheAppsItems(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		self.graph.items.update(
+			{"ELSEWHERE": {"parent": "BASE"}, "INSIDE": {"parent": "SUB"}, "SUB": {"parent": "FOLDER"}}
+		)
+
+	def moved(self):
+		f = self.attach()
+		files.upload_file(f.name)
+		return f
+
+	def point_at(self, f, item_id, folder_id=None):
+		"""What a File looked like if it was edited before 1.1.1: its ids, and no folder recorded."""
+		frappe.db.set_value(
+			"File", f.name, {"custom_microsoft_item_id": item_id, "custom_microsoft_folder_id": folder_id}
+		)
+
+	def test_upload_records_the_folder(self):
+		f = self.moved()
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_folder_id"), "FOLDER")
+
+	def test_opening_a_file_the_app_recorded_asks_graph_nothing_extra(self):
+		f = self.moved()
+		before = len(self.graph.calls)
+		with patch.object(files, "_stream", return_value="STREAM"):
+			files.open_file(f.name)
+		self.assertEqual(self.graph.calls[before:], [])
+
+	def test_open_file_refuses_an_item_outside_every_record_folder(self):
+		f = self.moved()
+		self.point_at(f, "ELSEWHERE")
+		with patch.object(files, "_stream") as stream:
+			with self.assertRaises(frappe.PermissionError):
+				files.open_file(f.name)
+		stream.assert_not_called()
+
+	def test_open_file_refuses_a_record_folder_itself(self):
+		f = self.moved()
+		self.point_at(f, "FOLDER", folder_id="FOLDER")
+		with patch.object(files, "_stream") as stream, self.assertRaises(frappe.PermissionError):
+			files.open_file(f.name)
+		stream.assert_not_called()
+
+	def test_files_moved_before_the_folder_was_recorded_are_checked_in_sharepoint(self):
+		f = self.moved()
+		self.point_at(f, "INSIDE")  # in a subfolder of the record's folder
+		with patch.object(files, "_stream", return_value="STREAM") as stream:
+			self.assertEqual(files.open_file(f.name), "STREAM")
+		stream.assert_called_once_with("DRIVE", "INSIDE", f.file_name, download=0)
+
+	def test_open_file_needs_status_stored(self):
+		f = self.moved()
+		frappe.db.set_value("File", f.name, "custom_microsoft_status", files.ARCHIVED)
+		with patch.object(files, "_stream") as stream, self.assertRaises(frappe.PermissionError):
+			files.open_file(f.name)
+		stream.assert_not_called()
+
+	def test_get_content_refuses_an_item_outside_every_record_folder(self):
+		f = self.moved()
+		self.point_at(f, "ELSEWHERE")
+		with patch.object(files, "fetch_content") as fetch, self.assertRaises(frappe.PermissionError):
+			frappe.get_doc("File", f.name).get_content()
+		fetch.assert_not_called()
+
+	def deletes(self):
+		return [p for m, p in self.graph.calls if m == "DELETE"]
+
+	def test_trash_never_deletes_an_item_the_app_did_not_put_in_a_folder(self):
+		configure(self, files_delete_remote=1)
+		self.graph.items.update({"ELSEWHERE": {"parent": "BASE"}})
+		f = self.moved()
+		self.point_at(f, "BASE")  # the whole base folder
+		frappe.delete_doc("File", f.name, force=True)
+		g = self.moved()
+		self.point_at(g, "ELSEWHERE")
+		frappe.delete_doc("File", g.name, force=True)
+		self.assertEqual(self.deletes(), [])
+
+	def test_trash_leaves_a_partial_upload_alone(self):
+		configure(self, files_delete_remote=1)
+		f = self.attach()
+		frappe.db.set_value(
+			"File",
+			f.name,
+			{
+				"custom_microsoft_status": files.FAILED,
+				"custom_microsoft_drive_id": "DRIVE",
+				"custom_microsoft_item_id": "ELSEWHERE",
+			},
+		)
+		frappe.delete_doc("File", f.name, force=True)
+		self.assertEqual(self.deletes(), [])
+
+	def test_copies_share_the_item_and_the_last_one_removes_it(self):
+		configure(self, files_delete_remote=1)
+		f = self.moved()
+		other = frappe.get_doc({"doctype": "ToDo", "description": "copy target"}).insert()
+		copy = frappe.get_doc("File", f.name).create_attachment_copy(MAPPED, other.name)
+		frappe.delete_doc("File", copy.name, force=True)
+		self.assertEqual(self.deletes(), [])
+		frappe.delete_doc("File", f.name, force=True)
+		self.assertEqual(self.deletes(), ["/drives/DRIVE/items/ITEM-" + f.file_name])
+
+
+class TestOwnBytesOnly(FilesTestCase):
+	"""After a move the disk name is free, and the next upload of that name gets it."""
+
+	def moved_then_taken(self, keep_hash=True):
+		# A name no earlier test left on disk, so that A gets it as it is, and B after A.
+		name = f"report-{frappe.generate_hash(length=8)}.csv"
+		a = self.attach(content=f"A's bytes {frappe.generate_hash()}".encode(), name=name)
+		old = a.file_url
+		files.upload_file(a.name)
+		self.assertFalse(os.path.exists(files.local_path(old)))
+		if not keep_hash:
+			frappe.db.set_value("File", a.name, "custom_microsoft_content_hash", None)  # moved before 1.1.1
+		secret = frappe.get_doc({"doctype": "ToDo", "description": "confidential"}).insert()
+		b = self.attach(
+			content=f"B's secret {frappe.generate_hash()}".encode(),
+			name=name,
+			attached_to_name=secret.name,
+		)
+		self.assertEqual(b.file_url, old)  # Frappe handed B the freed name
+		return frappe.get_doc("File", a.name), b
+
+	def test_upload_records_the_bytes(self):
+		import hashlib
+
+		body = f"hash me {frappe.generate_hash()}".encode()
+		f = self.attach(content=body)
+		files.upload_file(f.name)
+		self.assertEqual(
+			frappe.db.get_value("File", f.name, "custom_microsoft_content_hash"), hashlib.md5(body).hexdigest()
+		)
+
+	def open_after_sharepoint_lost_it(self, f):
+		with (
+			patch.object(files, "_stream", side_effect=MsGraphNotFound("404")),
+			patch("frappe.utils.response.send_private_file", return_value="LOCAL") as served,
+		):
+			try:
+				return files.open_file(f.name), served
+			except frappe.DoesNotExistError:
+				return None, served
+
+	def test_open_file_does_not_serve_a_path_now_owned_by_another_file(self):
+		for keep_hash in (True, False):
+			a, _b = self.moved_then_taken(keep_hash)
+			out, served = self.open_after_sharepoint_lost_it(a)
+			self.assertIsNone(out)
+			served.assert_not_called()
+
+	def test_a_kept_copy_is_still_served_when_sharepoint_loses_it(self):
+		configure(self, files_keep_local_copy=1)
+		f = self.attach()
+		files.upload_file(f.name)
+		out, served = self.open_after_sharepoint_lost_it(frappe.get_doc("File", f.name))
+		self.assertEqual(out, "LOCAL")
+		served.assert_called_once()
+
+	def test_bring_back_downloads_when_the_local_path_belongs_to_another_file(self):
+		a, b = self.moved_then_taken()
+		body = b"A's bytes, from SharePoint"
+		resp = MagicMock()
+		resp.iter_content.return_value = iter([body])
+		with patch.object(graph, "graph_request", return_value=resp) as gr:
+			target = files.bring_back(a.name)
+		gr.assert_called_once()
+		self.assertNotEqual(target, b.file_url)
+		with open(files.local_path(target), "rb") as fh:
+			self.assertEqual(fh.read(), body)
+		with open(b.get_full_path(), "rb") as fh:
+			self.assertTrue(fh.read().startswith(b"B's secret"))
+
+	def test_a_kept_copy_whose_bytes_changed_is_not_taken_back(self):
+		configure(self, files_keep_local_copy=1)
+		f = self.attach(name="kept.csv")
+		files.upload_file(f.name)
+		with open(f.get_full_path(), "wb") as fh:
+			fh.write(b"something else now")
+		resp = MagicMock()
+		resp.iter_content.return_value = iter([b"the real thing"])
+		with patch.object(graph, "graph_request", return_value=resp) as gr:
+			target = files.bring_back(f.name)
+		gr.assert_called_once()
+		self.assertNotEqual(target, f.file_url)
+
+
+class TestOwnFolders(FilesTestCase):
+	def folder_of(self, todo):
+		return files.ensure_folder(MAPPED, todo.name)
+
+	def by_title(self):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folder_pattern = "{title}"
+		mapping.save()
+
+	def test_two_records_with_the_same_title_get_different_folders(self):
+		self.by_title()
+		one = frappe.get_doc({"doctype": "ToDo", "description": "Same title"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "Same title"}).insert()
+		a, b = self.folder_of(one), self.folder_of(two)
+		self.assertNotEqual(a.item_id, b.item_id)
+		self.assertEqual((a.folder_name, b.folder_name), ("Same title", "Same title 1"))
+		self.assertEqual(b.folder_path, "Projects/Same title 1")
+
+	def test_names_that_collide_after_cleaning_get_different_folders(self):
+		self.by_title()
+		one = frappe.get_doc({"doctype": "ToDo", "description": "A/B"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "A-B"}).insert()
+		self.assertNotEqual(self.folder_of(one).item_id, self.folder_of(two).item_id)
+
+	def test_a_new_record_does_not_inherit_a_deleted_records_folder(self):
+		name = f"S4-{frappe.generate_hash(length=6)}"
+		old = frappe.get_doc({"doctype": "ToDo", "description": "old"}).insert(set_name=name)
+		kept = self.folder_of(old)
+		frappe.delete_doc(MAPPED, name, force=True)
+		new = frappe.get_doc({"doctype": "ToDo", "description": "new"}).insert(set_name=name)
+		self.assertNotEqual(self.folder_of(new).item_id, kept.item_id)
+
+	def test_base_folders_are_still_shared(self):
+		one = frappe.get_doc({"doctype": "ToDo", "description": "one"}).insert()
+		two = frappe.get_doc({"doctype": "ToDo", "description": "two"}).insert()
+		self.folder_of(one), self.folder_of(two)
+		posts = [p for m, p in self.graph.calls if m == "POST"]
+		self.assertEqual(posts, ["/drives/DRIVE/items/BASE/children"] * 2)
+
+	def test_the_app_never_records_another_records_folder(self):
+		self.folder_of(self.todo)
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		with self.assertRaises(frappe.DuplicateEntryError):
+			files.add_folder_row(MAPPED, other.name, {"drive_id": "DRIVE", "item_id": "FOLDER"})
+
+
+class TestLinkedFolders(FilesTestCase):
+	def add_row(self, todo, **row):
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.append("folders", {"reference_name": todo.name, **row})
+		mapping.save()
+		return frappe.get_doc("SharePoint Folder", {"parent": MAPPED, "reference_name": todo.name})
+
+	def test_an_admin_cannot_link_another_records_folder(self):
+		self.add_row(self.todo, existing_folder="Projects/Already there")
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		with self.assertRaises(frappe.DuplicateEntryError):
+			self.add_row(other, existing_folder="Projects/Already there")
+
+	def test_ids_typed_into_a_new_row_are_not_used(self):
+		row = self.add_row(self.todo, item_id="BASE", drive_id="DRIVE")
+		self.assertNotEqual(row.item_id, "BASE")
+		self.assertIn(("POST", "/drives/DRIVE/items/BASE/children"), self.graph.calls)
+
+	def test_the_folder_of_a_saved_row_cannot_be_changed(self):
+		files.create_folder(MAPPED, self.todo.name)
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		mapping.folders[0].item_id = "BASE"
+		with self.assertRaises(frappe.PermissionError):
+			mapping.save()
+
+
+class TestSharedFoldersCheck(FilesTestCase):
+	def folder_row(self, reference_name, item_id):
+		"""A Folders row as 1.1.0 could leave it, written past every check."""
+		frappe.get_doc(
+			{
+				"doctype": "SharePoint Folder",
+				"parent": MAPPED,
+				"parenttype": "SharePoint Mapping",
+				"parentfield": "folders",
+				"reference_doctype": MAPPED,
+				"reference_name": reference_name,
+				"drive_id": "DRIVE",
+				"item_id": item_id,
+				"folder_path": f"Projects/{item_id}",
+			}
+		).db_insert()
+
+	def test_records_sharing_a_folder_are_reported(self):
+		other = frappe.get_doc({"doctype": "ToDo", "description": "other"}).insert()
+		self.folder_row(self.todo.name, "SHARED-1")
+		self.folder_row(other.name, "SHARED-1")
+		self.folder_row(other.name + "-x", "OWN-1")
+		found = [f for f in files.upgrade_check_shared_folders() if "SHARED-1" in f["title"]]
+		self.assertEqual(len(found), 1)
+		self.assertEqual(found[0]["check"], "upgrade.sharepoint_shared_folders")
+		self.assertEqual(found[0]["status"], doctor.WARN)
+		self.assertIn(self.todo.name, found[0]["detail"])
+		self.assertIn(other.name, found[0]["detail"])
+		self.assertFalse([f for f in files.upgrade_check_shared_folders() if "OWN-1" in f["title"]])
+
+	def test_the_check_is_registered_for_the_upgrade_report(self):
+		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_shared_folders", upgrade_checks())
+
+
+def upgrade_checks():
+	"""Every check listed under microsoft365_upgrade_checks, whatever the release."""
+	checks = frappe.get_hooks("microsoft365_upgrade_checks")
+	return [path for paths in checks.values() for path in (paths if isinstance(paths, list) else [paths])]
+
+
+class TestFileItemsCheck(FilesTestCase):
+	def reported(self, name):
+		return [f for f in files.upgrade_check_file_items() if name in f["detail"]]
+
+	def test_files_the_app_moved_are_not_reported(self):
+		f = self.attach()
+		files.upload_file(f.name)
+		self.assertEqual(self.reported(f.name), [])
+		# moved before 1.1.1: no folder recorded, but its address is inside the folder's
+		folder = files.get_folder(MAPPED, self.todo.name)
+		frappe.db.set_value(
+			"File",
+			f.name,
+			{"custom_microsoft_folder_id": None, "custom_microsoft_web_url": folder.web_url + "/spec.csv"},
+		)
+		self.assertEqual(self.reported(f.name), [])
+
+	def test_files_pointing_elsewhere_are_reported(self):
+		f = self.attach()
+		files.upload_file(f.name)
+		frappe.db.set_value(
+			"File",
+			f.name,
+			{
+				"custom_microsoft_folder_id": None,
+				"custom_microsoft_item_id": "ELSEWHERE",
+				"custom_microsoft_web_url": LIBRARY_URL + "/HR/salaries.xlsx",
+			},
+		)
+		found = self.reported(f.name)
+		self.assertEqual(
+			[(x["check"], x["status"]) for x in found], [("upgrade.sharepoint_file_items", doctor.WARN)]
+		)
+
+	def test_a_file_naming_a_record_folder_fails(self):
+		f = self.attach()
+		files.upload_file(f.name)
+		frappe.db.set_value("File", f.name, "custom_microsoft_item_id", "FOLDER")
+		self.assertEqual([x["status"] for x in self.reported(f.name)], [doctor.FAIL])
+
+	def test_the_open_address_without_stored_is_reported(self):
+		f = self.attach()
+		frappe.db.set_value("File", f.name, "file_url", files.stored_url(f.name))
+		self.assertEqual([x["status"] for x in self.reported(f.name)], [doctor.WARN])
+
+	def test_the_check_is_registered_for_the_upgrade_report(self):
+		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_file_items", upgrade_checks())

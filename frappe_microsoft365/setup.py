@@ -370,10 +370,21 @@ def create_file_custom_fields(only_definitions=False):
 				"length": 255,
 			},
 			{
+				# The record folder the upload job put the item in. Only the app writes it (see
+				# microsoft_files.on_file_validate), so opening a file can check it against the
+				# SharePoint Folder rows without asking Graph where the item is.
+				"fieldname": "custom_microsoft_folder_id",
+				"fieldtype": "Data",
+				"label": "Folder ID",
+				"insert_after": "custom_microsoft_item_id",
+				"read_only": 1,
+				"length": 255,
+			},
+			{
 				"fieldname": "custom_microsoft_local_url",
 				"fieldtype": "Data",
 				"label": "Original URL",
-				"insert_after": "custom_microsoft_item_id",
+				"insert_after": "custom_microsoft_folder_id",
 				"read_only": 1,
 				"search_index": 1,
 				# The local file URL before the move: as long as the file name. Indexed, because
@@ -388,6 +399,20 @@ def create_file_custom_fields(only_definitions=False):
 				"label": "Upload Attempts",
 				"insert_after": "custom_microsoft_local_url",
 				"read_only": 1,
+			},
+			{
+				# MD5 of the bytes as they were on disk when the file moved (Frappe's own
+				# content_hash is cleared then; see microsoft_files.upload_file). A kept copy at
+				# the old path is served or brought back only if it still has these bytes: once the
+				# disk name is free, Frappe can give it to another upload. Fixed width, not 255:
+				# it is a hex digest, and tabFile has little room to spare.
+				"fieldname": "custom_microsoft_content_hash",
+				"fieldtype": "Data",
+				"label": "Content Hash Before Move",
+				"insert_after": "custom_microsoft_attempts",
+				"read_only": 1,
+				"hidden": 1,
+				"length": 32,
 			},
 		]
 	}

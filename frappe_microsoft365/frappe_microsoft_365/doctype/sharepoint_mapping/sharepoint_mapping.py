@@ -13,6 +13,10 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+#: What a Folders row records about its SharePoint folder. Filled in by the app when it creates or
+#: links the folder, never typed: file access is checked against these rows.
+RESOLVED_FIELDS = ("drive_id", "item_id", "web_url", "folder_name", "folder_path")
+
 
 class SharePointMapping(Document):
 	def _validate_links(self):
@@ -56,8 +60,24 @@ class SharePointMapping(Document):
 		from frappe_microsoft365 import microsoft_files as files
 
 		self.flags.new_folders = []
+		saved = self.get_doc_before_save()
+		saved_rows = {r.name: r for r in (saved.folders if saved else [])}
 		seen = set()
 		for row in self.folders:
+			old = saved_rows.get(row.name)
+			if old:
+				if row.item_id != old.item_id or row.drive_id != old.drive_id:
+					frappe.throw(
+						_(
+							"Row {0}: the SharePoint folder of a row is set by the app. Delete the row and add a new one, with Existing Folder, to link another folder."
+						).format(row.idx),
+						frappe.PermissionError,
+					)
+			else:
+				# A row added here: whatever it came with was not resolved by the app.
+				for fieldname in RESOLVED_FIELDS:
+					row.set(fieldname, None)
+
 			if row.reference_name in seen:
 				frappe.throw(
 					_("Row {0}: {1} {2} is listed twice.").format(
@@ -87,9 +107,20 @@ class SharePointMapping(Document):
 				)
 
 			if (row.existing_folder or "").strip():
+				# The one way a folder that already exists becomes a record's folder: an
+				# administrator links it, and even then not one that is another record's.
 				values = files.existing_folder_values(mapping, row.existing_folder)
+				files.assert_folder_unclaimed(values["item_id"], self.reference_doctype, row.reference_name)
 			else:
 				values = files.new_folder_values(mapping, self.reference_doctype, row.reference_name)
+			for other in self.folders:
+				if other is not row and other.item_id and other.item_id == values["item_id"]:
+					frappe.throw(
+						_(
+							"Rows {0} and {1} point at the same SharePoint folder. Each record needs a folder of its own."
+						).format(other.idx, row.idx),
+						frappe.DuplicateEntryError,
+					)
 			row.update(values)
 			# resolve_drive may have just looked these up; keep them rather than save blanks over them
 			self.site_id, self.drive_id = mapping.site_id, mapping.drive_id
