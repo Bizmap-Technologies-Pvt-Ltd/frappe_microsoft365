@@ -6,7 +6,18 @@ from frappe.model.document import Document
 
 
 class MicrosoftSettings(Document):
+	def onload(self):
+		from frappe_microsoft365 import upgrade
+
+		# The form points at the doctor when the last upgrade left something to look at.
+		report = upgrade.get_report()
+		if report:
+			self.set_onload(
+				"upgrade_report", {"version": report.get("version"), "count": len(report["findings"])}
+			)
+
 	def validate(self):
+		self._keep_upgrade_state()
 		# Surface the effective redirect URI so the admin can register it in Azure.
 		if not self.redirect_uri:
 			from frappe_microsoft365.microsoft_graph import get_redirect_uri
@@ -51,6 +62,18 @@ class MicrosoftSettings(Document):
 			from frappe_microsoft365.microsoft_files import refresh_desk_boot
 
 			refresh_desk_boot()
+
+	def _keep_upgrade_state(self):
+		"""The upgrade report belongs to migrate, not to whoever saves this form.
+
+		A form opened before a migrate and saved after it would otherwise write the old report
+		back over the new one, and the fields are only read-only in the browser.
+		"""
+		from frappe_microsoft365 import upgrade
+
+		for field in (upgrade.VERSION_FIELD, upgrade.REPORT_FIELD):
+			if self.meta.has_field(field):
+				self.set(field, frappe.db.get_single_value(self.doctype, field, cache=False))
 
 	def _drop_capabilities_that_lost_their_prerequisite(self):
 		"""A capability that builds on another cannot work without it — transcripts, for one,

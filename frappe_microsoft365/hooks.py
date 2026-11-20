@@ -21,6 +21,12 @@ has_permission = {
 after_install = "frappe_microsoft365.setup.after_install"
 after_migrate = "frappe_microsoft365.setup.after_migrate"
 
+# Read-only checks run after `bench migrate`; their findings form the upgrade report.
+# Keyed by the release that introduced them; see upgrade.py.
+microsoft365_upgrade_checks = {
+	"1.1.1": [],
+}
+
 doc_events = {
 	"Event": {
 		"validate": "frappe_microsoft365.microsoft_calendar_sync.event_validate",

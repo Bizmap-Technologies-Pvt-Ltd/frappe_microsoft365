@@ -41,6 +41,20 @@ frappe.ui.form.on("Microsoft Settings", {
 				)
 			);
 		}
+
+		// Set by the controller's onload when the last upgrade left something to look at.
+		const upgrade = (frm.doc.__onload || {}).upgrade_report;
+		if (upgrade) {
+			frm.dashboard.set_headline(
+				frappe.utils.escape_html(
+					__(
+						"After upgrading to {0}: {1} item(s) to check. Troubleshoot > Run Diagnostics lists them.",
+						[upgrade.version, upgrade.count]
+					)
+				),
+				"orange"
+			);
+		}
 	},
 });
 

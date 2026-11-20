@@ -1649,7 +1649,18 @@ def run_diagnostics():
 		)
 
 	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
-	return {"findings": findings, "counts": counts, "checked_connected_apps": sorted(checked_apps)}
+
+	# What the last upgrade found, shown above everything else until an admin dismisses it.
+	# Kept out of findings and counts: it describes the upgrade, not the configuration as it is
+	# now, and it must not hide the "No configuration problems found" line.
+	from frappe_microsoft365 import upgrade
+
+	return {
+		"findings": findings,
+		"counts": counts,
+		"checked_connected_apps": sorted(checked_apps),
+		"upgrade_report": upgrade.get_report(),
+	}
 
 
 @frappe.whitelist()
