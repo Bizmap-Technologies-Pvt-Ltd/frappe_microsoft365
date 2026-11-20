@@ -335,3 +335,9 @@ before_uninstall = "frappe_microsoft365.uninstall.before_uninstall"
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
 
+# Read-only checks run after `bench migrate`; their findings form the upgrade report.
+microsoft365_upgrade_checks = {
+	"1.1.1": [
+		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
+	],
+}

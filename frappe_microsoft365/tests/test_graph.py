@@ -52,19 +52,34 @@ class TestGraphPaging(BaseTestCase):
 			{"value": [{"id": "b"}], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=2"},
 		]
 		with patch.object(graph, "graph_request", side_effect=pages):
-			items, delta_link = graph.graph_delta("/me/calendarView/delta", "cal")
+			items, delta_link, next_link = graph.graph_delta("/me/calendarView/delta", "cal")
 
 		self.assertEqual([i["id"] for i in items], ["a", "b"])
 		self.assertEqual(delta_link, "https://graph.microsoft.com/v1.0/delta?token=2")
+		self.assertIsNone(next_link)
 
 	def test_delta_link_is_none_when_paging_is_cut_short(self):
 		"""A truncated read must NOT hand back a watermark, or the rest is skipped forever."""
 		endless = {"value": [{"id": "x"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"}
 		with patch.object(graph, "graph_request", return_value=endless):
-			items, delta_link = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
+			items, delta_link, _next = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
 
 		self.assertEqual(len(items), 2)
 		self.assertIsNone(delta_link)
+
+	def test_a_read_cut_short_hands_back_where_it_stopped(self):
+		"""Regression (#18): the page cap used to throw the nextLink away, so the next run started
+		over from the first page and never got past it."""
+		pages = [
+			{"value": [{"id": "a"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2"},
+			{"value": [{"id": "b"}], "@odata.nextLink": "https://graph.microsoft.com/v1.0/page3"},
+		]
+		with patch.object(graph, "graph_request", side_effect=pages):
+			items, delta_link, next_link = graph.graph_delta("/me/calendarView/delta", "cal", max_pages=2)
+
+		self.assertEqual([i["id"] for i in items], ["a", "b"])
+		self.assertIsNone(delta_link)
+		self.assertEqual(next_link, "https://graph.microsoft.com/v1.0/page3")
 
 
 class TestGraphRequestBehaviour(BaseTestCase):
@@ -303,3 +318,81 @@ class TestStreamedRequests(BaseTestCase):
 				graph.graph_request("GET", "/me/x/content", "cal", raw=True, stream=True)
 
 		resp.close.assert_called_once()
+
+
+class TestTokensOnlyGoToGraph(BaseTestCase):
+	"""A bearer token is sent to https://graph.microsoft.com and nowhere else."""
+
+	REFUSED = (
+		"http://graph.microsoft.com/v1.0/me/events",
+		"https://169.254.169.254/latest/meta-data",
+		"http://169.254.169.254/latest/meta-data",
+		"https://graph.microsoft.com.attacker.example/v1.0/me",
+		"https://attacker.example/graph.microsoft.com/v1.0/me",
+		"https://graph.microsoft.com@attacker.example/v1.0/me",
+		"https://user:pass@graph.microsoft.com/v1.0/me",
+		"https://graph.microsoft.com:8443/v1.0/me",
+		"https://attacker.example\\@graph.microsoft.com/v1.0/me",
+		"//attacker.example/v1.0/me",
+		"me/events",
+		"ftp://graph.microsoft.com/v1.0/me",
+		"https://graph.microsoft.com /v1.0/me",
+	)
+
+	def test_graph_request_refuses_any_other_host_or_plain_http(self):
+		"""Regression: anything starting with "http" was called with the token attached."""
+		for url in self.REFUSED:
+			with self.subTest(url=url), patch.object(
+				graph, "get_valid_access_token", return_value="token"
+			) as token, patch.object(graph, "_http_request") as http:
+				with self.assertRaises(MsGraphError):
+					graph.graph_request("GET", url, "cal")
+				http.assert_not_called()
+				token.assert_not_called()
+
+	def test_graph_links_and_relative_paths_are_accepted(self):
+		for path, expected in (
+			("/me/events", "https://graph.microsoft.com/v1.0/me/events"),
+			(
+				"https://graph.microsoft.com/v1.0/me/calendarView/delta?$skiptoken=abc",
+				"https://graph.microsoft.com/v1.0/me/calendarView/delta?$skiptoken=abc",
+			),
+			("https://GRAPH.microsoft.com:443/v1.0/me", "https://GRAPH.microsoft.com:443/v1.0/me"),
+		):
+			with self.subTest(path=path), patch.object(
+				graph, "get_valid_access_token", return_value="token"
+			), patch.object(graph, "_http_request", return_value=_response(200, {"ok": 1})) as http:
+				graph.graph_request("GET", path, "cal")
+				self.assertEqual(http.call_args[0][1], expected)
+
+	def test_a_stored_delta_link_off_graph_is_never_called(self):
+		"""The scenario end to end: a delta pull handed a link to somewhere else."""
+		with patch.object(graph, "get_valid_access_token", return_value="token"), patch.object(
+			graph, "_http_request"
+		) as http:
+			with self.assertRaises(MsGraphError):
+				graph.graph_delta("http://169.254.169.254/latest/meta-data", "cal")
+		http.assert_not_called()
+
+	def test_the_session_has_no_plain_http_adapter(self):
+		import requests
+
+		graph._session = None
+		self.addCleanup(setattr, graph, "_session", None)
+		session = graph._graph_session()
+
+		self.assertNotIn("http://", session.adapters)
+		with self.assertRaises(requests.exceptions.InvalidSchema):
+			session.get_adapter("http://graph.microsoft.com/v1.0/me")
+
+	def test_the_transport_refuses_plain_http(self):
+		with patch.object(graph, "_graph_session") as session:
+			with self.assertRaises(MsGraphError):
+				graph._http_request("PUT", "http://tenant.sharepoint.com/upload", data=b"x")
+		session.assert_not_called()
+
+	def test_is_graph_url(self):
+		self.assertTrue(graph.is_graph_url("https://graph.microsoft.com/v1.0/me"))
+		for url in self.REFUSED + (None, "", 42):
+			with self.subTest(url=url):
+				self.assertFalse(graph.is_graph_url(url))

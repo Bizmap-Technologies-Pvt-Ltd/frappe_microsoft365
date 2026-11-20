@@ -122,7 +122,7 @@ class SyncTestCase(BaseTestCase):
 		return frappe.get_doc("Event", name) if name else None
 
 	def _pull_with(self, items, delta_link="DELTA-1"):
-		with patch.object(graph, "graph_delta", return_value=(items, delta_link)) as mocked:
+		with patch.object(graph, "graph_delta", return_value=(items, delta_link, None)) as mocked:
 			result = sync._pull(self.calendar)
 		return result, mocked
 
@@ -221,7 +221,7 @@ class TestPull(SyncTestCase):
 		self.calendar.reload()
 
 		with patch.object(
-			graph, "graph_delta", side_effect=[MsGraphResyncRequired, ([ms_event()], "DELTA-FRESH")]
+			graph, "graph_delta", side_effect=[MsGraphResyncRequired, ([ms_event()], "DELTA-FRESH", None)]
 		) as mocked:
 			upserted, _ = sync._pull(self.calendar)
 
@@ -242,7 +242,7 @@ class TestPull(SyncTestCase):
 		)
 		self.calendar.reload()
 
-		with patch.object(graph, "graph_delta", return_value=([], "DELTA-2")) as mocked:
+		with patch.object(graph, "graph_delta", return_value=([], "DELTA-2", None)) as mocked:
 			sync._pull(self.calendar)
 
 		self.assertEqual(mocked.call_args[0][0], "https://graph.microsoft.com/v1.0/delta?token=abc")
@@ -255,7 +255,7 @@ class TestPull(SyncTestCase):
 		)
 		self.calendar.reload()
 
-		with patch.object(graph, "graph_delta", return_value=([], "DELTA-3")) as mocked:
+		with patch.object(graph, "graph_delta", return_value=([], "DELTA-3", None)) as mocked:
 			sync._pull(self.calendar)
 
 		self.assertIn("/me/calendarView/delta", mocked.call_args[0][0])
@@ -376,7 +376,7 @@ class TestWatermark(SyncTestCase):
 		frappe.db.set_value("Microsoft Calendar", CALENDAR, "last_error", "previous failure")
 		self.calendar.reload()
 
-		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-OK")), patch.object(
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-OK", None)), patch.object(
 			frappe.db, "commit"
 		):
 			result = sync._sync_locked(self.calendar)
@@ -389,7 +389,11 @@ class TestWatermark(SyncTestCase):
 		frappe.db.set_value("Microsoft Calendar", CALENDAR, "delta_link", "KEEP-ME")
 		self.calendar.reload()
 
-		with patch.object(graph, "graph_delta", return_value=([ms_event()], None)):
+		with patch.object(
+			graph,
+			"graph_delta",
+			return_value=([ms_event()], None, "https://graph.microsoft.com/v1.0/me/calendarView/delta?$skiptoken=p51"),
+		):
 			sync._pull(self.calendar)
 
 		self.assertEqual(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"), "KEEP-ME")
@@ -399,7 +403,7 @@ class TestEntrypoints(SyncTestCase):
 	"""The public entry points, including the lock path (v15 and v16 both ship filelock)."""
 
 	def test_sync_calendar_runs_the_whole_round_trip(self):
-		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-RT")), patch.object(
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-RT", None)), patch.object(
 			frappe.db, "commit"
 		):
 			result = sync.sync_calendar(CALENDAR)
@@ -527,7 +531,7 @@ class TestScheduledFanOut(SyncTestCase):
 		self.assertEqual(result, {"queued": False, "job_id": f"m365-sync-{CALENDAR}"})
 
 	def test_the_queued_job_does_the_same_work_as_a_sync_by_hand(self):
-		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-JOB")), patch.object(
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-JOB", None)), patch.object(
 			frappe.db, "commit"
 		), patch.object(frappe, "publish_realtime") as published:
 			result = sync.run_sync_job(CALENDAR, notify_user="Administrator")
@@ -543,7 +547,7 @@ class TestScheduledFanOut(SyncTestCase):
 
 	def test_a_run_nobody_asked_for_is_reported_to_the_calendars_owner(self):
 		"""The scheduled pass has no person behind it; the owner is who has that form open."""
-		with patch.object(graph, "graph_delta", return_value=([], "DELTA-OWNER")), patch.object(
+		with patch.object(graph, "graph_delta", return_value=([], "DELTA-OWNER", None)), patch.object(
 			frappe.db, "commit"
 		), patch.object(frappe, "publish_realtime") as published:
 			sync.run_sync_job(CALENDAR)
@@ -689,12 +693,13 @@ class TestEventSaveOffRequest(SyncTestCase):
 		self.assertEqual(len(jobs), 1)
 		self.assertEqual(jobs[0][1]["calendar_name"], CALENDAR)
 		self.assertEqual(jobs[0][1]["ms_event_id"], "ms-bye")
+		self.assertEqual(jobs[0][1]["event_owner"], "Administrator")
 		self.assertEqual(jobs[0][1]["job_id"], "m365-event-delete-ms-bye")
 		self.assertTrue(jobs[0][1]["enqueue_after_commit"])
 
 	def test_the_queued_delete_runs_with_no_event_left_to_read(self):
 		with patch.object(graph, "graph_request") as mocked:
-			sync.delete_event_in_graph(CALENDAR, "ms-already-deleted")
+			sync.delete_event_in_graph(CALENDAR, "ms-already-deleted", event_owner="Administrator")
 
 		self.assertEqual(mocked.call_args[0][0], "DELETE")
 		self.assertIn("ms-already-deleted", mocked.call_args[0][1])
@@ -804,7 +809,7 @@ class TestSyncCost(SyncTestCase):
 			# has been migrated onto the doctype.
 			self.skipTest("last_sync_seconds is not on this site's Microsoft Calendar yet")
 
-		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-TIMED")), patch.object(
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], "DELTA-TIMED", None)), patch.object(
 			frappe.db, "commit"
 		):
 			sync._sync_locked(self.calendar)
@@ -1715,3 +1720,498 @@ class TestOurOwnSeriesDoesNotComeBack(SyncTestCase):
 		outcome = sync._upsert_event(self.calendar, self._occurrence("AAMk-not-ours"))
 
 		self.assertEqual(outcome, "created")
+
+
+def _ensure_user(email):
+	if not frappe.db.exists("User", email):
+		frappe.get_doc({
+			"doctype": "User", "email": email, "first_name": email.split("@")[0],
+			"send_welcome_email": 0, "roles": [{"role": "Desk User"}],
+		}).insert(ignore_permissions=True)
+	return email
+
+
+class TestEventsOnlyGoToTheirOwnersCalendar(SyncTestCase):
+	"""An Event is only ever written to the Microsoft calendar of the person who owns it.
+
+	Linking an Event to a calendar used to be enough to send it from that calendar's mailbox —
+	invitations included, in that person's name — whoever had linked it.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		queue = patch.object(sync.background, "health", return_value=HEALTHY_QUEUE)
+		queue.start()
+		self.addCleanup(queue.stop)
+		self.colleague = _ensure_user("m365-colleague-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "push_to_microsoft_calendar", 1)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.addCleanup(frappe.clear_document_cache, "Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def _give_calendar_to(self, user):
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", user)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.calendar.reload()
+
+	def test_a_user_cannot_link_an_event_to_someone_elses_calendar(self):
+		"""Regression: this save used to create the meeting in the calendar owner's mailbox."""
+		frappe.set_user(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			with self.assertRaises(frappe.PermissionError):
+				self._local_event()
+
+		mocked.assert_not_called()
+
+	def test_a_system_manager_cannot_either(self):
+		"""Admins manage connections; they do not send as somebody else."""
+		self._give_calendar_to(self.colleague)
+		self.assertIn("System Manager", frappe.get_roles("Administrator"))
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			with self.assertRaises(frappe.PermissionError):
+				self._local_event()
+
+		mocked.assert_not_called()
+
+	def test_the_owner_can_link_their_own_calendar(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-own"}) as mocked, patch.object(
+			frappe, "enqueue"
+		):
+			event = self._local_event()
+
+		self.assertEqual(mocked.call_args[0][0], "POST")
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "ms-own")
+
+	def test_sending_a_different_owner_with_the_save_does_not_get_round_it(self):
+		"""The stored owner decides, not the one the request carries."""
+		self._give_calendar_to(self.colleague)
+		with patch.object(frappe, "enqueue"):
+			event = self._local_event(custom_sync_with_microsoft_calendar=0, custom_microsoft_calendar=None)
+
+		event.owner = self.colleague
+		event.custom_sync_with_microsoft_calendar = 1
+		event.custom_microsoft_calendar = CALENDAR
+		with patch.object(graph, "graph_request") as mocked, patch.object(frappe, "enqueue"):
+			with self.assertRaises(frappe.PermissionError):
+				event.save(ignore_permissions=True)
+
+		mocked.assert_not_called()
+
+	def test_a_queued_patch_does_nothing_once_the_owner_no_longer_matches(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event(ms_id="ms-changed-hands")
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request") as mocked:
+			sync.patch_event_in_graph(event.name)
+
+		mocked.assert_not_called()
+
+	def test_a_save_after_the_calendar_changed_hands_sends_nothing(self):
+		"""on_update re-checks: other code can save with validation skipped."""
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event(ms_id="ms-skip-validate")
+		self._give_calendar_to(self.colleague)
+
+		event.subject = "Edited"
+		event.flags.ignore_validate = True
+		with patch.object(frappe, "enqueue") as enqueued, patch.object(graph, "graph_request") as mocked:
+			event.save(ignore_permissions=True)
+
+		mocked.assert_not_called()
+		self.assertEqual(
+			[c for c in enqueued.call_args_list if "patch_event_in_graph" in str(c)], []
+		)
+
+	def test_the_scheduled_push_skips_events_owned_by_someone_else(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			event = self._local_event()
+		frappe.db.set_value("Event", event.name, "custom_microsoft_event_id", None)
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request", return_value={"id": "ms-x"}) as mocked, patch.object(
+			frappe.db, "commit"
+		):
+			pushed = sync._push(self.calendar)
+
+		self.assertEqual(pushed, 0)
+		mocked.assert_not_called()
+		self.assertEqual(sync._pending_push_count(self.calendar), 0)
+
+	def test_deleting_another_users_public_event_does_not_delete_it_in_their_mailbox(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request", return_value={"id": "ms-pub"}):
+			event = self._local_event(event_type="Public")
+		frappe.set_user("Administrator")
+
+		with patch.object(frappe, "enqueue") as enqueued, patch.object(graph, "graph_request") as mocked:
+			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)
+
+		mocked.assert_not_called()
+		self.assertEqual([c for c in enqueued.call_args_list if "delete_event_in_graph" in str(c)], [])
+
+	def test_the_owner_deleting_their_own_event_still_removes_it(self):
+		self._give_calendar_to(self.colleague)
+		frappe.set_user(self.colleague)
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request", return_value={"id": "ms-mine"}):
+			event = self._local_event()
+
+		with patch.object(frappe, "enqueue") as enqueued:
+			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)
+
+		jobs = [c for c in enqueued.call_args_list if "delete_event_in_graph" in str(c)]
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0][1]["event_owner"], self.colleague)
+
+	def test_a_delete_job_for_a_calendar_that_changed_hands_does_nothing(self):
+		self._give_calendar_to(self.colleague)
+
+		with patch.object(graph, "graph_request") as mocked:
+			sync.delete_event_in_graph(CALENDAR, "ms-gone", event_owner="Administrator")
+			sync.delete_event_in_graph(CALENDAR, "ms-gone")
+
+		mocked.assert_not_called()
+
+	def test_pulled_events_keep_working(self):
+		"""A mirror is owned by the calendar's user, so it passes, and stays editable."""
+		self._give_calendar_to(self.colleague)
+		self._pull_with([ms_event(event_id="ms-pulled-owner")])
+		event = self._event_for("ms-pulled-owner")
+		self.assertEqual(frappe.db.get_value("Event", event.name, "owner"), self.colleague)
+
+		event.reload()
+		event.location = "Elsewhere"
+		with patch.object(graph, "graph_request") as mocked, patch.object(frappe, "enqueue"):
+			event.save(ignore_permissions=True)
+		mocked.assert_not_called()
+
+
+class TestUpgradeCheckEventOwners(SyncTestCase):
+	def test_nothing_to_report_on_a_clean_site(self):
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			self._local_event()
+
+		self.assertEqual(
+			[f for f in sync.upgrade_check_event_owners() if f["target"] == CALENDAR], []
+		)
+
+	def test_counts_mismatched_events_per_calendar_and_changes_nothing(self):
+		from frappe_microsoft365 import doctor
+
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			first = self._local_event(ms_id="ms-up-1")
+			second = self._local_event()
+		colleague = _ensure_user("m365-colleague-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", colleague)
+
+		findings = [f for f in sync.upgrade_check_event_owners() if f["target"] == CALENDAR]
+
+		self.assertEqual(len(findings), 1)
+		finding = findings[0]
+		self.assertEqual(finding["check"], "upgrade.calendar_event_owner")
+		self.assertEqual(finding["status"], doctor.WARN)
+		self.assertTrue(finding["title"].startswith("2 "))
+		self.assertIn(first.name, finding["detail"])
+		self.assertIn(second.name, finding["detail"])
+		# Read-only: the links are still there.
+		self.assertEqual(frappe.db.get_value("Event", first.name, "custom_microsoft_calendar"), CALENDAR)
+
+	def test_registered_for_the_release(self):
+		checks = frappe.get_hooks("microsoft365_upgrade_checks", app_name="frappe_microsoft365")
+		self.assertIn(
+			"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
+			checks.get("1.1.1") or [],
+		)
+
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+
+
+class FakeDeltaGraph:
+	"""A calendar of several delta pages behind graph_request, keyed by the link asked for.
+
+	Page links are opaque skiptoken URLs, as Graph's are, so the only way to reach page three is
+	to have been handed page two's nextLink.
+	"""
+
+	def __init__(self, pages, delta_link=f"{GRAPH}/me/calendarView/delta?$deltatoken=done"):
+		self.pages = pages
+		self.delta_link = delta_link
+		self.calls = []
+
+	def link(self, index):
+		return f"{GRAPH}/me/calendarView/delta?$skiptoken=page{index}"
+
+	def __call__(self, method, path, auth, **kwargs):
+		self.calls.append(path)
+		index = int(path.rsplit("page", 1)[1]) if "$skiptoken=page" in path else 0
+		body = {"value": self.pages[index]}
+		if index + 1 < len(self.pages):
+			body["@odata.nextLink"] = self.link(index + 1)
+		else:
+			body["@odata.deltaLink"] = self.delta_link
+		return body
+
+
+class TestALargeCalendarCatchesUp(SyncTestCase):
+	"""#18: a delta longer than the page cap has to finish across runs, and say so if it cannot."""
+
+	def setUp(self):
+		super().setUp()
+		cap = patch.object(graph, "MAX_PAGES", 2)
+		cap.start()
+		self.addCleanup(cap.stop)
+		self.fake = FakeDeltaGraph(
+			[[ms_event(event_id=f"ms-big-{page}-{n}") for n in range(2)] for page in range(5)]
+		)
+
+	def _run(self):
+		self.calendar.reload()
+		with patch.object(graph, "graph_request", side_effect=self.fake), patch.object(frappe.db, "commit"):
+			return sync._sync_locked(self.calendar)
+
+	def _stored(self, field):
+		return frappe.db.get_value("Microsoft Calendar", CALENDAR, field)
+
+	def test_a_delta_longer_than_the_page_cap_completes_across_runs(self):
+		"""Regression: every run re-read the first pages and never stored a deltaLink."""
+		first = self._run()
+
+		self.assertTrue(first["ok"])
+		self.assertIn("next sync carries on", first["message"])
+		self.assertFalse(self._stored("delta_link"), "a partial read must never store a watermark")
+		self.assertEqual(self._stored("delta_next_link"), self.fake.link(2))
+
+		second = self._run()
+		self.assertTrue(second["ok"])
+		self.assertEqual(self.fake.calls[2], self.fake.link(2), "the second run carries on, not over")
+		self.assertFalse(self._stored("delta_link"))
+
+		third = self._run()
+		self.assertTrue(third["ok"])
+		self.assertEqual(self._stored("delta_link"), self.fake.delta_link)
+		self.assertFalse(self._stored("delta_next_link"))
+		self.assertFalse(self._stored("delta_next_window_end"))
+		self.assertEqual(len(self.fake.calls), 5, "each page is read exactly once")
+		for page in range(5):
+			for n in range(2):
+				self.assertIsNotNone(self._event_for(f"ms-big-{page}-{n}"))
+
+	def test_a_first_read_keeps_the_window_it_started_with(self):
+		self._run()
+		started = get_datetime(self._stored("delta_next_window_end"))
+		self.assertGreater(started, add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS - 1))
+
+		self._run()
+		self._run()
+
+		self.assertEqual(get_datetime(self._stored("delta_window_end")), started)
+
+	def test_an_incremental_round_keeps_its_old_watermark_until_it_ends(self):
+		old = f"{GRAPH}/me/calendarView/delta?$deltatoken=old"
+		window_end = add_to_date(now_datetime(), days=90)
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, {"delta_link": old, "delta_window_end": window_end}
+		)
+
+		self._run()
+
+		self.assertEqual(self.fake.calls[0], old)
+		self.assertEqual(self._stored("delta_link"), old)
+		self.assertFalse(self._stored("delta_next_window_end"), "an incremental round has no new window")
+
+		self._run()
+		self._run()
+
+		self.assertEqual(self._stored("delta_link"), self.fake.delta_link)
+		self.assertEqual(get_datetime(self._stored("delta_window_end")), get_datetime(window_end))
+
+	def test_an_expired_resume_point_starts_the_round_again(self):
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{"delta_next_link": self.fake.link(3), "delta_next_window_end": add_to_date(now_datetime(), days=100)},
+		)
+		calls = []
+
+		def gone_then_fake(method, path, auth, **kwargs):
+			calls.append(path)
+			if path == self.fake.link(3):
+				raise MsGraphResyncRequired("gone")
+			return self.fake(method, path, auth, **kwargs)
+
+		self.calendar.reload()
+		with patch.object(graph, "graph_request", side_effect=gone_then_fake), patch.object(frappe.db, "commit"):
+			result = sync._sync_locked(self.calendar)
+
+		self.assertTrue(result["ok"])
+		self.assertIn("/me/calendarView/delta?startDateTime=", calls[1])
+		self.assertEqual(self._stored("delta_next_link"), self.fake.link(2))
+
+	def test_a_read_that_cannot_move_forward_is_reported(self):
+		stuck = f"{GRAPH}/me/calendarView/delta?$skiptoken=stuck"
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{"delta_next_link": stuck, "delta_next_window_end": add_to_date(now_datetime(), days=100)},
+		)
+		self.calendar.reload()
+		page = {"value": [], "@odata.nextLink": stuck}
+
+		with patch.object(graph, "graph_request", return_value=page), patch.object(frappe.db, "commit"):
+			result = sync._sync_locked(self.calendar)
+
+		self.assertFalse(result["ok"])
+		self.assertIn("not moving forward", self._stored("last_error"))
+
+	def test_a_read_that_ends_with_no_link_at_all_is_reported(self):
+		with patch.object(graph, "graph_delta", return_value=([ms_event()], None, None)), patch.object(
+			frappe.db, "commit"
+		):
+			result = sync._sync_locked(self.calendar)
+
+		self.assertFalse(result["ok"])
+		self.assertTrue(self._stored("last_error"))
+		self.assertIsNotNone(self._event_for("ms-1"), "what was read is still applied")
+
+	def test_disconnect_drops_the_resume_point(self):
+		from frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar import microsoft_calendar
+
+		self._run()
+		self.assertTrue(self._stored("delta_next_link"))
+
+		microsoft_calendar.disconnect(CALENDAR)
+
+		self.assertFalse(self._stored("delta_next_link"))
+		self.assertFalse(self._stored("delta_next_window_end"))
+
+
+class TestSyncStateIsServerManaged(SyncTestCase):
+	"""The delta links are called with the owner's token, so nobody may set them from outside."""
+
+	def setUp(self):
+		super().setUp()
+		self.person = _ensure_user("m365-owner-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", self.person)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": f"{GRAPH}/me/calendarView/delta?$deltatoken=real",
+				"delta_window_end": add_to_date(now_datetime(), days=90),
+			},
+		)
+		frappe.clear_document_cache("Microsoft Calendar", CALENDAR)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def test_the_owner_cannot_change_delta_link_through_the_api(self):
+		"""Regression: read_only is a form setting; the API wrote whatever it was sent."""
+		from frappe.client import set_value
+
+		frappe.set_user(self.person)
+		for field, value in (
+			("delta_link", "http://169.254.169.254/latest/meta-data"),
+			("delta_window_end", "2099-01-01 00:00:00"),
+			("delta_next_link", "https://attacker.example/x"),
+			("delta_next_window_end", "2099-01-01 00:00:00"),
+		):
+			set_value("Microsoft Calendar", CALENDAR, field, value)
+
+		frappe.set_user("Administrator")
+		stored = frappe.db.get_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			["delta_link", "delta_window_end", "delta_next_link", "delta_next_window_end"],
+			as_dict=True,
+		)
+		self.assertEqual(stored.delta_link, f"{GRAPH}/me/calendarView/delta?$deltatoken=real")
+		self.assertNotEqual(str(stored.delta_window_end)[:4], "2099")
+		self.assertFalse(stored.delta_next_link)
+		self.assertFalse(stored.delta_next_window_end)
+
+	def test_a_new_connection_cannot_be_created_with_sync_state(self):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Microsoft Calendar",
+				"account_name": "_Test MS Calendar seeded",
+				"user": "Administrator",
+				"delta_link": "https://attacker.example/x",
+				"delta_window_end": "2099-01-01 00:00:00",
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Microsoft Calendar", doc.name, force=True, ignore_permissions=True)
+
+		self.assertFalse(frappe.db.get_value("Microsoft Calendar", doc.name, "delta_link"))
+		self.assertFalse(frappe.db.get_value("Microsoft Calendar", doc.name, "delta_window_end"))
+
+	def test_an_ordinary_save_keeps_the_sync_state(self):
+		doc = frappe.get_doc("Microsoft Calendar", CALENDAR)
+		doc.pull_from_microsoft_calendar = 0
+		doc.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"),
+			f"{GRAPH}/me/calendarView/delta?$deltatoken=real",
+		)
+
+	def test_a_form_opened_before_a_sync_does_not_roll_the_watermark_back(self):
+		stale_form = frappe.get_doc("Microsoft Calendar", CALENDAR)
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, "delta_link", f"{GRAPH}/me/calendarView/delta?$deltatoken=newer",
+			update_modified=False,
+		)
+
+		stale_form.pull_from_microsoft_calendar = 0
+		stale_form.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_link"),
+			f"{GRAPH}/me/calendarView/delta?$deltatoken=newer",
+		)
+
+
+class TestClearNonGraphDeltaLinksPatch(SyncTestCase):
+	def test_clears_only_links_that_are_not_graph_and_is_idempotent(self):
+		from frappe_microsoft365.patches import clear_non_graph_delta_links
+
+		good = f"{GRAPH}/me/calendarView/delta?$deltatoken=ok"
+		other = frappe.get_doc(
+			{"doctype": "Microsoft Calendar", "account_name": "_Test MS Calendar good", "user": "Administrator"}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Microsoft Calendar", other.name, force=True, ignore_permissions=True)
+		window_end = add_to_date(now_datetime(), days=90)
+		frappe.db.set_value("Microsoft Calendar", other.name, {"delta_link": good, "delta_window_end": window_end})
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": "http://169.254.169.254/latest/meta-data",
+				"delta_window_end": window_end,
+				"delta_next_link": "https://graph.microsoft.com.attacker.example/x",
+				"delta_next_window_end": window_end,
+			},
+		)
+
+		clear_non_graph_delta_links.execute()
+		clear_non_graph_delta_links.execute()
+
+		cleared = frappe.db.get_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			["delta_link", "delta_window_end", "delta_next_link", "delta_next_window_end"],
+			as_dict=True,
+		)
+		self.assertFalse(any(cleared.values()), cleared)
+		self.assertEqual(frappe.db.get_value("Microsoft Calendar", other.name, "delta_link"), good)
+		self.assertTrue(frappe.db.get_value("Microsoft Calendar", other.name, "delta_window_end"))

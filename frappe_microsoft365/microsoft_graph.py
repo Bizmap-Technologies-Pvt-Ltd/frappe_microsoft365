@@ -9,6 +9,7 @@ See docs/graph-api-reference.md for the verified endpoint/permission contract.
 
 import time
 from http import cookiejar
+from urllib.parse import urlsplit
 
 import frappe
 import requests
@@ -20,6 +21,11 @@ from requests.adapters import HTTPAdapter
 from frappe_microsoft365 import capabilities
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+#: The only host a Graph bearer token is ever sent to. Absolute URLs reach graph_request from
+#: Graph itself (nextLink, deltaLink) and those are always on this host over HTTPS; anything
+#: else is refused before a token is even looked up.
+GRAPH_HOST = "graph.microsoft.com"
 
 #: Requested on every sign-in regardless of capabilities: /me is how the connection resolves
 #: which Microsoft account it is attached to.
@@ -59,7 +65,8 @@ CALLBACK_METHOD = (
 MAX_RETRY_AFTER_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 2
 
-#: Safety valve for link-following loops (nextLink / deltaLink paging).
+#: Safety valve for link-following loops (nextLink / deltaLink paging). For a delta it is a
+#: per-run budget, not a limit: the calendar sync stores where it stopped and carries on.
 MAX_PAGES = 50
 
 #: Connection pool for the shared session, sized for a single worker process: Graph and the
@@ -516,7 +523,10 @@ def _graph_session():
 		session.cookies.set_policy(_RefuseCookies())
 		adapter = HTTPAdapter(pool_connections=POOL_CONNECTIONS, pool_maxsize=POOL_MAXSIZE)
 		session.mount("https://", adapter)
-		session.mount("http://", adapter)
+		# requests.Session mounts a plain-HTTP adapter by default. Nothing this session talks to
+		# is reachable over plain HTTP — Graph, and the HTTPS upload URLs SharePoint hands out —
+		# so removing it means a cleartext request fails here instead of leaving the machine.
+		session.adapters.pop("http://", None)
 		_session = session
 	return _session
 
@@ -528,7 +538,54 @@ def _http_request(method, url, **kwargs):
 	dispatched on the long-lived session instead, so this is what a test patches to keep the
 	suite off the network.
 	"""
+	if urlsplit(url or "").scheme.lower() != "https":
+		frappe.throw(_("Refusing to call Microsoft over anything but HTTPS."), MsGraphError)
 	return _graph_session().request(method, url, **kwargs)
+
+
+def is_graph_url(url):
+	"""True when ``url`` is an absolute https://graph.microsoft.com URL that is safe to call.
+
+	Credentials, a port other than 443, backslashes and whitespace are refused as well: URL
+	parsers disagree about them, and a URL that two parsers read differently is one where the
+	host this check saw may not be the host the request reaches.
+	"""
+	if not url or not isinstance(url, str):
+		return False
+	if "\\" in url or any(ch.isspace() or ord(ch) < 32 for ch in url):
+		return False
+	try:
+		parts = urlsplit(url)
+		port = parts.port
+	except ValueError:
+		return False
+	return (
+		parts.scheme.lower() == "https"
+		and (parts.hostname or "").lower() == GRAPH_HOST
+		and "@" not in parts.netloc
+		and port in (None, 443)
+	)
+
+
+def graph_url(path):
+	"""The absolute URL for a Graph path, refusing anything that is not Graph over HTTPS.
+
+	A relative path ('/me/events') is joined onto GRAPH_BASE. An absolute URL is accepted only
+	when it is https://graph.microsoft.com/..., which covers the nextLink and deltaLink values
+	Graph returns. Everything else is refused, because the caller is about to attach a bearer
+	token, and a stored link that has been pointed somewhere else would hand that token to
+	whoever answers there.
+	"""
+	path = path or ""
+	url = f"{GRAPH_BASE}{path}" if path.startswith("/") and not path.startswith("//") else path
+	if not is_graph_url(url):
+		frappe.throw(
+			_("Refusing to send a Microsoft token outside {0}: only Microsoft Graph over HTTPS is allowed.").format(
+				GRAPH_HOST
+			),
+			MsGraphError,
+		)
+	return url
 
 
 def _release(resp):
@@ -549,7 +606,8 @@ def graph_request(
 	`auth` says who the call acts as: a Microsoft Calendar (doc or name) for a delegated call, or
 	APP to call as the application itself (client credentials). See _App.
 
-	`path` is relative to GRAPH_BASE (e.g. '/me/events') or an absolute graph URL.
+	`path` is relative to GRAPH_BASE (e.g. '/me/events') or an absolute URL on
+	https://graph.microsoft.com; anything else is refused before a token is fetched (graph_url).
 	Returns parsed JSON (or the requests.Response when raw=True).
 
 	`stream` leaves the body on the wire for the caller to consume in chunks — a Teams recording
@@ -558,8 +616,9 @@ def graph_request(
 	`data` sends a raw body (bytes or a file-like object) instead of JSON — a file upload.
 	"""
 	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
+	# Checked before the token is resolved: a refused URL should not even cost a refresh.
+	url = graph_url(path)
 	token = _token_for(name)
-	url = path if path.startswith("http") else f"{GRAPH_BASE}{path}"
 	req_headers = {"Authorization": f"Bearer {token}"}
 	if headers:
 		req_headers.update(headers)
@@ -669,24 +728,33 @@ def graph_paged(path, auth, headers=None, max_pages=MAX_PAGES):
 	return items
 
 
-def graph_delta(path, auth, headers=None, max_pages=MAX_PAGES):
-	"""Follow a delta query to the end. Returns ``(items, delta_link)``.
+def graph_delta(path, auth, headers=None, max_pages=None):
+	"""Follow a delta query for up to ``max_pages`` pages. Returns ``(items, delta_link, next_link)``.
 
 	``delta_link`` is the ``@odata.deltaLink`` to pass back on the next run; it is only
 	returned once every page has been consumed, so a partial read never advances the
 	watermark. Raises MsGraphResyncRequired (410) when the token is no longer valid.
+
+	``next_link`` is set instead when the page cap stopped the read before the end: it is where
+	the next run has to carry on from. Dropping it is what made a large calendar re-read the
+	same first pages on every run and never reach the rest. Exactly one of the two is set,
+	unless Graph ended the read with neither, which is answered with ``(items, None, None)``.
 	"""
 	items = []
 	next_path = path
 	delta_link = None
-	for _page in range(max_pages):
+	# Resolved at call time, so the cap is the module's current value rather than the one it had
+	# when this function was defined.
+	for _page in range(max_pages or MAX_PAGES):
 		resp = graph_request("GET", next_path, auth, headers=headers)
 		items.extend(resp.get("value") or [])
 		delta_link = resp.get("@odata.deltaLink")
 		next_path = resp.get("@odata.nextLink")
 		if delta_link or not next_path:
 			break
-	return items, delta_link
+	if delta_link:
+		return items, delta_link, None
+	return items, None, next_path or None
 
 
 def whoami(calendar):
