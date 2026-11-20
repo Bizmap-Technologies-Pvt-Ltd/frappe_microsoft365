@@ -36,6 +36,13 @@ class SharePointMapping(Document):
 		):
 			frappe.throw(_("{0} cannot have its own SharePoint folders.").format(self.reference_doctype))
 
+		# The address ends up in the Site Grant Script a SharePoint administrator runs, so only
+		# a real SharePoint Online site address is accepted.
+		from frappe_microsoft365.script_values import validate_site_url
+
+		if self.site_url:
+			validate_site_url(self.site_url)
+
 		# The resolved ids are a cache of the URL and the library name; editing either has to
 		# drop them, or files keep flowing to the old library with nothing on screen saying so.
 		if not self.is_new() and (self.has_value_changed("site_url") or self.has_value_changed("library")):

@@ -1418,28 +1418,39 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 	needs someone who can manage the sites (SharePoint admin or Sites.FullControl.All), which
 	is deliberately not this app.
 
+	``client_id`` is the registration that makes the SharePoint calls: the Application access
+	one when it is set (see site_grant_client_id). Granting any other leaves every upload at 403.
+
 	Pasted, not saved as a file: one complete statement per line, and a line break at the end.
 	A line ending inside @{ ... } leaves a PowerShell window at ">>" waiting for the rest, and
 	a last line without a line break is never run.
-	"""
-	from frappe_microsoft365.microsoft_files import parse_site_url
 
+	A SharePoint administrator runs this with far more rights than whoever saved the values in
+	it, so every value is checked again here and written as a single-quoted, never-expanded
+	string.
+	"""
+	from frappe_microsoft365.script_values import ps_literal, validate_client_id, validate_site_url
+
+	if client_id:
+		client_id = validate_client_id(client_id)
 	lines = [
 		"# Grants the Frappe app access to the SharePoint sites in this site's SharePoint Mappings.",
 		"# Run as a SharePoint or Global administrator. Requires: Install-Module Microsoft.Graph.Sites",
-		'Connect-MgGraph -Scopes "Sites.FullControl.All"',
-		f'$appId = "{client_id or "<client id>"}"',
+		"Connect-MgGraph -Scopes 'Sites.FullControl.All'",
+		f"$appId = {ps_literal(client_id or '<client id>')}",
 		"",
 	]
 	for url in site_urls:
-		host, path = parse_site_url(url)
+		host, path = validate_site_url(url)
 		site_ref = f"{host}:{path}" if path else host
 		lines += [
-			f"# {url}",
-			f'$site = Get-MgSite -SiteId "{site_ref}"',
+			# The validated site, not the pasted text: whatever followed it in the address bar
+			# has no business in a script, not even in a comment.
+			f"# https://{host}{path}",
+			f"$site = Get-MgSite -SiteId {ps_literal(site_ref)}",
 			"New-MgSitePermission -SiteId $site.Id -BodyParameter @{ "
-			f'roles = @("{role}"); '
-			'grantedToIdentities = @(@{ application = @{ id = $appId; displayName = "Frappe" } }) }',
+			f"roles = @({ps_literal(role)}); "
+			"grantedToIdentities = @(@{ application = @{ id = $appId; displayName = 'Frappe' } }) }",
 			"",
 		]
 	lines += [
@@ -1457,44 +1468,66 @@ def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None
 	Microsoft's biggest documented trap: New-ServicePrincipal wants the Object ID from the
 	ENTERPRISE APPLICATION blade, not the one shown on the App Registration page. Using the
 	wrong one fails at authentication time with no useful message, so the generated script
-	looks it up by AppId instead of asking anyone to copy it.
+	looks it up by AppId instead of asking anyone to copy it. That lookup is a Microsoft Graph
+	call, so the script signs in to Graph as well as to Exchange Online.
+
+	Every value is validated and written as a single-quoted string: the Exchange administrator
+	who pastes this runs it with their own rights.
 	"""
-	mailboxes = mailboxes or []
+	from frappe_microsoft365.script_values import ps_literal, validate_client_id, validate_mailbox
+
+	if client_id:
+		client_id = validate_client_id(client_id)
+	if enterprise_object_id:
+		enterprise_object_id = validate_client_id(enterprise_object_id, _("Enterprise application Object ID"))
+	mailboxes = [validate_mailbox(m) for m in mailboxes or []]
+	targets = [ps_literal(m) for m in mailboxes] or [ps_literal("<shared@yourdomain.com>")]
+
 	lines = [
-		"# Run in Exchange Online PowerShell as a tenant admin.",
+		"# Run in PowerShell as a tenant admin.",
 		"Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser",
+	]
+	if not enterprise_object_id:
+		lines.append("Install-Module -Name Microsoft.Graph.Applications -Scope CurrentUser")
+	lines += [
 		"Import-Module ExchangeOnlineManagement",
 		"Connect-ExchangeOnline",
+	]
+	if not enterprise_object_id:
+		lines.append("Connect-MgGraph -Scopes 'Application.Read.All'")
+	lines += [
 		"",
 		"# Look the service principal up by AppId so the correct (Enterprise Application)",
 		"# Object ID is used — copying the App Registration one causes silent auth failures.",
-		f'$appId = "{client_id or "<CLIENT_ID>"}"',
+		f"$appId = {ps_literal(client_id or '<CLIENT_ID>')}",
 	]
 
 	if enterprise_object_id:
-		lines.append(f'$objectId = "{enterprise_object_id}"')
+		lines.append(f"$objectId = {ps_literal(enterprise_object_id)}")
 	else:
 		lines += [
-			"$sp = Get-MgServicePrincipal -Filter \"appId eq '$appId'\"   # or Get-AzureADServicePrincipal",
+			"$sp = Get-MgServicePrincipal -Filter \"appId eq '$appId'\"",
 			"$objectId = $sp.Id",
 		]
 
 	lines += [
 		"",
-		"New-ServicePrincipal -AppId $appId -ObjectId $objectId -DisplayName \"Frappe mail access\"",
-		"$exoSp = Get-ServicePrincipal -Identity \"Frappe mail access\"",
+		"# Exchange's own record of the app, found by AppId: a display name is shared by every site",
+		"# in the tenant that ran this script. Created only if an earlier run has not done so.",
+		"$exoSp = Get-ServicePrincipal -Identity $appId -ErrorAction SilentlyContinue",
+		"if (-not $exoSp) { $exoSp = New-ServicePrincipal -AppId $appId -ObjectId $objectId -DisplayName 'Frappe mail access' }",
 		"",
 		"# Grant only the mailboxes this app should ever read. Access is scoped per mailbox,",
 		"# so the app cannot reach anything not listed here.",
 	]
 
-	for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+	for mailbox in targets:
 		lines.append(
-			f'Add-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity -AccessRights FullAccess'
+			f"Add-MailboxPermission -Identity {mailbox} -User $exoSp.Identity -AccessRights FullAccess"
 		)
 		if send_as:
 			lines.append(
-				f'Add-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+				f"Add-RecipientPermission -Identity {mailbox} -Trustee $exoSp.Identity "
 				f"-AccessRights SendAs -Confirm:$false"
 			)
 
@@ -1507,19 +1540,20 @@ def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None
 			"# TO UNDO. Removes the application's access again; run as a tenant admin.",
 			"# " + "-" * 72,
 		]
-		for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+		for mailbox in targets:
 			if send_as:
 				lines.append(
-					f'# Remove-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+					f"# Remove-RecipientPermission -Identity {mailbox} -Trustee $exoSp.Identity "
 					f"-AccessRights SendAs -Confirm:$false"
 				)
 			lines.append(
-				f'# Remove-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity '
+				f"# Remove-MailboxPermission -Identity {mailbox} -User $exoSp.Identity "
 				f"-AccessRights FullAccess -Confirm:$false"
 			)
 		lines.append("# Remove-ServicePrincipal -Identity $exoSp.Identity   # revokes it everywhere")
 
-	return "\n".join(lines)
+	# Pasted, not saved as a file: a last line without a line break is never run.
+	return "\n".join(lines) + "\n"
 
 
 # --- collectors -----------------------------------------------------------------------

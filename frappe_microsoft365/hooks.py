@@ -60,6 +60,7 @@ on_social_login = ["frappe_microsoft365.sign_in.on_social_login"]
 microsoft365_upgrade_checks = {
 	"1.1.1": [
 		"frappe_microsoft365.sign_in.upgrade_check",
+		"frappe_microsoft365.script_values.upgrade_check",
 	],
 }
 

@@ -246,7 +246,11 @@ failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
   commands for app-only mailbox access, looking the service principal up by AppId rather
   than asking you to copy an Object ID — Microsoft's own documentation warns that copying
   the one from the App Registration page (instead of the Enterprise Application page) causes
-  authentication to fail with no useful error.
+  authentication to fail with no useful error. That lookup goes through Microsoft Graph
+  PowerShell (`Connect-MgGraph -Scopes Application.Read.All`), and Exchange's own record of the
+  app is found by AppId too, so a second site in the same tenant never picks up the wrong one.
+  Mailboxes must be plain addresses and every value is written as a single-quoted PowerShell
+  string, so nothing typed into the dialog can run as a command in the administrator's window.
 
 **The shared-mailbox identity conflict.** Microsoft requires the *shared mailbox address* in
 the IMAP XOAUTH2 string but the *signing-in user* for SMTP. Frappe sends `login_id or

@@ -17,6 +17,7 @@ from frappe_microsoft365.doctor import (
 from frappe_microsoft365.tests.base import BaseTestCase
 
 TENANT = "11111111-2222-3333-4444-555555555555"
+CLIENT_ID = "038b9c8e-2699-4858-b5f1-4f7a3d4077c4"
 
 
 def ids(findings, status=None):
@@ -861,7 +862,7 @@ class TestSetupGuideEndpoint(BaseTestCase):
 class TestPowerShellGenerator(BaseTestCase):
 	def test_looks_up_object_id_instead_of_asking_for_it(self):
 		"""Microsoft's documented #1 trap: the App Registration Object ID is the wrong one."""
-		script = doctor.powershell_for_app_only("client-abc", mailboxes=["support@example.com"])
+		script = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["support@example.com"])
 
 		self.assertIn("appId eq '$appId'", script)
 		self.assertIn("New-ServicePrincipal", script)
@@ -869,21 +870,21 @@ class TestPowerShellGenerator(BaseTestCase):
 		self.assertIn("support@example.com", script)
 
 	def test_uses_a_supplied_object_id_when_known(self):
-		script = doctor.powershell_for_app_only("client-abc", enterprise_object_id="obj-123")
+		script = doctor.powershell_for_app_only(CLIENT_ID, enterprise_object_id="0b1c2d3e-0000-4000-8000-000000000123")
 
-		self.assertIn('$objectId = "obj-123"', script)
+		self.assertIn("$objectId = '0b1c2d3e-0000-4000-8000-000000000123'", script)
 		self.assertNotIn("Get-MgServicePrincipal", script)
 
 	def test_send_as_permission_is_opt_in(self):
-		without = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"])
-		with_send = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"], send_as=True)
+		without = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com"])
+		with_send = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com"], send_as=True)
 
 		self.assertNotIn("Add-RecipientPermission", without)
 		self.assertIn("Add-RecipientPermission", with_send)
 
 	def test_the_script_ships_with_its_own_undo(self):
 		"""Granting standing mailbox access is reversible; the reverse belongs in the output."""
-		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"], send_as=True)
+		script = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com"], send_as=True)
 
 		self.assertIn("TO UNDO", script)
 		self.assertIn("Remove-MailboxPermission", script)
@@ -891,13 +892,13 @@ class TestPowerShellGenerator(BaseTestCase):
 		self.assertIn("Remove-ServicePrincipal", script)
 
 	def test_undo_block_can_be_suppressed(self):
-		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"], include_undo=False)
+		script = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com"], include_undo=False)
 
 		self.assertNotIn("TO UNDO", script)
 		self.assertIn("Add-MailboxPermission", script)
 
 	def test_undo_lines_are_commented_so_nothing_runs_by_accident(self):
-		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com"])
+		script = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com"])
 		undo = script[script.index("TO UNDO"):]
 
 		for line in undo.splitlines():
@@ -905,7 +906,7 @@ class TestPowerShellGenerator(BaseTestCase):
 				self.assertTrue(line.strip().startswith("#"), f"undo line must be commented: {line}")
 
 	def test_every_mailbox_is_granted_individually(self):
-		script = doctor.powershell_for_app_only("c", mailboxes=["a@b.com", "c@d.com"])
+		script = doctor.powershell_for_app_only(CLIENT_ID, mailboxes=["a@b.com", "c@d.com"])
 
 		self.assertEqual(script.count("Add-MailboxPermission"), 2)
 
