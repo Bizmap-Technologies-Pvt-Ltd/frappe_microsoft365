@@ -952,7 +952,12 @@ class TestSettings(BaseTestCase):
 				for df in frappe.get_meta(doctype).fields
 				if df.fieldtype == "Data"
 			]
+		# An MD5 hex digest has one width; nothing from SharePoint goes in it.
+		fixed = {"custom_microsoft_content_hash": 32}
 		for fieldname, length in fields:
+			if fieldname in fixed:
+				self.assertEqual(length, fixed[fieldname], fieldname)
+				continue
 			self.assertGreaterEqual(length or 140, 255, fieldname)
 
 	def test_file_gets_at_most_one_wide_varchar(self):
@@ -1677,6 +1682,90 @@ class TestOnlyTheAppsItems(FilesTestCase):
 		self.assertEqual(self.deletes(), [])
 		frappe.delete_doc("File", f.name, force=True)
 		self.assertEqual(self.deletes(), ["/drives/DRIVE/items/ITEM-" + f.file_name])
+
+
+class TestOwnBytesOnly(FilesTestCase):
+	"""After a move the disk name is free, and the next upload of that name gets it."""
+
+	def moved_then_taken(self, keep_hash=True):
+		# A name no earlier test left on disk, so that A gets it as it is, and B after A.
+		name = f"report-{frappe.generate_hash(length=8)}.csv"
+		a = self.attach(content=f"A's bytes {frappe.generate_hash()}".encode(), name=name)
+		old = a.file_url
+		files.upload_file(a.name)
+		self.assertFalse(os.path.exists(files.local_path(old)))
+		if not keep_hash:
+			frappe.db.set_value("File", a.name, "custom_microsoft_content_hash", None)  # moved before 1.1.1
+		secret = frappe.get_doc({"doctype": "ToDo", "description": "confidential"}).insert()
+		b = self.attach(
+			content=f"B's secret {frappe.generate_hash()}".encode(),
+			name=name,
+			attached_to_name=secret.name,
+		)
+		self.assertEqual(b.file_url, old)  # Frappe handed B the freed name
+		return frappe.get_doc("File", a.name), b
+
+	def test_upload_records_the_bytes(self):
+		import hashlib
+
+		body = f"hash me {frappe.generate_hash()}".encode()
+		f = self.attach(content=body)
+		files.upload_file(f.name)
+		self.assertEqual(
+			frappe.db.get_value("File", f.name, "custom_microsoft_content_hash"), hashlib.md5(body).hexdigest()
+		)
+
+	def open_after_sharepoint_lost_it(self, f):
+		with (
+			patch.object(files, "_stream", side_effect=MsGraphNotFound("404")),
+			patch("frappe.utils.response.send_private_file", return_value="LOCAL") as served,
+		):
+			try:
+				return files.open_file(f.name), served
+			except frappe.DoesNotExistError:
+				return None, served
+
+	def test_open_file_does_not_serve_a_path_now_owned_by_another_file(self):
+		for keep_hash in (True, False):
+			a, _b = self.moved_then_taken(keep_hash)
+			out, served = self.open_after_sharepoint_lost_it(a)
+			self.assertIsNone(out)
+			served.assert_not_called()
+
+	def test_a_kept_copy_is_still_served_when_sharepoint_loses_it(self):
+		configure(self, files_keep_local_copy=1)
+		f = self.attach()
+		files.upload_file(f.name)
+		out, served = self.open_after_sharepoint_lost_it(frappe.get_doc("File", f.name))
+		self.assertEqual(out, "LOCAL")
+		served.assert_called_once()
+
+	def test_bring_back_downloads_when_the_local_path_belongs_to_another_file(self):
+		a, b = self.moved_then_taken()
+		body = b"A's bytes, from SharePoint"
+		resp = MagicMock()
+		resp.iter_content.return_value = iter([body])
+		with patch.object(graph, "graph_request", return_value=resp) as gr:
+			target = files.bring_back(a.name)
+		gr.assert_called_once()
+		self.assertNotEqual(target, b.file_url)
+		with open(files.local_path(target), "rb") as fh:
+			self.assertEqual(fh.read(), body)
+		with open(b.get_full_path(), "rb") as fh:
+			self.assertTrue(fh.read().startswith(b"B's secret"))
+
+	def test_a_kept_copy_whose_bytes_changed_is_not_taken_back(self):
+		configure(self, files_keep_local_copy=1)
+		f = self.attach(name="kept.csv")
+		files.upload_file(f.name)
+		with open(f.get_full_path(), "wb") as fh:
+			fh.write(b"something else now")
+		resp = MagicMock()
+		resp.iter_content.return_value = iter([b"the real thing"])
+		with patch.object(graph, "graph_request", return_value=resp) as gr:
+			target = files.bring_back(f.name)
+		gr.assert_called_once()
+		self.assertNotEqual(target, f.file_url)
 
 
 class TestOwnFolders(FilesTestCase):

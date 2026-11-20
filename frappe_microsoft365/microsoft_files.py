@@ -827,6 +827,7 @@ PROTECTED_FILE_FIELDS = (
 	"custom_microsoft_folder_id",
 	"custom_microsoft_local_url",
 	"custom_microsoft_attempts",
+	"custom_microsoft_content_hash",
 )
 
 
@@ -996,6 +997,14 @@ def upload_file(file_name):
 	if local_url:
 		values["file_url"] = stored_url(file_name)
 		values["content_hash"] = None
+		# What the bytes were, so that whatever is at local_url later is served or brought back
+		# only if it is still this file (see own_local_copy).
+		try:
+			values["custom_microsoft_content_hash"] = _hash_of(file_doc.get_full_path())
+		except OSError:
+			# Uploaded a moment ago, so this is unlikely; without a hash the kept copy is simply
+			# trusted less (own_local_copy), which is no reason to fail the move.
+			values["custom_microsoft_content_hash"] = None
 		# Kept whether or not the disk copy is: links already handed out (a bookmark, an email,
 		# a form opened before the move) still say this URL, and redirect_moved_file follows it.
 		values["custom_microsoft_local_url"] = local_url
@@ -1026,6 +1035,17 @@ def _rollback_to(savepoint):
 		frappe.db.rollback(save_point=savepoint)
 	except Exception:
 		frappe.db.rollback()
+
+
+def _hash_of(path):
+	"""MD5 hex digest of a file on disk, read in pieces. Frappe's content_hash is MD5 too."""
+	import hashlib
+
+	digest = hashlib.md5()
+	with open(path, "rb") as fh:  # nosemgrep: callers pass local_path() of a /files URL
+		for chunk in iter(lambda: fh.read(DOWNLOAD_CHUNK_BYTES), b""):
+			digest.update(chunk)
+	return digest.hexdigest()
 
 
 def _drive_of(item, folder):
@@ -1619,6 +1639,26 @@ def _inside_known_folder(drive_id, item_id, known):
 	return False
 
 
+def own_local_copy(file_doc, url):
+	"""Is the file at a /files or /private/files URL still this File's own bytes?
+
+	Once a file has moved without a kept copy its disk name is free, and Frappe gives that exact
+	name to the next upload with the same file name, which may be another record's confidential
+	file. So: when the bytes were hashed before the move, they must still match. Files moved
+	before that was recorded have nothing to compare, and their old path counts as theirs only
+	while no other File claims it.
+	"""
+	if not url or ".." in url.split("/") or not url.startswith(("/files/", "/private/files/")):
+		return False
+	path = local_path(url)
+	if not os.path.isfile(path):
+		return False
+	recorded = file_doc.get("custom_microsoft_content_hash")
+	if recorded:
+		return _hash_of(path) == recorded
+	return not frappe.db.exists("File", {"file_url": url, "name": ["!=", file_doc.name]})
+
+
 @frappe.whitelist(methods=["GET"])
 def open_file(file: str, download: int = 0):
 	"""Open a File that was moved to SharePoint. The file_url of every moved File points here.
@@ -1649,8 +1689,8 @@ def open_file(file: str, download: int = 0):
 		)
 	except MsGraphNotFound:
 		_forget_message()
-		# Gone from SharePoint. A kept local copy is still the file; serve that instead.
-		if local and os.path.exists(local_path(local)):
+		# Gone from SharePoint. A kept local copy is still the file; serve that instead, if it is.
+		if local and own_local_copy(file_doc, local):
 			if local.startswith("/private/files/"):
 				from frappe.utils.response import send_private_file
 
@@ -1996,8 +2036,6 @@ def bring_back(file_name):
 	open_file, so every attachment that lives in SharePoint has to come home first. The
 	SharePoint copy is left where it is. Returns the local URL the file now has.
 	"""
-	import hashlib
-
 	file_doc = frappe.get_doc("File", file_name)
 	if file_doc.get("custom_microsoft_status") != STORED:
 		return file_doc.file_url
@@ -2009,9 +2047,13 @@ def bring_back(file_name):
 		target = prefix + safe_file_name(file_doc.file_name or file_doc.name)
 	path = local_path(target)
 
-	if not os.path.exists(path):
-		if frappe.db.exists("File", {"file_url": target, "name": ["!=", file_doc.name]}):
-			# The name is taken by another attachment; never write over someone else's file.
+	# A kept copy is reused only if it is still this file's bytes (see own_local_copy).
+	if not own_local_copy(file_doc, target):
+		if os.path.exists(path) or frappe.db.exists(
+			"File", {"file_url": target, "name": ["!=", file_doc.name]}
+		):
+			# The name is taken by another attachment; never write over someone else's file, and
+			# never take it for this one.
 			target = prefix + f"{file_doc.name}-" + safe_file_name(file_doc.file_name or "file")
 			path = local_path(target)
 		resp = graph.graph_request(
@@ -2034,15 +2076,10 @@ def bring_back(file_name):
 			if os.path.exists(tmp):
 				os.remove(tmp)
 
-	digest = hashlib.md5()
-	with open(path, "rb") as fh:  # nosemgrep
-		for chunk in iter(lambda: fh.read(DOWNLOAD_CHUNK_BYTES), b""):
-			digest.update(chunk)
-
 	frappe.db.set_value(
 		"File",
 		file_doc.name,
-		{"file_url": target, "content_hash": digest.hexdigest(), "custom_microsoft_status": None},
+		{"file_url": target, "content_hash": _hash_of(path), "custom_microsoft_status": None},
 		update_modified=False,
 	)
 	for comment in frappe.get_all(

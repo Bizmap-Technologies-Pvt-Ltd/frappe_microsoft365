@@ -103,7 +103,7 @@ Three places hold the configuration: **Microsoft Settings** for the connection, 
 
 | Option | Off (default) | On |
 | --- | --- | --- |
-| Keep a local copy after upload | The server copy is deleted once the file is in SharePoint, freeing disk space | Both copies are kept; useful while trialling. If the SharePoint copy disappears, the local one is served |
+| Keep a local copy after upload | The server copy is deleted once the file is in SharePoint, freeing disk space | Both copies are kept; useful while trialling. If the SharePoint copy disappears, the local one is served, as long as it is still the same file |
 | Also copy linked files into SharePoint | Attachments that are only a web link stay links | The linked file is downloaded once and archived in the record's folder; the link is kept |
 | Remove from SharePoint when the attachment is deleted | SharePoint keeps the file | The file goes to the site's recycle bin, where it can be restored |
 

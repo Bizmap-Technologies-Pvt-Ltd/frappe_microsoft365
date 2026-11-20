@@ -62,7 +62,9 @@ even then the file goes to the site's recycle bin. Deleting a record keeps its f
 Where a File lives in SharePoint is the app's to say. The *Microsoft 365* fields on File and the
 `open_file` address cannot be set or changed through the form or the API (a copy of a moved
 attachment, which repeats them, is the exception), and the app only opens, reads or deletes an
-item that is in a record's folder.
+item that is in a record's folder. If a moved file's SharePoint copy is gone, a kept local copy is
+served only while it is still that file: same bytes as when it moved, or, for files moved before
+1.1.1, a disk name no other attachment has taken since.
 
 ### Options, site-wide and per DocType
 

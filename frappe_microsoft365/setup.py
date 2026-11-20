@@ -390,6 +390,20 @@ def create_file_custom_fields(only_definitions=False):
 				"insert_after": "custom_microsoft_local_url",
 				"read_only": 1,
 			},
+			{
+				# MD5 of the bytes as they were on disk when the file moved (Frappe's own
+				# content_hash is cleared then; see microsoft_files.upload_file). A kept copy at
+				# the old path is served or brought back only if it still has these bytes: once the
+				# disk name is free, Frappe can give it to another upload. Fixed width, not 255:
+				# it is a hex digest, and tabFile has little room to spare.
+				"fieldname": "custom_microsoft_content_hash",
+				"fieldtype": "Data",
+				"label": "Content Hash Before Move",
+				"insert_after": "custom_microsoft_attempts",
+				"read_only": 1,
+				"hidden": 1,
+				"length": 32,
+			},
 		]
 	}
 	if only_definitions:
