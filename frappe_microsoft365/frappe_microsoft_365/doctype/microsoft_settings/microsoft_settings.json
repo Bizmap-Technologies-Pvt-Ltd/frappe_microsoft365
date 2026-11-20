@@ -30,7 +30,9 @@
   "scopes_section",
   "effective_scopes_display",
   "default_scopes",
-  "authorized_scopes"
+  "authorized_scopes",
+  "upgrade_reported_version",
+  "upgrade_report"
  ],
  "fields": [
   {
@@ -202,11 +204,29 @@
    "read_only": 1,
    "no_copy": 1,
    "description": "What the last sign-in asked for. A token only carries the permissions it was issued with."
+  },
+  {
+   "fieldname": "upgrade_reported_version",
+   "fieldtype": "Data",
+   "label": "Upgrade Checks Last Run For",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "The last release whose upgrade checks ran on this site."
+  },
+  {
+   "fieldname": "upgrade_report",
+   "fieldtype": "Long Text",
+   "label": "Upgrade Report",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "What the last upgrade found, shown by Run Diagnostics until dismissed."
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-22 00:00:00",
+ "modified": "2026-11-21 00:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Settings",
  "owner": "Administrator",

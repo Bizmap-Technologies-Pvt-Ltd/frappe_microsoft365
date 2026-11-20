@@ -14,12 +14,22 @@ def after_install():
 	Wiring only after_migrate meant a plain install left the Event custom fields missing,
 	and the sync then failed with "Unknown column custom_sync_with_microsoft_calendar".
 	"""
+	from frappe_microsoft365 import upgrade
+
 	setup()
+	# A new site has no earlier version to have upgraded from, so its first migrate must not
+	# report the checks of every release up to this one.
+	upgrade.mark_installed()
 
 
 def after_migrate():
 	"""Runs on every `bench migrate`, so upgrades pick up new fields too."""
+	from frappe_microsoft365 import upgrade
+
 	setup()
+	# After setup, so the checks see the fields and capabilities this release needs. Reports
+	# once per release; never raises.
+	upgrade.after_migrate()
 
 
 def setup():
