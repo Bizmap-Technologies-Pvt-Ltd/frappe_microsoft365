@@ -8,6 +8,11 @@
   parameters and failed as pasted; it now uses `$true` and says to update the MicrosoftTeams
   module first (#49).
 
+- Docs: `compatibility.md`, the FAQ and the README no longer say nothing is version-gated and
+  there is no build step. They now state that SharePoint document storage needs Frappe v16, how
+  the app checks the version, that the desk scripts are built bundles, and how Sign in with
+  Microsoft differs between v15 and v16, with a v15/v16 feature table (#50).
+
 ### Changed
 
 - `get_transcript_content` returns the format Microsoft actually sent in `format`, and
@@ -18,7 +23,8 @@
 ### Added
 
 - A test that scans every PowerShell block in `docs/` and `README.md` for a Boolean parameter given
-  a bare `true`/`false` (#49).
+  a bare `true`/`false` (#49), and one that keeps the v15/v16 table in `compatibility.md` in line
+  with the capabilities' minimum Frappe version (#50).
 
 ### Upgrade notes
 

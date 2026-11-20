@@ -82,3 +82,31 @@ class TestPowerShellInDocs(unittest.TestCase):
 	def test_only_powershell_blocks_are_read(self):
 		other = "```bash\nsomething --flag -x true\n```\nOutside -Enabled true\n"
 		self.assertEqual(bare_booleans(other), [])
+
+
+class TestCompatibilityDoc(unittest.TestCase):
+	"""compatibility.md once said nothing was version-gated while SharePoint storage was v16-only.
+	Tie its table to the capability registry so the two cannot drift apart again."""
+
+	def setUp(self):
+		path = ROOT / "docs" / "compatibility.md"
+		if not path.exists():
+			self.skipTest("docs/ is not next to the package")
+		self.rows = {
+			cells[0]: cells[1:]
+			for cells in (
+				[c.strip() for c in line.strip().strip("|").split("|")]
+				for line in path.read_text(encoding="utf-8").splitlines()
+				if line.startswith("|")
+			)
+			if len(cells) == 3
+		}
+
+	def test_every_capability_has_a_row_saying_whether_v15_has_it(self):
+		from frappe_microsoft365 import capabilities
+
+		for capability in capabilities.all_capabilities():
+			row = next((cells for label, cells in self.rows.items() if capability.label in label), None)
+			self.assertIsNotNone(row, f"no row in compatibility.md for {capability.label}")
+			on_v15 = not row[0].lower().lstrip("*").startswith("no")
+			self.assertEqual(on_v15, capability.min_frappe <= 15, (capability.label, row))
