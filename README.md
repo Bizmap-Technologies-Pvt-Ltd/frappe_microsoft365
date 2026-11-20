@@ -50,7 +50,8 @@ Microsoft Graph.
   `Calendars.ReadWrite` and nothing else — Microsoft mints the link as part of the event.
 - **The invitation side.** Organiser, the attendee list with everyone's reply, and
   Accept / Tentative / Decline on invitations you received.
-- **Transcripts and recordings.** The transcript is attached to the Event as a `.vtt`. A
+- **Transcripts and recordings.** The transcript is attached to the Event as a `.vtt` (a `.txt`
+  without speaker names on tenants that switch speaker attribution off). A
   recording stays with Microsoft and streams through Frappe on demand rather than filling your
   file store.
 - **Sign in with Microsoft**, and **Outlook mail over OAuth** — it provisions the `Connected App`
@@ -84,11 +85,14 @@ you grant in Azure and what sign-in asks for cannot drift apart.
 
 | Frappe | Branch | Status |
 | --- | --- | --- |
-| v15 | `version-15` | supported |
-| v16 | `version-16` | supported |
+| v15 | `version-15` | supported, except SharePoint document storage |
+| v16 | `version-16` | supported, every feature |
 
-`main` carries the same code as both. Python 3.10+. `msal` is the only dependency that is not
-already in a bench.
+`main` carries the same code as both. SharePoint document storage needs Frappe v16 (Microsoft
+Settings refuses it on v15); everything else works on both. On v15, Sign in with Microsoft relies
+on Frappe 15's own OAuth state handling, while v16 validates the state server-side. Python 3.10+
+(v16 needs 3.14). `msal` is the only dependency that is not already in a bench. What differs, and
+why: [compatibility](docs/compatibility.md).
 
 ## Install
 

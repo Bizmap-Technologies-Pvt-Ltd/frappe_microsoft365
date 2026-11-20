@@ -510,9 +510,7 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 	refusal = None
 	for transcript in ordered:
 		try:
-			content = ms.get_transcript_content(calendar_name, meeting_id, transcript["id"]).get(
-				"content"
-			)
+			fetched = ms.get_transcript_content(calendar_name, meeting_id, transcript["id"])
 		except MsGraphError as e:
 			# One part failing must not cost the others, so this keeps going — but it is kept,
 			# not dropped. Microsoft listing a transcript it will not then hand over is a
@@ -520,8 +518,11 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 			# a transcript that was finished and being withheld.
 			refusal = refusal or e
 			continue
+		content = fetched.get("content")
 		if content:
-			contents.append((transcript.get("created_date_time"), content))
+			contents.append(
+				(transcript.get("created_date_time"), content, _transcript_extension(fetched.get("format")))
+			)
 
 	if not contents:
 		if refusal:
@@ -532,16 +533,25 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 
 	saved = []
 	total = len(contents)
-	for index, (created_at, content) in enumerate(contents, start=1):
+	for index, (created_at, content, extension) in enumerate(contents, start=1):
 		stamp = (created_at or "")[:10] or frappe.utils.nowdate()
 		suffix = f"-part-{index}" if total > 1 else ""
-		file_doc = _save_transcript(f"{TRANSCRIPT_PREFIX}{stamp}{suffix}.vtt", content, doc.name)
+		file_doc = _save_transcript(f"{TRANSCRIPT_PREFIX}{stamp}{suffix}{extension}", content, doc.name)
 		saved.append({"file_name": file_doc.file_name, "file_url": file_doc.file_url})
 	return saved
 
 
+def _transcript_extension(fmt):
+	"""``.txt`` for the plain-text transcript a tenant without speaker attribution gets, ``.vtt``
+	otherwise. Decided per part, from what Microsoft actually sent: the file has no voice tags,
+	and calling it VTT would promise speaker names it does not contain."""
+	from frappe_microsoft365.microsoft_transcripts import PLAIN_TEXT_FORMAT
+
+	return ".txt" if fmt == PLAIN_TEXT_FORMAT else ".vtt"
+
+
 def _save_transcript(filename, content, event_name):
-	"""Write the VTT as a File on the Event, and be clear about whose fault it is if that fails.
+	"""Write the transcript as a File on the Event, and be clear about whose fault it is if that fails.
 
 	Saving a File runs every after_insert hook any installed app has put on File — an S3
 	offloader, a virus scanner, a storage quota. When one of those is misconfigured the upload

@@ -132,14 +132,20 @@ every permission granted and consented still gets:
 ```
 
 Turn **Microsoft Graph access** **On**. Then select **Configure** and turn **Include speaker
-attribution** **On** if you want speaker names in the VTT — that one is off by default too, and
-without it the transcript is text with nobody's name against it.
+attribution** **On** if you want speaker names in the transcript — that one is off by default too.
+Without it Microsoft will not hand over the `.vtt`, and the app attaches the same transcript as a
+`.txt` with nobody's name against it.
 
-The PowerShell equivalent, if you would rather not click:
+The PowerShell equivalent, if you would rather not click. Update the MicrosoftTeams module first
+(`Update-Module MicrosoftTeams`, or `Install-Module MicrosoftTeams` if it is not installed): these
+two parameters are recent, and an older module may not know them.
 
 ```powershell
-Set-CsTeamsMeetingConfiguration -EnableGraphTranscriptAccess true -EnableAttributedTranscripts true -Identity Global
+Connect-MicrosoftTeams
+Set-CsTeamsMeetingConfiguration -Identity Global -EnableGraphTranscriptAccess $true -EnableAttributedTranscripts $true
 ```
+
+Both parameters are Booleans, so they take `$true`; a bare `true` is refused.
 
 There is no request-side workaround and re-granting consent does nothing, which is why both the
 error message and the doctor name this switch specifically rather than blaming permissions.

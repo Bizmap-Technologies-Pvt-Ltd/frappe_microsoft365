@@ -135,7 +135,10 @@ than right ones. Open the event in Outlook for those.
 # Teams meeting transcripts and recordings
 
 Once a Teams meeting has finished, its transcript is **attached to the Event as a `.vtt` file**
-and its recordings are listed on the Event, ready to download.
+and its recordings are listed on the Event, ready to download. On a tenant that has speaker
+attribution switched off, Microsoft refuses the `.vtt`, and the app attaches the same transcript
+without speaker names as a `.txt` instead (see
+[troubleshooting](troubleshooting.md#speakerattributionnotallowed)).
 
 **Nothing is ready the moment a meeting ends.** Microsoft publishes no schedule for this: an
 ordinary meeting is usually ready in 5-30 minutes, a long or heavy one can take a few hours,
@@ -274,7 +277,7 @@ Other apps depend on this app and call its utilities (they never re-implement Gr
 | Settings / liveness | `frappe_microsoft365.microsoft_graph.get_settings()` |
 | Authorize / callback / disconnect / test | `…doctype.microsoft_calendar.microsoft_calendar` → `authorize_access(calendar_name)`, `callback`, `test_connection(calendar_name)`, `disconnect(calendar_name)` |
 | Create a Teams meeting | `frappe_microsoft365.microsoft_meetings.create_meeting(calendar_name, subject, start_datetime, end_datetime, attendees=None, body=None, create_calendar_event=True)` → `{event_id, web_link, join_url, online_meeting_id}` |
-| Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt}` |
+| Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt, latest_format}` (`latest_format` is `text/vtt`, or `application/vnd.microsoft.graph.transcript+text` when speaker attribution is off) |
 | Read calendar events | `frappe_microsoft365.microsoft_calendar_sync.fetch_events(calendar_name, start_datetime, end_datetime)` |
 | Reply to an invitation | `frappe_microsoft365.microsoft_rsvp.respond_to_event(event, response, comment=None, send_response=1)` — `response` is `accept`, `decline` or `tentative` |
 
