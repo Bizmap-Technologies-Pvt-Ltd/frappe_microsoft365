@@ -1105,11 +1105,13 @@ MOVED_EVENT = "microsoft365_file_moved"
 def redirect_moved_file():
 	"""before_request: send an old /files or /private/files link of a moved file to its new home.
 
-	The disk copy is gone, so Frappe would answer the old link with Forbidden (private) or Not
-	Found (public). The redirect target, open_file, checks permission exactly as the old URL
-	would have, so this reveals nothing to someone who could not open the file before.
-	Costs nothing on other requests: a prefix check, then one indexed lookup only when the
-	file is missing from disk.
+	Decided by the database, not the disk: with Keep Local Copy on the old path still exists, but
+	no File carries it as its address any more, so Frappe would answer it with Forbidden. The
+	moved File is found by its recorded old address; when several moved Files share one (Frappe
+	stores identical content once, so attachments of different records can share a disk name),
+	the redirect goes to one this user may read. The target, open_file, checks permission again
+	exactly as the old URL would have, so this reveals nothing to someone who could not open the
+	file before. Other requests cost a prefix check; old-style file paths one indexed lookup.
 	"""
 	request = getattr(frappe.local, "request", None)
 	if not request or request.method not in ("GET", "HEAD"):
@@ -1119,15 +1121,36 @@ def redirect_moved_file():
 	path = unquote(request.path or "")
 	if not path.startswith(("/private/files/", "/files/")) or ".." in path.split("/"):
 		return
-	if os.path.exists(local_path(path)) or not has_file_fields():
+	if not has_file_fields():
 		return
-	name = frappe.db.get_value(
-		"File", {"custom_microsoft_local_url": path, "custom_microsoft_status": STORED}, "name"
+	moved = frappe.get_all(
+		"File",
+		filters={"custom_microsoft_local_url": path, "custom_microsoft_status": STORED},
+		pluck="name",
+		order_by="creation asc",
 	)
-	if name:
+	if not moved:
+		return
+	on_disk = os.path.exists(local_path(path))
+	if on_disk and _readable_file_at(path):
+		# The bytes there are also an unmoved File's own, which this user may read: Frappe serves it.
+		return
+	target = next((name for name in moved if frappe.has_permission("File", "read", doc=name)), None)
+	if not target and not on_disk:
+		# Nothing this user may read. open_file refuses them just as the old URL would have.
+		target = moved[0]
+	if target:
 		from werkzeug.routing import RequestRedirect
 
-		raise RequestRedirect(stored_url(name))
+		raise RequestRedirect(stored_url(target))
+
+
+def _readable_file_at(url):
+	"""Whether a File whose address is this local URL is one the user may read."""
+	return any(
+		frappe.has_permission("File", "read", doc=name)
+		for name in frappe.get_all("File", filters={"file_url": url}, pluck="name")
+	)
 
 
 def _repoint_links(file_doc, old_url, new_url):

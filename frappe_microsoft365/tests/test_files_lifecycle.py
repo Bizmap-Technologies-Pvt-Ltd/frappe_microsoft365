@@ -324,3 +324,66 @@ class TestPublicFilesStayPublic(FilesTestCase):
 	def test_open_file_is_reachable_without_signing_in(self):
 		# Without allow_guest Frappe answers a guest with 403 before open_file runs.
 		self.assertIn(files.open_file, frappe.guest_methods)
+
+
+# --- B22: old /files links follow the database row --------------------------------------------
+
+
+class TestOldLinks(FilesTestCase):
+	USER = "m365-old-links@example.com"
+
+	def setUp(self):
+		super().setUp()
+		if not frappe.db.exists("User", self.USER):
+			frappe.get_doc(
+				{"doctype": "User", "email": self.USER, "first_name": "Reader", "send_welcome_email": 0}
+			).insert(ignore_permissions=True).add_roles("Desk User")
+		self.mine = frappe.get_doc({"doctype": "ToDo", "description": "the reader's"}).insert()
+		frappe.db.set_value("ToDo", self.mine.name, "owner", self.USER)
+
+	def follow(self, path, user="Administrator"):
+		"""Where redirect_moved_file sends GET path, as user; None when it lets Frappe answer."""
+		from werkzeug.routing import RequestRedirect
+
+		frappe.local.request = SimpleNamespace(method="GET", path=path)
+		frappe.set_user(user)
+		try:
+			files.redirect_moved_file()
+		except RequestRedirect as redirect:
+			return redirect.new_url.split("file=", 1)[1]
+		finally:
+			frappe.set_user("Administrator")
+			frappe.local.request = None
+		return None
+
+	def test_an_old_link_redirects_with_keep_local_on(self):
+		configure(self, files_keep_local_copy=1)
+		f = self.attach()
+		old = f.file_url
+		files.upload_file(f.name)
+		self.addCleanup(lambda p=files.local_path(old): os.path.exists(p) and os.remove(p))
+		self.assertTrue(os.path.exists(files.local_path(old)))  # the kept copy
+		self.assertEqual(self.follow(old), f.name)
+
+	def test_a_shared_blob_redirects_to_the_row_the_user_may_read(self):
+		content = f"shared {frappe.generate_hash()}".encode()
+		for first, second in ((self.todo, self.mine), (self.mine, self.todo)):
+			a = self.attach(content=content, attached_to_name=first.name)
+			b = self.attach(content=content, attached_to_name=second.name)
+			self.assertEqual(a.file_url, b.file_url)
+			old = a.file_url
+			files.upload_file(a.name)
+			files.upload_file(b.name)
+			readers = a if first is self.mine else b
+			self.assertEqual(self.follow(old, self.USER), readers.name)
+			frappe.db.delete("File", {"name": ["in", [a.name, b.name]]})
+			content = f"shared {frappe.generate_hash()}".encode()
+
+	def test_a_file_still_served_from_disk_is_left_to_frappe(self):
+		content = f"shared {frappe.generate_hash()}".encode()
+		a = self.attach(content=content, attached_to_name=self.mine.name)
+		b = self.attach(content=content, attached_to_doctype="Note", attached_to_name="unmapped")
+		frappe.db.set_value("File", b.name, "owner", self.USER)
+		files.upload_file(a.name)
+		self.assertTrue(os.path.exists(files.local_path(b.file_url)))  # b still uses the bytes
+		self.assertIsNone(self.follow(b.file_url, self.USER))

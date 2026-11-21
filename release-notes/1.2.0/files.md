@@ -6,6 +6,7 @@
 ### Fixed
 
 - Public attachments moved to SharePoint open for visitors who are not signed in again, as they did from `/files` before the move: images on web pages, links in customer emails. Private ones still need a signed-in user who may read them. This also fixes public files that were moved before 1.2.0. (#37)
+- Old `/files` and `/private/files` links of a moved file redirect to it with Keep Local Copy on too (they used to answer Forbidden), and when several moved Files share one disk name the link goes to the one the user may read. (#39)
 
 ### Upgrade notes
 
