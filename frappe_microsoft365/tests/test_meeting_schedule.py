@@ -224,6 +224,52 @@ class TestTemporaryErrorsKeepTheSchedule(ScheduleTestCase):
 		self.assertNotIn("$filter", str(ctx.exception))
 
 
+class TestTheReopeningPatch(ScheduleTestCase):
+	def _stopped(self, ended_days_ago):
+		event = self._meeting(
+			ended_minutes_ago=ended_days_ago * 24 * 60, custom_microsoft_online_meeting_id=None
+		)
+		event.db_set("custom_microsoft_artifacts_attempts", SPENT, update_modified=False)
+		return event
+
+	def _patch(self):
+		from frappe_microsoft365.patches import reopen_artifact_fetches_stopped_by_an_error as patch_
+
+		patch_.execute()
+
+	def test_recent_meetings_are_reopened_and_older_ones_explained(self):
+		recent, old = self._stopped(2), self._stopped(20)
+
+		self._patch()
+		self._patch()  # twice: it must be idempotent
+
+		recent_state, old_state = self._fields(recent), self._fields(old)
+		self.assertEqual(recent_state.attempts, 0)
+		self.assertIn("checked again", recent_state.status)
+		self.assertEqual(old_state.attempts, SPENT)
+		self.assertIn("Get Transcript & Recording", old_state.status)
+		self.assertIn(recent.name, artifacts._due_events([CALENDAR]))
+		self.assertNotIn(old.name, artifacts._due_events([CALENDAR]))
+
+	def test_a_reopened_meeting_gets_its_transcript(self):
+		recent = self._stopped(2)
+		self._patch()
+
+		starts_on = get_datetime(recent.starts_on)
+		with fake_graph(Graph(transcripts=[("t1", utc(add_to_date(starts_on, minutes=5)))])):
+			artifacts.fetch_pending()
+
+		self.assertEqual(len(self._files(recent)), 1)
+
+	def test_a_meeting_that_was_really_checked_is_left_alone(self):
+		event = self._stopped(2)
+		event.db_set("custom_microsoft_artifacts_checked_on", now_datetime(), update_modified=False)
+
+		self._patch()
+
+		self.assertEqual(self._fields(event).attempts, SPENT)
+
+
 class TestOccurrences(ScheduleTestCase):
 	"""B16: each occurrence of a recurring meeting gets only its own transcripts and recordings."""
 
