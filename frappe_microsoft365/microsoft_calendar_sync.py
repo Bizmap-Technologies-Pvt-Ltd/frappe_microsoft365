@@ -60,7 +60,7 @@ from frappe.utils import (
 
 from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired
+from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired, MsGraphThrottled
 
 EVENT_SELECT = (
 	"id,subject,bodyPreview,start,end,location,isAllDay,isCancelled,"
@@ -460,6 +460,8 @@ def _sync_locked(doc):
 		except Exception as e:
 			messages.append(f"Push failed: {e}")
 			frappe.log_error(title=f"MS Calendar push failed: {calendar_name}")
+		if doc.flags.push_warning:
+			messages.append(doc.flags.push_warning)
 
 	# The watermark only moves when the pull actually completed. Advancing it after a
 	# failure would silently skip every change made inside the failed window.
@@ -1024,17 +1026,22 @@ def _push(doc):
 		filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
 		pluck="name",
 	)
+	throttled = None
 	for name in new_events:
 		try:
 			event = frappe.get_doc("Event", name)
 			created = _create_graph_event(doc.name, event)
 			if _store_graph_response(name, created, doc.name):
 				count += 1
+		except MsGraphThrottled as e:
+			# Microsoft asked this mailbox to wait; every further call this run would be refused.
+			throttled = e
+			break
 		except Exception:
 			frappe.log_error(title=f"MS event push failed: {name}")
 
 	# Edits made while the connection was down never reached doc_events; catch them up.
-	if doc.last_sync:
+	if doc.last_sync and not throttled:
 		edited = frappe.get_all(
 			"Event",
 			filters={
@@ -1056,8 +1063,14 @@ def _push(doc):
 				)
 				_store_graph_response(name, patched or {}, doc.name)
 				count += 1
+			except MsGraphThrottled as e:
+				throttled = e
+				break
 			except Exception:
 				frappe.log_error(title=f"MS event patch failed: {name}")
+
+	if throttled:
+		doc.flags.push_warning = str(throttled)
 
 	# The ids of events already created in Graph must survive a later failure in this job;
 	# losing them would create duplicates in Outlook on the next run.

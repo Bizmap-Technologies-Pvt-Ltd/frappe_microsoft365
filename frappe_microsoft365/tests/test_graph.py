@@ -85,6 +85,9 @@ class TestGraphPaging(BaseTestCase):
 class TestGraphRequestBehaviour(BaseTestCase):
 	def setUp(self):
 		super().setUp()
+		# A throttled answer pauses the connection for the rest of the request; start clean.
+		graph.clear_token_cache()
+		self.addCleanup(graph.clear_token_cache)
 		self.token_patcher = patch.object(graph, "get_valid_access_token", return_value="token")
 		self.token_patcher.start()
 		self.addCleanup(self.token_patcher.stop)
@@ -187,15 +190,26 @@ class TestTokenCache(BaseTestCase):
 		graph.clear_token_cache()
 		self.addCleanup(graph.clear_token_cache)
 
-	def _calendar_doc(self):
-		doc = MagicMock()
-		doc.token_expiry = add_to_date(now_datetime(), hours=1)
-		return doc
+	def _calendar_row(self):
+		"""A get_value stand-in that answers for the calendar row only.
+
+		Everything else (the doctype's meta, read through the same function) is passed through,
+		so the test does not depend on what happens to be cached already.
+		"""
+		row = frappe._dict(authorized=1, token_expiry=add_to_date(now_datetime(), hours=1), authorization_error="")
+		real = frappe.db.get_value
+
+		def get_value(doctype, *args, **kwargs):
+			if doctype == "Microsoft Calendar":
+				return row
+			return real(doctype, *args, **kwargs)
+
+		return get_value
 
 	def test_a_second_lookup_for_the_same_calendar_does_not_read_the_token_again(self):
 		"""Resolving a token is two queries plus an AES decrypt; a 50-page delta paid it per page."""
 		with patch.object(
-			graph.frappe, "get_doc", return_value=self._calendar_doc()
+			graph.frappe.db, "get_value", side_effect=self._calendar_row()
 		) as loaded, patch.object(graph, "get_decrypted_password", return_value="tok") as decrypted:
 			first = graph.get_valid_access_token("cal")
 			second = graph.get_valid_access_token("cal")
@@ -206,7 +220,7 @@ class TestTokenCache(BaseTestCase):
 
 	def test_each_calendar_is_cached_under_its_own_name(self):
 		"""One shared entry would hand one person's connection the token of another's."""
-		with patch.object(graph.frappe, "get_doc", return_value=self._calendar_doc()), patch.object(
+		with patch.object(graph.frappe.db, "get_value", side_effect=self._calendar_row()), patch.object(
 			graph, "get_decrypted_password", side_effect=["tok-a", "tok-b"]
 		):
 			self.assertEqual(graph.get_valid_access_token("cal-a"), "tok-a")
@@ -219,7 +233,7 @@ class TestTokenCache(BaseTestCase):
 
 		frappe.local.microsoft365_token_cache = None  # what the next request starts from
 
-		with patch.object(graph.frappe, "get_doc", return_value=self._calendar_doc()), patch.object(
+		with patch.object(graph.frappe.db, "get_value", side_effect=self._calendar_row()), patch.object(
 			graph, "get_decrypted_password", return_value="fresh"
 		):
 			self.assertEqual(graph.get_valid_access_token("cal"), "fresh")
@@ -228,7 +242,7 @@ class TestTokenCache(BaseTestCase):
 		"""Serving one with seconds left hands Graph a token that dies in the middle of the call."""
 		graph._cache_token("cal", "stale", add_to_date(now_datetime(), seconds=5))
 
-		with patch.object(graph.frappe, "get_doc", return_value=self._calendar_doc()), patch.object(
+		with patch.object(graph.frappe.db, "get_value", side_effect=self._calendar_row()), patch.object(
 			graph, "get_decrypted_password", return_value="fresh"
 		):
 			self.assertEqual(graph.get_valid_access_token("cal"), "fresh")
@@ -237,10 +251,12 @@ class TestTokenCache(BaseTestCase):
 		"""A refresh that left the old token cached would send the dead one on the very next call."""
 		graph._cache_token("cal", "old", add_to_date(now_datetime(), hours=1))
 
-		with patch.object(graph.frappe, "get_doc", return_value=MagicMock()):
+		with patch.object(graph, "set_encrypted_password"), patch.object(
+			frappe.db, "get_value", return_value="someone@example.com"
+		), patch.object(frappe.db, "set_value"), patch.object(frappe.db, "commit"):
 			graph._store_tokens("cal", {"access_token": "new", "expires_in": 3600})
 
-		# Served from the cache — an unpatched get_doc here would be the tell if it were not.
+		# Served from the cache — an unpatched get_value here would be the tell if it were not.
 		self.assertEqual(graph.get_valid_access_token("cal"), "new")
 
 	def test_a_401_invalidates_the_cached_token_so_the_retry_sends_a_fresh_one(self):
@@ -248,10 +264,10 @@ class TestTokenCache(BaseTestCase):
 		graph._cache_token("cal", "dead", add_to_date(now_datetime(), hours=1))
 		responses = [_response(401), _response(200, {"ok": True})]
 		with patch.object(graph, "_http_request", side_effect=responses) as mocked, patch.object(
-			graph.frappe, "get_doc", return_value=self._calendar_doc()
+			graph.frappe.db, "get_value", side_effect=self._calendar_row()
 		), patch.object(graph, "get_decrypted_password", return_value="fresh"), patch.object(
 			frappe.db, "set_value"
-		):
+		), patch.object(frappe.db, "commit"):
 			result = graph.graph_request("GET", "/me", "cal")
 
 		self.assertEqual(result, {"ok": True})
@@ -262,6 +278,9 @@ class TestTokenCache(BaseTestCase):
 class TestStreamedRequests(BaseTestCase):
 	def setUp(self):
 		super().setUp()
+		# A throttled answer pauses the connection for the rest of the request; start clean.
+		graph.clear_token_cache()
+		self.addCleanup(graph.clear_token_cache)
 		self.token_patcher = patch.object(graph, "get_valid_access_token", return_value="token")
 		self.token_patcher.start()
 		self.addCleanup(self.token_patcher.stop)

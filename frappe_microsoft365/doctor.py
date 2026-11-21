@@ -272,6 +272,74 @@ def check_authorized_scopes(requested, authorized, connections):
 	]
 
 
+def check_connection_scopes(requested, connections):
+	"""Per connection: does its token carry what sign-in asks for now, and is it still accepted?
+
+	``requested`` is what sign-in asks for now. ``connections`` is a list of dicts with
+	``name``, ``authorized``, ``authorized_scopes`` (what that connection asked for when it last
+	signed in) and ``authorization_error``. Pure, so it is testable without a site.
+
+	One finding per connection, because the fix is per connection: whoever owns it has to open
+	it and sign in again. A connection that never recorded its scopes is left out rather than
+	guessed at. A connection Microsoft has stopped accepting is reported whatever its scopes.
+	"""
+	requested = _norm_scopes(requested)
+	out = []
+	for conn in connections or []:
+		name = conn.get("name")
+		if not conn.get("authorized"):
+			if conn.get("authorization_error"):
+				out.append(
+					finding(
+						"calendar.authorization_lost",
+						WARN,
+						_("{0} has to be authorised again").format(name),
+						_("Microsoft stopped accepting its sign-in: {0}").format(conn.get("authorization_error")),
+						_(
+							"Its user (or a System Manager) opens the connection and clicks Authorize "
+							"Microsoft Access. Sync, Teams meetings and transcripts for it are paused "
+							"until then."
+						),
+						target=name,
+					)
+				)
+			continue
+		granted = _norm_scopes((conn.get("authorized_scopes") or "").replace(",", " ").split())
+		if not granted:
+			continue
+		missing = [s for s in requested if s not in granted]
+		if not missing:
+			continue
+		out.append(
+			finding(
+				"scopes.connection_missing",
+				WARN,
+				_("{0} was authorised without {1}").format(name, ", ".join(missing)),
+				_("It last signed in asking for {0}; sign-in now asks for {1} as well.").format(
+					", ".join(granted), ", ".join(missing)
+				),
+				_(
+					"Open this Microsoft Calendar and click Re-authorize. A token keeps the "
+					"permissions it was issued with, so the new capability fails with a 403 for "
+					"this connection until it signs in again."
+				),
+				target=name,
+			)
+		)
+	return out
+
+
+def _connection_scope_rows():
+	"""What check_connection_scopes needs, read from the site. None before the migration."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	if not meta.has_field("authorized_scopes"):
+		return None
+	fields = ["name", "authorized", "authorized_scopes"]
+	if meta.has_field("authorization_error"):
+		fields.append("authorization_error")
+	return frappe.get_all("Microsoft Calendar", filters={"enabled": 1}, fields=fields, limit_page_length=0)
+
+
 #: Azure identifiers are GUIDs. A secret VALUE never is, which is what makes the mix-up
 #: detectable: the Secret ID sitting next to it in the same table is.
 GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -1713,13 +1781,20 @@ def run_diagnostics():
 
 	if any(settings.get(field) for field, _scope in graph.CAPABILITY_SCOPES):
 		findings += check_scopes(settings)
-		findings += check_authorized_scopes(
-			graph.get_scopes(settings),
-			graph.parse_scopes(settings.get("authorized_scopes")),
-			# Only authorised connections hold a token; an unauthorised one picks up the new
-			# scopes the first time it signs in, so it is not a problem to report.
-			frappe.db.count("Microsoft Calendar", {"authorized": 1}),
-		)
+		connections = _connection_scope_rows()
+		if connections is None:
+			# Not migrated yet: only the site-wide record of the last sign-in exists.
+			findings += check_authorized_scopes(
+				graph.get_scopes(settings),
+				graph.parse_scopes(settings.get("authorized_scopes")),
+				# Only authorised connections hold a token; an unauthorised one picks up the new
+				# scopes the first time it signs in, so it is not a problem to report.
+				frappe.db.count("Microsoft Calendar", {"authorized": 1}),
+			)
+		else:
+			# Each connection against its own sign-in: the site-wide value only says what the
+			# last person to authorise asked for, and vouched for everybody else's token.
+			findings += check_connection_scopes(graph.get_scopes(settings), connections)
 		# The half of the setup that lives in Microsoft's portals. Reported here because this is
 		# the button people press when something is wrong, and the fault that cost a real tenant
 		# an hour — a tenant switch shipped off — is on this list and invisible to every check

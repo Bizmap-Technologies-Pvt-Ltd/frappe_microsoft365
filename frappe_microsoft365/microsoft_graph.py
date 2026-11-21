@@ -7,7 +7,10 @@ authenticated Graph v1.0 calls. Secrets/tokens are never logged or returned to c
 See docs/graph-api-reference.md for the verified endpoint/permission contract.
 """
 
+import math
 import time
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from http import cookiejar
 from urllib.parse import urlsplit
 
@@ -15,7 +18,7 @@ import frappe
 import requests
 from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
-from frappe.utils.password import get_decrypted_password
+from frappe.utils.password import get_decrypted_password, set_encrypted_password
 from requests.adapters import HTTPAdapter
 from requests.utils import requote_uri
 
@@ -61,10 +64,42 @@ CALLBACK_METHOD = (
 	"frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback"
 )
 
-#: Graph asks us to back off with a Retry-After header. Wait inline only for short waits;
-#: anything longer is left to the next scheduled run.
+#: Graph asks us to back off with a Retry-After header. How long a call may wait inline depends
+#: on who is waiting: a person behind a web request gets a short wait, a background job (the
+#: scheduled sync) can afford to sit out what Microsoft asks for. Anything longer than the cap
+#: is left to the next run, and the connection is left alone until then (MsGraphThrottled).
 MAX_RETRY_AFTER_SECONDS = 10
+MAX_BACKGROUND_RETRY_AFTER_SECONDS = 60
+#: The first wait when Microsoft sends no Retry-After; doubled on every further attempt.
 DEFAULT_RETRY_AFTER_SECONDS = 2
+
+#: How many times one call is retried after a throttling or availability answer. Three, as in
+#: Microsoft's own Graph SDK retry handler.
+MAX_THROTTLE_RETRIES = 3
+
+#: 429 Too Many Requests and 503 Service Unavailable are both how Graph throttles: the request
+#: was not processed, Retry-After says when to come back, and a connection that is still refused
+#: after the retries is left alone for the rest of the run.
+THROTTLE_STATUSES = (429, 503)
+
+#: 504 Gateway Timeout is retried too, but only for a method that is safe to repeat: a POST that
+#: timed out at the gateway may still have created its meeting, and sending it again would invite
+#: everybody twice.
+GATEWAY_TIMEOUT_STATUS = 504
+IDEMPOTENT_METHODS = ("GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+#: How long a connection is left alone when Microsoft kept refusing it without saying for how
+#: long.
+DEFAULT_THROTTLE_PAUSE_SECONDS = 60
+
+#: OAuth errors on a refresh that mean the grant itself is gone (password reset, account
+#: disabled, consent revoked, a sign-in policy that now needs the person present). Retrying can
+#: never succeed; only signing in again can. Nothing else marks a connection dead: a timeout or a
+#: 5xx from the login service says nothing about the grant.
+DEAD_GRANT_ERRORS = ("invalid_grant", "interaction_required")
+
+#: How long a worker waits for another worker's refresh of the same connection to finish.
+TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS = 30
 
 #: Safety valve for link-following loops (nextLink / deltaLink paging). For a delta it is a
 #: per-run budget, not a limit: the calendar sync stores where it stopped and carries on.
@@ -96,6 +131,31 @@ class MsGraphNotFound(MsGraphError):
 
 class MsGraphConflict(MsGraphError):
 	"""Graph answered 409 — typically "an item with that name already exists"."""
+
+
+class MsGraphThrottled(MsGraphError):
+	"""Microsoft asked this connection to slow down for longer than this run will wait.
+
+	Raised for the refused call and, without touching the network, for every further call made
+	for the same connection until Microsoft's wait is over. A loop working through one
+	connection's items should stop on this rather than log the same refusal once per item.
+	"""
+
+	def __init__(self, message=None, retry_after=None):
+		super().__init__(message)
+		self.retry_after = retry_after
+
+
+class MsGraphAuthorizationLost(MsGraphError):
+	"""The refresh token is no longer accepted (invalid_grant / interaction_required).
+
+	The connection has been marked as not authorised and its user told; only signing in again
+	brings it back.
+	"""
+
+	def __init__(self, message=None, reason=None):
+		super().__init__(message)
+		self.reason = reason or message
 
 
 class _App:
@@ -275,6 +335,10 @@ def exchange_code(code):
 	)
 	_raise_on_token_error(result)
 	_record_authorized_scopes(scopes)
+	# What was asked for travels with the tokens, so the callback can record it on the one
+	# connection that just signed in (see _record_authorized_scopes for why the request is what
+	# is kept).
+	result["requested_scopes"] = list(scopes)
 	return result
 
 
@@ -292,6 +356,10 @@ def _record_authorized_scopes(scopes):
 
 	Written straight to the Singles row so the OAuth callback — which runs as whoever signed
 	in, not necessarily a System Manager — is never blocked by permissions on Settings.
+
+	This site-wide value is only what the LAST sign-in asked for. Each Microsoft Calendar also
+	keeps its own copy (``authorized_scopes``, written by the callback), and that is what the
+	doctor compares: one person re-authorising must not vouch for everybody else's token.
 	"""
 	frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", " ".join(scopes))
 
@@ -307,7 +375,10 @@ def _raise_on_token_error(result):
 	if not result or "access_token" not in result:
 		err = (result or {}).get("error_description") or (result or {}).get("error") or "unknown error"
 		# never include tokens; error_description from MS is safe (no secrets)
-		frappe.throw(f"Microsoft sign-in failed: {err}", MsGraphError)
+		message = f"Microsoft sign-in failed: {err}"
+		if (result or {}).get("error") in DEAD_GRANT_ERRORS:
+			frappe.throw(message, MsGraphAuthorizationLost)
+		frappe.throw(message, MsGraphError)
 
 
 # --- per-calendar token management ---------------------------------------------------
@@ -336,25 +407,107 @@ def clear_token_cache(calendar_name=None):
 	The 401 path depends on it: back-dating token_expiry only forces a refresh if the cached
 	copy goes with it, otherwise the retry re-sends the token Graph has just refused and 401s
 	again, for as many times as it is allowed to.
+
+	Called with no name it forgets everything this request remembers about connections, which
+	includes the throttling pauses (see _throttled_until): it is how a fresh run starts clean.
 	"""
 	if calendar_name is None:
 		_token_cache().clear()
+		_throttled_until().clear()
 	else:
 		_token_cache().pop(calendar_name, None)
 
 
-def _store_tokens(calendar_name, result):
+# --- throttling ------------------------------------------------------------------------
+
+def _throttled_until():
+	"""The request-local ``{connection: monotonic deadline}`` of connections Microsoft paused.
+
+	Request-local like the token cache, and for the same reason: one worker serves every site,
+	and a calendar name on site A says nothing about the same name on site B. A scheduled sync
+	runs as its own job, so "the rest of the run" is exactly the life of this dict.
+	"""
+	paused = getattr(frappe.local, "microsoft365_throttled_until", None)
+	if paused is None:
+		paused = {}
+		frappe.local.microsoft365_throttled_until = paused
+	return paused
+
+
+def _throttle_key(name):
+	return "app" if name is APP else name
+
+
+def _pause(name, seconds):
+	"""Leave this connection alone for ``seconds``, as Microsoft asked."""
+	_throttled_until()[_throttle_key(name)] = time.monotonic() + max(seconds, 1)
+
+
+def _raise_if_paused(name):
+	"""Refuse a call to a connection Microsoft has asked to wait, without calling Microsoft."""
+	deadline = _throttled_until().get(_throttle_key(name))
+	if deadline is None:
+		return
+	remaining = deadline - time.monotonic()
+	if remaining <= 0:
+		_throttled_until().pop(_throttle_key(name), None)
+		return
+	frappe.throw(
+		_(
+			"Microsoft is throttling this connection and asked us to wait {0} more seconds. "
+			"The next scheduled sync carries on."
+		).format(math.ceil(remaining)),
+		MsGraphThrottled,
+	)
+
+
+def is_throttled(auth):
+	"""True while Microsoft's requested pause for this connection (doc, name or APP) lasts."""
+	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
+	deadline = _throttled_until().get(_throttle_key(name))
+	return bool(deadline and deadline > time.monotonic())
+
+
+def _max_inline_wait():
+	"""How long one call may sleep for Microsoft: short with a person waiting, longer in a job."""
+	if getattr(frappe.local, "request", None):
+		return MAX_RETRY_AFTER_SECONDS
+	return MAX_BACKGROUND_RETRY_AFTER_SECONDS
+
+
+def _store_tokens(calendar_name, result, commit=True):
+	"""Write freshly minted tokens onto the connection, without loading or saving the document.
+
+	A ``doc.save()`` here is what put ``TimestampMismatchError`` in production's Error Log: the
+	sync holds the calendar for a whole run, a refresh in another worker (an Event's patch job)
+	saved the row under it, and the next save from either side found ``modified`` moved. Tokens
+	are not an edit anybody made, so they are written column by column, ``modified`` is left
+	alone (a person with the form open can still save it), and the write is committed straight
+	away: the refresh token Microsoft just rotated has to outlive whatever the caller does next,
+	and the other worker waiting on the refresh lock has to be able to read it.
+
+	``commit=False`` is for the OAuth callback, which commits the tokens together with the rest
+	of what a sign-in changes.
+	"""
 	expiry = add_to_date(now_datetime(), seconds=(result.get("expires_in") or 3600) - 300)
-	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
-	doc.access_token = result.get("access_token")
-	if result.get("refresh_token"):
-		doc.refresh_token = result["refresh_token"]
-	doc.token_expiry = expiry
+	updates = {"token_expiry": expiry}
+	# Password fields: the secret goes to __Auth and the column gets the mask a save would give
+	# it. Leaving the column empty would be read by the next form save as "cleared" and delete
+	# the stored token.
+	for fieldname in ("access_token", "refresh_token"):
+		value = result.get(fieldname)
+		if value:
+			set_encrypted_password("Microsoft Calendar", calendar_name, value, fieldname)
+			updates[fieldname] = "*" * len(value)
 	claims = result.get("id_token_claims") or {}
-	if claims.get("preferred_username") and not doc.microsoft_user_email:
-		doc.microsoft_user_email = claims.get("preferred_username")
-	doc.flags.ignore_permissions = True
-	doc.save()
+	if claims.get("preferred_username") and not frappe.db.get_value(
+		"Microsoft Calendar", calendar_name, "microsoft_user_email"
+	):
+		updates["microsoft_user_email"] = claims.get("preferred_username")
+	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
+	frappe.clear_document_cache("Microsoft Calendar", calendar_name)
+	if commit:
+		frappe.db.commit()  # nosemgrep
 
 	# Whatever the rest of the request does next has to use the token that was just minted; the
 	# cache still holds the one this refresh replaced.
@@ -363,7 +516,36 @@ def _store_tokens(calendar_name, result):
 		_cache_token(calendar_name, token, expiry)
 	else:
 		clear_token_cache(calendar_name)
-	return doc
+	return expiry
+
+
+def _stored_token(name):
+	"""``(access_token, expiry, row)`` as stored now. Raises when the connection cannot be used."""
+	row = frappe.db.get_value(
+		"Microsoft Calendar", name, ["authorized", "token_expiry", *_optional_fields("authorization_error")],
+		as_dict=True,
+	)
+	if not row:
+		frappe.throw(_("Microsoft Calendar {0} does not exist.").format(name), MsGraphError)
+	if not row.authorized:
+		# A connection that is not authorised is never called, whatever is left in storage: that
+		# is what stops a dead grant being retried every fifteen minutes, and what makes
+		# Disconnect final.
+		if row.get("authorization_error"):
+			frappe.throw(
+				_("Microsoft Calendar '{0}' must be authorised again: {1}").format(name, row.authorization_error),
+				MsGraphError,
+			)
+		frappe.throw(_("Microsoft Calendar '{0}' is not authorized. Click Authorize.").format(name), MsGraphError)
+	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
+	expiry = get_datetime(row.token_expiry) if row.token_expiry else None
+	return token, expiry, row
+
+
+def _optional_fields(*fieldnames):
+	"""The fields that exist on this site: the code can run before the migration adds them."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	return [f for f in fieldnames if meta.has_field(f)]
 
 
 def get_valid_access_token(calendar):
@@ -381,19 +563,125 @@ def get_valid_access_token(calendar):
 		if cached_expiry > add_to_date(now_datetime(), seconds=TOKEN_CACHE_LEEWAY_SECONDS):
 			return cached_token
 
-	doc = frappe.get_doc("Microsoft Calendar", name)
-	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
-	expiry = get_datetime(doc.token_expiry) if doc.token_expiry else None
+	token, expiry, _row = _stored_token(name)
 	if token and expiry and expiry > now_datetime():
 		_cache_token(name, token, expiry)
 		return token
-	# refresh
-	refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
-	if not refresh:
-		frappe.throw(f"Microsoft Calendar '{name}' is not authorized. Click Authorize.", MsGraphError)
-	result = refresh_tokens(refresh)
-	_store_tokens(name, result)
-	return result.get("access_token")
+	return _refresh_access_token(name)
+
+
+def _refresh_access_token(name):
+	"""Refresh one connection's tokens, once, however many workers want it at the same moment.
+
+	Two workers finding the same expired token used to both refresh it and both save the row:
+	the second save failed with TimestampMismatchError, and with refresh-token rotation the
+	first one's new refresh token could be overwritten by a staler answer. Now the refresh runs
+	under a per-connection lock, and the token is read again once the lock is held: when another
+	worker has refreshed meanwhile, its token is used and Microsoft is not asked twice.
+	"""
+	with _refresh_lock(name):
+		# The re-read has to see what the other worker committed. Inside a transaction that
+		# began before that commit, REPEATABLE READ keeps answering from the old snapshot, so the
+		# snapshot is ended first. A refresh is already a commit point (_store_tokens commits),
+		# so this moves it a few statements earlier rather than adding a new one.
+		frappe.db.commit()  # nosemgrep
+		token, expiry, _row = _stored_token(name)
+		if token and expiry and expiry > now_datetime():
+			_cache_token(name, token, expiry)
+			return token
+
+		refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
+		if not refresh:
+			frappe.throw(_("Microsoft Calendar '{0}' is not authorized. Click Authorize.").format(name), MsGraphError)
+		try:
+			result = refresh_tokens(refresh)
+		except MsGraphAuthorizationLost as e:
+			mark_authorization_lost(name, str(e))
+			raise
+		_store_tokens(name, result)
+		return result.get("access_token")
+
+
+@contextmanager
+def _refresh_lock(name):
+	"""A per-connection lock in Redis, shared by every worker of this site on every server.
+
+	Redis rather than a row lock: a SELECT ... FOR UPDATE would be held until the caller's
+	transaction ends, which for a sync is the whole run — the very wait this is meant to end. If
+	the lock cannot be had (Redis down, or another refresh hung past the timeout) the refresh
+	goes ahead without it: two refreshes are wasteful, no refresh at all is an outage.
+	"""
+	lock = None
+	try:
+		cache = frappe.cache()
+		lock = cache.lock(
+			cache.make_key(f"microsoft365:token-refresh:{name}"),
+			timeout=TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS * 2,
+			blocking_timeout=TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS,
+		)
+		if not lock.acquire():
+			lock = None
+	except Exception:
+		lock = None
+	try:
+		yield
+	finally:
+		if lock is not None:
+			try:
+				lock.release()
+			except Exception:
+				# Expired under us (a refresh slower than the lock timeout); nothing to release.
+				pass
+
+
+def mark_authorization_lost(calendar_name, reason):
+	"""Mark a connection whose grant Microsoft no longer accepts, keep why, and tell its user.
+
+	Only reached on invalid_grant / interaction_required (DEAD_GRANT_ERRORS) — never on a
+	timeout or a server error, so a live connection is not switched off by a bad minute at
+	Microsoft. Once ``authorized`` is 0 the scheduler stops queueing the calendar, Event saves
+	stop pushing to it and no further refresh is attempted, so the person is told once.
+
+	The tokens are left where they are: nothing will use them, and the next sign-in replaces
+	them.
+	"""
+	reason = (reason or "").strip() or _("Microsoft no longer accepts this connection's sign-in.")
+	updates = {"authorized": 0}
+	if _optional_fields("authorization_error"):
+		updates["authorization_error"] = reason[:1000]
+	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
+	frappe.clear_document_cache("Microsoft Calendar", calendar_name)
+	clear_token_cache(calendar_name)
+	_notify_authorization_lost(calendar_name, reason)
+	# Committed on its own: whatever called Graph is about to fail, and a rollback of its work
+	# must not take the mark (and the notification) with it, or the next run finds the connection
+	# still "authorised", refreshes again and notifies again.
+	frappe.db.commit()  # nosemgrep
+
+
+def _notify_authorization_lost(calendar_name, reason):
+	"""One Notification Log to the connection's user. Best effort: the mark matters more."""
+	user = frappe.db.get_value("Microsoft Calendar", calendar_name, "user")
+	if not user or not frappe.db.get_value("User", user, "enabled"):
+		return
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "Notification Log",
+				"for_user": user,
+				"type": "Alert",
+				"document_type": "Microsoft Calendar",
+				"document_name": calendar_name,
+				"subject": _("Your Microsoft 365 connection {0} needs you to sign in again").format(calendar_name),
+				"email_content": _(
+					"Microsoft no longer accepts this connection's sign-in, so calendar sync, Teams "
+					"meetings and transcripts have stopped for it. Microsoft said: {0}. Open the "
+					"connection and click Authorize Microsoft Access to sign in again."
+				).format(frappe.utils.escape_html(reason)),
+			}
+		).insert(ignore_permissions=True)
+	except Exception:
+		frappe.log_error(title=f"MS Calendar re-authorisation notice failed: {calendar_name}")
 
 
 # --- application (client credentials) tokens -------------------------------------------
@@ -511,7 +799,7 @@ def _graph_session():
 	graph.microsoft.com that is ~44 ms per call versus ~11 ms on a socket that is already open —
 	three quarters of the transport time — and a 50-page delta run pays it once per page.
 
-	No urllib3 Retry is mounted, deliberately: graph_request owns the 401/429 policy including
+	No urllib3 Retry is mounted, deliberately: graph_request owns the 401 and throttling policy including
 	Retry-After, and an adapter retrying underneath it would multiply every attempt invisibly.
 	"""
 	global _session
@@ -606,7 +894,7 @@ def _release(resp):
 
 def graph_request(
 	method, path, auth, json=None, params=None, headers=None, raw=False, stream=False,
-	data=None, timeout=30, _retried=False,
+	data=None, timeout=30, _retried=False, _attempt=0,
 ):
 	"""Authenticated Graph v1.0 call. Refreshes the token once on 401 and retries.
 
@@ -621,10 +909,17 @@ def graph_request(
 	runs to gigabytes, and buffering one to hand back a .content is how a worker gets killed.
 
 	`data` sends a raw body (bytes or a file-like object) instead of JSON — a file upload.
+
+	Throttling (429, 503) is retried up to MAX_THROTTLE_RETRIES times, waiting what Retry-After
+	asks (seconds or an HTTP date) or, without one, an exponential backoff. A wait longer than
+	this call may hold, or a refusal that outlasts the retries, raises MsGraphThrottled, and
+	every later call for the same connection in this run is refused without reaching Microsoft
+	until the wait is over. A 504 is retried the same way for methods that are safe to repeat.
 	"""
 	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
 	# Checked before the token is resolved: a refused URL should not even cost a refresh.
 	url = graph_url(path)
+	_raise_if_paused(name)
 	token = _token_for(name)
 	req_headers = {"Authorization": f"Bearer {token}"}
 	if headers:
@@ -635,34 +930,46 @@ def graph_request(
 	else:
 		kwargs["json"] = json
 	resp = _http_request(method, url, **kwargs)
+	# A body that was a stream has already been consumed, so that one can never be replayed.
+	replayable = not hasattr(data, "read")
 
-	if resp.status_code == 401 and not _retried and not hasattr(data, "read"):
+	if resp.status_code == 401 and not _retried and replayable:
 		# Force refresh then retry once. Dropping the cached token is half of the force: without
-		# it the retry would resolve to the very token Graph has just rejected. A body that was a
-		# stream has already been consumed, so that one cannot be replayed and falls through.
+		# it the retry would resolve to the very token Graph has just rejected.
 		_force_refresh(name)
 		_release(resp)
 		return graph_request(
 			method, path, name, json=json, params=params, headers=headers,
-			raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
+			raw=raw, stream=stream, data=data, timeout=timeout, _retried=True, _attempt=_attempt,
 		)
 
-	if resp.status_code == 429 and not _retried and not hasattr(data, "read"):
-		# Honour Retry-After for short waits; longer backoffs are left to the next run.
-		wait = _retry_after_seconds(resp)
-		if wait is not None:
+	retry_gateway = resp.status_code == GATEWAY_TIMEOUT_STATUS and method.upper() in IDEMPOTENT_METHODS
+	if resp.status_code in THROTTLE_STATUSES or retry_gateway:
+		wait = _retry_after_seconds(resp, _attempt)
+		if replayable and _attempt < MAX_THROTTLE_RETRIES and wait <= _max_inline_wait():
 			time.sleep(wait)
 			_release(resp)
 			return graph_request(
 				method, path, name, json=json, params=params, headers=headers,
-				raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
+				raw=raw, stream=stream, data=data, timeout=timeout, _retried=_retried,
+				_attempt=_attempt + 1,
 			)
 
-	if resp.status_code == 429:
+	if resp.status_code in THROTTLE_STATUSES:
+		wait = _retry_after_seconds(resp, _attempt, default=DEFAULT_THROTTLE_PAUSE_SECONDS)
 		_release(resp)
-		frappe.throw(
-			_("Microsoft Graph rate limit hit (429). The next scheduled sync will retry."), MsGraphError
-		)
+		_pause(name, wait)
+		try:
+			frappe.throw(
+				_(
+					"Microsoft Graph is throttling this connection ({0}) and asked us to wait {1} "
+					"seconds. The next scheduled sync carries on."
+				).format(resp.status_code, wait),
+				MsGraphThrottled,
+			)
+		except MsGraphThrottled as e:
+			e.retry_after = wait
+			raise
 
 	if resp.status_code == 410:
 		# Delta token expired/invalid — the caller has to restart with a full sync.
@@ -713,16 +1020,38 @@ def _safe_error(resp):
 		return resp.reason
 
 
-def _retry_after_seconds(resp):
-	"""Seconds to wait per the Retry-After header, or None when the wait is too long to hold."""
-	raw = (resp.headers or {}).get("Retry-After")
+def _retry_after_seconds(resp, attempt=0, default=None):
+	"""Seconds to wait before trying again, per Retry-After, as a whole number of at least 1.
+
+	Retry-After comes in two forms (RFC 9110): a number of seconds, or an HTTP date to wait
+	until. Without a usable header the wait is ``default`` when given, otherwise an exponential
+	backoff from DEFAULT_RETRY_AFTER_SECONDS that doubles with each attempt.
+	"""
+	raw = ((resp.headers or {}).get("Retry-After") or "").strip()
+	wait = _parse_retry_after(raw) if raw else None
+	if wait is None:
+		wait = default if default is not None else DEFAULT_RETRY_AFTER_SECONDS * (2 ** attempt)
+	return max(math.ceil(wait), 1)
+
+
+def _parse_retry_after(raw):
+	"""Seconds from a Retry-After value, or None when it is neither form."""
 	try:
-		wait = int(float(raw)) if raw else DEFAULT_RETRY_AFTER_SECONDS
+		return max(float(raw), 0)
 	except (TypeError, ValueError):
-		wait = DEFAULT_RETRY_AFTER_SECONDS
-	if wait > MAX_RETRY_AFTER_SECONDS:
+		pass
+	try:
+		when = parsedate_to_datetime(raw)
+	except (TypeError, ValueError, IndexError):
 		return None
-	return max(wait, 1)
+	if when is None:
+		return None
+	from datetime import datetime, timezone
+
+	if when.tzinfo is None:
+		# HTTP dates are always GMT; a date without a zone is read as one.
+		when = when.replace(tzinfo=timezone.utc)
+	return max((when - datetime.now(timezone.utc)).total_seconds(), 0)
 
 
 def graph_paged(path, auth, headers=None, max_pages=MAX_PAGES):

@@ -12,6 +12,15 @@ frappe.ui.form.on("Microsoft Calendar", {
 			frm.add_custom_button(__("Authorize Microsoft Access"), () => authorize(frm)).addClass(
 				"btn-primary"
 			);
+			if (frm.doc.authorization_error) {
+				// Set when Microsoft stopped accepting the sign-in; nothing syncs until it is redone.
+				frm.dashboard.set_headline_alert(
+					__("Microsoft no longer accepts this connection's sign-in: {0}", [
+						frappe.utils.escape_html(frm.doc.authorization_error),
+					]),
+					"red"
+				);
+			}
 		} else {
 			frm.dashboard.set_headline(
 				__("Connected as {0}", [frm.doc.microsoft_user_email || "Microsoft account"])
