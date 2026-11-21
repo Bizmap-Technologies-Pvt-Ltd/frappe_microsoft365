@@ -54,6 +54,11 @@ App → **Certificates & secrets** → **Client secrets** → **New client secre
 
 - Give it a description and an expiry (note the date — you'll need to rotate before it expires).
 - **Copy the secret Value immediately** (it is shown only once; the "Secret ID" is not the value).
+- **Rotating it later:** Set Up copies the secret into the mail Connected App and the sign-in
+  Social Login Key when it creates them, and never rewrites them on its own. After pasting a new
+  secret into Microsoft Settings, open **Set Up**: copies that still hold the old one are listed
+  under *Needs attention*, and **Sync Secret** copies the new one to them. The doctor reports the
+  same drift. Nothing ever shows a secret; they are compared on the server.
 
 ## 4. API permissions (Microsoft Graph, Delegated)
 

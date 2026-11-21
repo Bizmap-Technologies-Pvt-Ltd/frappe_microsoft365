@@ -853,6 +853,40 @@ def check_sign_in_callback(frappe_checks_state, runs_hook, callback_is_ours):
 	return out
 
 
+def check_secret_copies(copies):
+	"""Has the client secret in a copy drifted from Microsoft Settings? Pure.
+
+	``copies``: dicts of doctype, name, uses ("mail" or "sign-in") and same (bool), worked out by
+	``_secret_copies`` on the server. No secret is ever part of a finding.
+	"""
+	out = []
+	for copy in copies:
+		if copy.get("same"):
+			continue
+		out.append(
+			finding(
+				"secret.drift",
+				WARN,
+				_("The client secret in {0} '{1}' differs from Microsoft Settings").format(
+					_(copy["doctype"]), copy["name"]
+				),
+				_(
+					"{0} uses this copy, which Set Up made when it created the record. After a secret "
+					"is rotated in Azure the old one stops working, and Microsoft answers "
+					"AADSTS7000215 (invalid client secret)."
+				).format(copy.get("uses") or _("Microsoft 365")),
+				_(
+					"If Microsoft Settings holds the current secret, click Set Up on Microsoft Settings "
+					"and then Sync Secret, which copies it here. Otherwise paste the current secret "
+					"Value into Microsoft Settings first."
+				),
+				ENTRA_ERROR_DOC,
+				copy["name"],
+			)
+		)
+	return out
+
+
 #: Custom fields the sync reads and writes. Without them every query fails with a raw SQL
 #: error ("Unknown column ... in WHERE"), which tells an admin nothing.
 EVENT_CUSTOM_FIELDS = [
@@ -1712,6 +1746,61 @@ def _settings_config():
 	}
 
 
+def _decrypted(doctype, name, field="client_secret"):
+	try:
+		return get_decrypted_password(doctype, name, field, raise_exception=False) or ""
+	except Exception:
+		# A copy encrypted with another site's key cannot be compared; nothing to report.
+		return None
+
+
+def _secret_copies(settings=None):
+	"""Each copy of a Microsoft Settings secret, and whether it still matches. Server-side only.
+
+	A Connected App or Microsoft Social Login Key holds a copy when its client id is the one in
+	Microsoft Settings (or, for a Connected App, the application-access one). A record made for
+	another app registration has its own secret and is not compared. Returns only whether each
+	copy matches, never a secret.
+	"""
+	settings = settings or _settings_config()
+	pairs = []
+	client_id = (settings.get("client_id") or "").strip()
+	if client_id and settings.get("client_secret"):
+		pairs.append((client_id, settings.get("client_secret")))
+	app_client_id = (settings.get("app_client_id") or "").strip()
+	if app_client_id and app_client_id != client_id and settings.get("app_client_secret"):
+		pairs.append((app_client_id, settings.get("app_client_secret")))
+	if not pairs:
+		return []
+
+	copies = []
+	for record_client_id, secret in pairs:
+		for name in frappe.get_all("Connected App", filters={"client_id": record_client_id}, pluck="name"):
+			current = _decrypted("Connected App", name)
+			if current is not None:
+				copies.append(
+					{"doctype": "Connected App", "name": name, "uses": _("Mail"), "same": current == secret}
+				)
+		if record_client_id != client_id:
+			continue
+		for name in frappe.get_all(
+			"Social Login Key",
+			filters={"social_login_provider": "Office 365", "client_id": record_client_id},
+			pluck="name",
+		):
+			current = _decrypted("Social Login Key", name)
+			if current is not None:
+				copies.append(
+					{
+						"doctype": "Social Login Key",
+						"name": name,
+						"uses": _("Sign in with Microsoft"),
+						"same": current == secret,
+					}
+				)
+	return copies
+
+
 def _files_mappings():
 	if not frappe.db.table_exists("SharePoint Mapping"):
 		return []
@@ -1862,6 +1951,9 @@ def run_diagnostics():
 		findings += check_sign_in_tenant(key, settings)
 		if key.enable_social_login:
 			findings += _sign_in_callback_findings()
+
+	# A rotated secret updated in one place only: mail or sign-in fails while Set Up looks fine.
+	findings += check_secret_copies(_secret_copies(settings))
 
 	if wants_mail and not oauth_accounts:
 		findings.append(
