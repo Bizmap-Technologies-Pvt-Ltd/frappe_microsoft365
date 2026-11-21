@@ -89,8 +89,8 @@ syncs into Frappe, so people can join from either side.
 
 No extra Azure permission is needed. Microsoft creates the meeting as part of the event, so
 `Calendars.ReadWrite` covers it — the **Outlook calendar** capability on its own is enough.
-`OnlineMeetings.ReadWrite` is only required for standalone meetings and transcripts, which are
-separate tickboxes precisely so a calendar-only setup never has to ask for them.
+`OnlineMeetings.ReadWrite` is only required for standalone meetings, and transcripts need only
+`OnlineMeetings.Read`; both are separate tickboxes precisely so a calendar-only setup never has to ask for them.
 
 **One limitation, enforced rather than explained away:** Microsoft cannot turn an existing
 online meeting back into a plain event. So the tickbox **locks itself once the meeting exists**
@@ -194,7 +194,7 @@ tenant`. It lives in the Teams admin center, not Entra — step 7 of *Connect Fr
 is no request-side workaround, and re-granting consent does nothing, which is why both the error
 message and the doctor name this switch specifically rather than blaming permissions.
 
-**Requirements.** Three delegated permissions, not one: `OnlineMeetings.ReadWrite` to turn a join
+**Requirements.** Three delegated permissions, not one: `OnlineMeetings.Read` to turn a join
 link into the meeting the transcript belongs to, `OnlineMeetingTranscript.Read.All` to read the
 transcript, and `OnlineMeetingRecording.Read.All` for the recordings — which also need a Teams
 licence that records. Microsoft consents to reading the words and reading the video separately, so

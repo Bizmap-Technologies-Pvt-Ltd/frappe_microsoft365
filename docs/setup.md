@@ -90,15 +90,16 @@ consented to is itself a way to make sign-in fail.
 | --- | --- |
 | Outlook calendar | `User.Read` `Calendars.ReadWrite` |
 | Standalone Teams meetings | `User.Read` `OnlineMeetings.ReadWrite` |
-| Meeting transcripts and recordings | the row above, **plus** `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+| Meeting transcripts and recordings | `User.Read` `OnlineMeetings.Read` `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
 
 Transcripts are the row people get wrong, and all three permissions are load-bearing.
 `OnlineMeetingTranscript.Read.All` reads a transcript you can already address by online meeting id
-— but you start from a join URL, and turning that into a meeting id is `OnlineMeetings.ReadWrite`.
+— but you start from a join URL, and turning that into a meeting id is `OnlineMeetings.Read`
+(sites set up before 1.2.0 keep the `OnlineMeetings.ReadWrite` they were granted, which covers it).
 Recordings are consented separately again as `OnlineMeetingRecording.Read.All`, because Microsoft
 treats reading the words and reading the video as different permissions and plenty of tenants grant
-one and refuse the other. Frappe enforces the first half: *Meeting transcripts and recordings* only
-appears once *Standalone Teams meetings* is on, and is cleared if you turn that back off.
+one and refuse the other. *Meeting transcripts and recordings* adds the lookup permission itself,
+so it no longer needs *Standalone Teams meetings* ticked.
 
 `offline_access`, `openid` and `profile` are requested automatically at sign-in and never belong in
 a list you maintain — but `offline_access` still has to be **granted here** like any other, or
@@ -224,7 +225,7 @@ permissions each capability needs, and only then offers to apply it.
 | --- | --- | --- |
 | Outlook calendar | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `Calendars.ReadWrite`, `offline_access` |
 | Standalone Teams meetings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetings.ReadWrite`, `offline_access` |
-| Meeting transcripts and recordings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetingTranscript.Read.All`, `OnlineMeetingRecording.Read.All`, `offline_access` |
+| Meeting transcripts and recordings | Nothing — this app talks to Graph directly | Graph delegated: `User.Read`, `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All`, `OnlineMeetingRecording.Read.All`, `offline_access` |
 | Outlook mail | A `Connected App` for Frappe's Email Account | Exchange delegated: `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access` — or the `.default` app-only scope for shared mailboxes |
 | Sign in with Microsoft | A `Social Login Key` | Graph delegated: `openid`, `email`, `profile` |
 
@@ -237,8 +238,8 @@ Azure and what sign-in asks for cannot drift apart.
 The split is what makes that work. **Outlook calendar** is `Calendars.ReadWrite` and nothing
 else — including the **Add Teams meeting** tickbox on an Event, because Microsoft mints the
 Teams link as part of the event rather than as a separate meeting. `OnlineMeetings.ReadWrite`
-is only for meetings created outside a calendar event and for resolving a join URL back to a
-meeting; `OnlineMeetingTranscript.Read.All` and `OnlineMeetingRecording.Read.All` are only
+is only for meetings created outside a calendar event; `OnlineMeetings.Read` resolves a join URL
+back to a meeting for transcripts; `OnlineMeetingTranscript.Read.All` and `OnlineMeetingRecording.Read.All` are only
 for transcripts and recordings. All are permissions tenants routinely refuse — reading the
 words and reading the video are consented separately — which is why wanting a calendar no
 longer asks for any of them.

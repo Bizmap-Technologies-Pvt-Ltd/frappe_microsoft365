@@ -276,7 +276,12 @@ class TestCapabilityAzurePermissions(BaseTestCase):
 		for capability_id in provisioning.GRAPH_CAPABILITY_FIELDS:
 			listed |= set(self._capability(capability_id)["azure"])
 
-		self.assertEqual(listed - {OFFLINE_ACCESS}, set(graph.derive_scopes(everything)))
+		derived = set(graph.derive_scopes(everything))
+		self.assertEqual(listed - {OFFLINE_ACCESS} - {"OnlineMeetings.Read"}, derived)
+		# Transcripts alone list OnlineMeetings.Read; with standalone meetings ticked too,
+		# ReadWrite covers it and the combined request carries only ReadWrite.
+		self.assertIn("OnlineMeetings.ReadWrite", derived)
+		self.assertNotIn("OnlineMeetings.Read", derived)
 
 	def test_graph_capabilities_do_not_advertise_openid_or_profile(self):
 		"""Those are sign-in scopes, requested automatically; only offline_access is consented."""

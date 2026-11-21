@@ -20,6 +20,7 @@ from requests.adapters import HTTPAdapter
 from requests.utils import requote_uri
 
 from frappe_microsoft365 import capabilities
+from frappe_microsoft365.capabilities import MEETINGS_READ, MEETINGS_READ_WRITE
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -41,8 +42,9 @@ BASE_SCOPE = "User.Read"
 #: * Creating an event with isOnlineMeeting/teamsForBusiness on POST /me/events is a calendar
 #:   write — Microsoft mints the Teams link as part of the event — so the Teams tickbox on an
 #:   Event needs Calendars.ReadWrite and nothing else.
-#: * OnlineMeetings.ReadWrite is needed only for standalone meetings (POST /me/onlineMeetings)
-#:   and for resolving a join URL to a meeting id.
+#: * OnlineMeetings.ReadWrite is needed only for standalone meetings (POST /me/onlineMeetings).
+#:   Resolving a join URL to a meeting id needs only OnlineMeetings.Read, which is what
+#:   transcripts ask for — unless the site already holds ReadWrite (see derive_scopes).
 #: * OnlineMeetingTranscript.Read.All is needed only for transcripts, and recordings need
 #:   their own OnlineMeetingRecording.Read.All on top of it — Microsoft grants the two
 #:   separately, and a tenant that consents to reading words often will not consent to
@@ -169,11 +171,12 @@ def parse_scopes(raw):
 	return scopes
 
 
-def derive_scopes(capabilities):
+def derive_scopes(capabilities, granted=None):
 	"""The delegated scopes implied by the ticked capabilities.
 
 	Pure: takes a plain dict (or any .get() mapping, including the Settings Document) so the
-	rule is testable without a site or a tenant.
+	rule is testable without a site or a tenant. ``granted`` is what this site's connections
+	were last authorised with (granted_scopes()); it only ever decides one thing, below.
 
 	Nothing reserved is returned. offline_access/openid/profile are added once, centrally, in
 	build_authorize_url; including them here would put them in the MSAL token calls too, which
@@ -182,16 +185,63 @@ def derive_scopes(capabilities):
 	Asking for a permission nothing uses is not free — it shows up on the consent screen, and
 	plenty of tenants refuse OnlineMeetings or transcript consent outright — so a capability
 	that is not ticked contributes no scope at all.
+
+	OnlineMeetings.Read is the one exception to "derived from the tickboxes alone". Transcripts
+	need only Read, but until 1.2.0 they were built on standalone meetings and asked for
+	ReadWrite. A site that was granted ReadWrite keeps asking for it: swapping it for Read would
+	be a scope that connection was never consented to, which means a consent prompt (or, on a
+	tenant that needs admin consent, a refused sign-in) for every user, for no gain. Read is
+	also dropped whenever ReadWrite is asked for anyway, because ReadWrite covers it.
 	"""
 	capabilities = capabilities or {}
+	granted = granted or ()
 	scopes = [BASE_SCOPE]
 	for field, field_scopes in CAPABILITY_SCOPES:
 		if not capabilities.get(field):
 			continue
 		for scope in field_scopes:
+			if scope == MEETINGS_READ and MEETINGS_READ_WRITE in granted:
+				scope = MEETINGS_READ_WRITE
 			if scope not in scopes:
 				scopes.append(scope)
+	if MEETINGS_READ_WRITE in scopes and MEETINGS_READ in scopes:
+		scopes.remove(MEETINGS_READ)
 	return scopes
+
+
+def granted_scopes():
+	"""Every delegated scope a connection on this site was authorised with, in first-seen order.
+
+	Read through here, never from the field directly, because where it is kept is moving: 1.1.x
+	keeps one site-wide value on Microsoft Settings (``authorized_scopes``, rewritten by whoever
+	authorised last), and per-connection storage puts the same list on each Microsoft Calendar.
+	Both are read when they exist, so this answers the same on a site with either, or with both
+	during the move. A column that does not exist yet is skipped, not an error.
+
+	The union is the right question for derive_scopes: if any connection holds a scope, the
+	tenant has consented to it and asking for it again costs nobody a prompt.
+	"""
+	raw = []
+	try:
+		raw.append(frappe.db.get_single_value("Microsoft Settings", "authorized_scopes"))
+	except Exception:
+		pass
+	try:
+		if frappe.db.has_column("Microsoft Calendar", "authorized_scopes"):
+			raw += frappe.get_all(
+				"Microsoft Calendar", filters={"authorized": 1}, pluck="authorized_scopes"
+			)
+	except Exception:
+		pass
+	return parse_scopes(" ".join(r for r in raw if r))
+
+
+def meeting_lookup_scope(scopes=None):
+	"""Which OnlineMeetings permission finding a meeting from its join link relies on here."""
+	scopes = get_scopes() if scopes is None else scopes
+	if MEETINGS_READ_WRITE in scopes:
+		return MEETINGS_READ_WRITE
+	return MEETINGS_READ
 
 
 def get_scopes(settings=None):
@@ -205,7 +255,7 @@ def get_scopes(settings=None):
 	override = parse_scopes(settings.get("default_scopes"))
 	if override:
 		return override
-	return derive_scopes(settings)
+	return derive_scopes(settings, granted_scopes())
 
 
 @frappe.whitelist()
@@ -218,7 +268,7 @@ def preview_scopes(capabilities: dict | str | None = None, override: str | None 
 	frappe.only_for("System Manager")
 	if isinstance(capabilities, str):
 		capabilities = frappe.parse_json(capabilities) or {}
-	derived = derive_scopes(capabilities)
+	derived = derive_scopes(capabilities, granted_scopes())
 	overridden = parse_scopes(override)
 	return {
 		"scopes": overridden or derived,

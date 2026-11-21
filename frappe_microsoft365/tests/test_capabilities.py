@@ -58,11 +58,16 @@ class TestRules(BaseTestCase):
 		self.assertIsNone(capabilities.unmet(files, {"use_files": 1}, frappe_major=16))
 
 	def test_missing_prerequisite(self):
-		transcripts = capabilities.get("transcripts")
-		self.assertTrue(capabilities.unmet(transcripts, {"use_transcripts": 1}, frappe_major=16))
-		self.assertIsNone(
-			capabilities.unmet(transcripts, {"use_transcripts": 1, "use_teams": 1}, frappe_major=16)
+		dependent = capabilities.Capability(
+			id="x", field="use_x", label="X", access=capabilities.DELEGATED, requires=("teams",)
 		)
+		self.assertTrue(capabilities.unmet(dependent, {"use_x": 1}, frappe_major=16))
+		self.assertIsNone(capabilities.unmet(dependent, {"use_x": 1, "use_teams": 1}, frappe_major=16))
+
+	def test_transcripts_stand_on_their_own(self):
+		"""They find their meeting with OnlineMeetings.Read, so standalone meetings are optional."""
+		transcripts = capabilities.get("transcripts")
+		self.assertIsNone(capabilities.unmet(transcripts, {"use_transcripts": 1}, frappe_major=16))
 
 	def test_is_enabled_needs_the_integration_on_too(self):
 		self.assertTrue(capabilities.is_enabled("files", frappe._dict(enabled=1, use_files=1)))

@@ -865,7 +865,7 @@ class TestWhichPermissionIsMissing(ArtifactsTestCase):
 
 	def test_a_403_resolving_the_join_link_names_the_meetings_permission(self):
 		"""Mapping a join link to a meeting id is /me/onlineMeetings, which needs
-		OnlineMeetings.ReadWrite — a permission neither transcript nor recording consent
+		OnlineMeetings.Read — a permission neither transcript nor recording consent
 		includes. People tick transcripts, grant that, and stop, so this is the step that fails
 		for them; it used to surface as a raw Graph 403 against a path nobody recognises."""
 		event = self._finished_meeting(custom_microsoft_online_meeting_id=None)
@@ -879,8 +879,8 @@ class TestWhichPermissionIsMissing(ArtifactsTestCase):
 				artifacts.fetch_meeting_artifacts(event.name)
 
 		said = str(ctx.exception)
-		self.assertIn("OnlineMeetings.ReadWrite", said)
-		self.assertIn("Standalone Teams meetings", said, "name the tickbox that asks for it")
+		self.assertIn(graph.meeting_lookup_scope(), said, "name the permission this site requests")
+		self.assertIn("OnlineMeetings.Read", said)
 		self.assertNotIn("OnlineMeetingTranscript.Read.All", said)
 
 	def test_a_join_link_that_matches_nothing_is_not_called_a_permission_problem(self):

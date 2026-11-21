@@ -4,11 +4,14 @@ Only the network is faked (tests/network.py): graph_url's encoding and the URL g
 real, so the URLs asserted here are the ones that would go out.
 """
 
+from unittest.mock import patch
 from urllib.parse import parse_qsl, urlsplit
 
+import frappe
 from requests.utils import requote_uri
 
 from frappe_microsoft365 import microsoft_graph as graph
+from frappe_microsoft365 import microsoft_transcripts as ms
 from frappe_microsoft365.microsoft_meetings import _resolve_online_meeting_id
 from frappe_microsoft365.tests.network import Response, error, fake_graph
 from frappe_microsoft365.tests.test_meeting_artifacts import CALENDAR, ArtifactsTestCase
@@ -125,3 +128,109 @@ class TestTheFallbacks(ArtifactsTestCase):
 		with fake_graph(lambda *a: error(503, "ServiceUnavailable")):
 			with self.assertRaises(graph.MsGraphError):
 				_resolve_online_meeting_id(CALENDAR, OLD_JOIN)
+
+
+class TestTheLookupPermission(ArtifactsTestCase):
+	"""Transcripts ask for OnlineMeetings.Read, except where ReadWrite was already granted."""
+
+	TRANSCRIPTS = {"use_calendar": 1, "use_transcripts": 1}
+	BEFORE_120 = (
+		"User.Read Calendars.ReadWrite OnlineMeetings.ReadWrite "
+		"OnlineMeetingTranscript.Read.All OnlineMeetingRecording.Read.All"
+	)
+
+	def _granted(self, value):
+		previous = frappe.db.get_single_value("Microsoft Settings", "authorized_scopes")
+		frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", value)
+		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "authorized_scopes", previous)
+
+	def test_a_new_setup_with_transcripts_alone_asks_for_read(self):
+		self.assertEqual(
+			graph.derive_scopes(self.TRANSCRIPTS),
+			[
+				"User.Read",
+				"Calendars.ReadWrite",
+				"OnlineMeetings.Read",
+				"OnlineMeetingTranscript.Read.All",
+				"OnlineMeetingRecording.Read.All",
+			],
+		)
+
+	def test_a_site_already_granted_readwrite_keeps_asking_for_it(self):
+		"""Swapping it for Read would be a scope nobody consented to: a prompt for everyone."""
+		scopes = graph.derive_scopes(self.TRANSCRIPTS, graph.parse_scopes(self.BEFORE_120))
+
+		self.assertIn("OnlineMeetings.ReadWrite", scopes)
+		self.assertNotIn("OnlineMeetings.Read", scopes)
+
+	def test_an_existing_site_requests_exactly_what_it_was_authorised_with(self):
+		"""The 1.1.x setup (standalone meetings + transcripts) asks for the identical list, so
+		the doctor sees no scope change and nobody is told to re-authorise."""
+		self._granted(self.BEFORE_120)
+		ticked = frappe._dict(use_calendar=1, use_teams=1, use_transcripts=1, default_scopes="")
+
+		self.assertEqual(graph.get_scopes(ticked), graph.parse_scopes(self.BEFORE_120))
+
+	def test_unticking_standalone_meetings_later_still_keeps_readwrite(self):
+		self._granted(self.BEFORE_120)
+		ticked = frappe._dict(self.TRANSCRIPTS, default_scopes="")
+
+		self.assertEqual(graph.get_scopes(ticked), graph.parse_scopes(self.BEFORE_120))
+
+	def test_standalone_meetings_ask_for_readwrite_and_never_both(self):
+		scopes = graph.derive_scopes({"use_teams": 1, "use_transcripts": 1})
+
+		self.assertIn("OnlineMeetings.ReadWrite", scopes)
+		self.assertNotIn("OnlineMeetings.Read", scopes)
+
+	def test_the_sign_in_url_of_an_existing_site_is_unchanged(self):
+		self._granted(self.BEFORE_120)
+		ticked = frappe._dict(use_calendar=1, use_teams=0, use_transcripts=1, default_scopes="")
+
+		with patch.object(graph, "get_settings", return_value=ticked), patch.object(
+			graph, "_settings_doc", return_value=ticked
+		):
+			ticked.update(client_id="cid", tenant_id="contoso.example", redirect_uri="https://x/cb")
+			url = graph.build_authorize_url("state")
+
+		scope = dict(parse_qsl(urlsplit(url).query))["scope"].split()
+		self.assertIn("OnlineMeetings.ReadWrite", scope)
+		self.assertNotIn("OnlineMeetings.Read", scope)
+
+	def test_granted_scopes_also_reads_per_connection_storage(self):
+		"""Whichever of the two places holds them, the answer is the same."""
+		self._granted("")
+		with patch.object(frappe.db, "has_column", return_value=True), patch.object(
+			frappe, "get_all", return_value=["User.Read OnlineMeetings.ReadWrite", None]
+		):
+			self.assertEqual(graph.granted_scopes(), ["User.Read", "OnlineMeetings.ReadWrite"])
+
+	def test_the_join_link_403_names_the_permission_in_use(self):
+		self._granted("")
+		with patch.object(graph, "_settings_doc", return_value=frappe._dict(self.TRANSCRIPTS)):
+			self.assertIn("OnlineMeetings.Read,", ms._online_meetings_hint())
+		self._granted(self.BEFORE_120)
+		with patch.object(graph, "_settings_doc", return_value=frappe._dict(self.TRANSCRIPTS)):
+			self.assertIn("OnlineMeetings.ReadWrite", ms._online_meetings_hint())
+
+	def test_the_doctor_says_which_one_is_in_use(self):
+		from frappe_microsoft365 import doctor
+
+		new = doctor.check_meeting_lookup_scope(self.TRANSCRIPTS, graph.derive_scopes(self.TRANSCRIPTS))
+		kept = doctor.check_meeting_lookup_scope(
+			self.TRANSCRIPTS, graph.derive_scopes(self.TRANSCRIPTS, ["OnlineMeetings.ReadWrite"])
+		)
+
+		self.assertEqual(new[0]["title"], "Transcripts find their meeting with OnlineMeetings.Read")
+		self.assertEqual(kept[0]["title"], "Transcripts find their meeting with OnlineMeetings.ReadWrite")
+		self.assertIn("already granted", kept[0]["detail"])
+		self.assertEqual(doctor.check_meeting_lookup_scope({"use_calendar": 1}, ["User.Read"]), [])
+
+	def test_an_override_with_readwrite_is_not_told_read_is_missing(self):
+		from frappe_microsoft365 import doctor
+
+		found = doctor.check_scopes(
+			{**self.TRANSCRIPTS, "default_scopes": self.BEFORE_120}
+		)
+
+		self.assertEqual(found, [])

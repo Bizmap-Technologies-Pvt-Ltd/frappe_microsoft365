@@ -41,8 +41,8 @@ five-hour meeting is two recordings, not one. Transcription can be stopped and r
 Everything here is therefore plural: every transcript is attached, every recording is listed
 and separately downloadable.
 
-Requires the Teams and transcript capabilities: a transcript is addressed by online meeting id,
-and resolving that from a join URL needs OnlineMeetings.ReadWrite.
+Requires the transcript capability: a transcript is addressed by online meeting id, and
+resolving that from a join URL needs OnlineMeetings.Read (ReadWrite on sites that already had it).
 """
 
 import json
@@ -158,7 +158,7 @@ def _event_for_artifacts(event_name, resolve=True):
 				calendar_name, join_url, event_id=doc.get("custom_microsoft_event_id")
 			)
 		except MsGraphError as e:
-			# This step needs OnlineMeetings.ReadWrite, which the transcript permission does not
+			# This step needs OnlineMeetings.Read, which the transcript permission does not
 			# include — so it is the one that fails for people who granted transcript consent and
 			# stopped. Left to fall through, the dialog showed a raw Graph 403 against a path
 			# nobody recognises.

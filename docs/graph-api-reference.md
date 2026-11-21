@@ -13,6 +13,9 @@ This is the contract the app implements. Endpoints are Graph **v1.0**. Auth via 
   - Outlook calendar (including the Teams meeting tickbox on an Event): `User.Read`,
     `Calendars.ReadWrite`
   - Standalone Teams meetings: `+ OnlineMeetings.ReadWrite`
+  - Meeting transcripts and recordings: `+ OnlineMeetings.Read` (for the join-URL lookup;
+    `OnlineMeetings.ReadWrite` instead where it is already requested or was already granted),
+    `OnlineMeetingTranscript.Read.All`, `OnlineMeetingRecording.Read.All`
 > **Before any of this works:** Graph access to transcripts is a tenant switch that Microsoft
 > ships **off** — Teams admin center > Meetings > Meeting settings > Transcript API access >
 > Microsoft Graph access. With it off, every endpoint below returns

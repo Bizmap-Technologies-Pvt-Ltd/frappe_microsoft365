@@ -65,14 +65,13 @@
    "fieldtype": "Check",
    "label": "Standalone Teams meetings",
    "default": "0",
-   "description": "Standalone meetings, and finding a meeting from its join link. Transcripts need this."
+   "description": "Teams meetings created on their own, without a calendar event. Transcripts do not need this."
   },
   {
    "fieldname": "use_transcripts",
    "fieldtype": "Check",
    "label": "Meeting transcripts and recordings",
    "default": "0",
-   "depends_on": "use_teams",
    "description": "Read transcripts and recordings of past meetings. Usually needs admin consent."
   },
   {
@@ -226,7 +225,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-21 00:00:00",
+ "modified": "2026-11-21 10:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Settings",
  "owner": "Administrator",
