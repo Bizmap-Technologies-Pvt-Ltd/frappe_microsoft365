@@ -10,6 +10,7 @@
 - A SharePoint library or site that was deleted and created again under the same address no longer breaks every new folder: when the cached library id answers 404 and the library itself is gone, the app looks the site and library up again from the mapping's address, once, and carries on. (#40)
 
 - Long paths: SharePoint refuses a file whose whole path passes 400 characters, and uploads used to fail with a path error. A mapping whose base folder leaves too little room is now refused when saved, with the length in the message; record folders are named to leave room for their files; and a file name that would pass the limit is shortened, keeping its extension. Files more than 10 folders deep inside a record's folder open again from the panel. (#41)
+- A worker that died after uploading a file but before recording it no longer leaves a duplicate (`report (1).pdf`): the retry looks in the record's folder for a file of the same name and size that this app uploaded and no other File claims, and adopts it. (#42)
 
 ### Changed
 

@@ -579,3 +579,65 @@ class TestPathLimits(FilesTestCase):
 		self.assertEqual([f["check"] for f in found], ["upgrade.sharepoint_long_paths"])
 		self.assertEqual(found[0]["target"], MAPPED)
 		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_long_paths", upgrade_checks())
+
+
+# --- B25: a retry adopts the upload a dead worker left behind ----------------------------------
+
+
+class TestRetryAfterALostCommit(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		files.add_folder_row(
+			MAPPED,
+			self.todo.name,
+			{"drive_id": "DRIVE", "item_id": "FOLDER", "folder_name": "F", "folder_path": "Projects/F", "web_url": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/Projects/F"},
+		)
+		self.file = self.attach(name="report.csv")
+		self.size = os.path.getsize(self.file.get_full_path())
+		# The first attempt counted itself, uploaded, and died before recording the ids.
+		frappe.db.set_value("File", self.file.name, "custom_microsoft_attempts", 1)
+		real_graph(self)
+
+	def left_behind(self, created_by):
+		def answer(method, url, kwargs):
+			if method == "GET" and url == f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:":
+				return HttpResponse(
+					200,
+					{
+						"id": "LEFT",
+						"name": "report.csv",
+						"size": self.size,
+						"file": {},
+						"webUrl": "https://x/report.csv",
+						"parentReference": {"driveId": "DRIVE", "id": "FOLDER"},
+						"createdBy": created_by,
+					},
+				)
+			if method == "PUT" and url == f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:/content":
+				return HttpResponse(
+					201, {"id": "NEW", "name": "report (1).csv", "parentReference": {"driveId": "DRIVE", "id": "FOLDER"}}
+				)
+			raise AssertionError(f"unexpected {method} {url}")
+
+		return network(self, answer)
+
+	def test_the_retry_adopts_the_item_instead_of_uploading_again(self):
+		client_id = frappe.get_single("Microsoft Settings").client_id
+		fake = self.left_behind({"application": {"id": client_id, "displayName": "ERP"}})
+		files.upload_file(self.file.name)
+		self.assertEqual([(m, u) for m, u, _k in fake.calls], [("GET", f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:")])
+		self.assertIn("size", fake.calls[0][2]["params"]["$select"])
+		row = frappe.db.get_value("File", self.file.name, ["custom_microsoft_status", "custom_microsoft_item_id"], as_dict=True)
+		self.assertEqual((row.custom_microsoft_status, row.custom_microsoft_item_id), (files.STORED, "LEFT"))
+
+	def test_a_file_a_person_put_there_is_not_taken(self):
+		fake = self.left_behind({"user": {"id": "a-person", "displayName": "Asha"}})
+		files.upload_file(self.file.name)
+		self.assertEqual([m for m, _u, _k in fake.calls], ["GET", "PUT"])
+		self.assertEqual(frappe.db.get_value("File", self.file.name, "custom_microsoft_item_id"), "NEW")
+
+	def test_a_first_attempt_never_looks(self):
+		frappe.db.set_value("File", self.file.name, "custom_microsoft_attempts", 0)
+		fake = self.left_behind({})
+		files.upload_file(self.file.name)
+		self.assertEqual([m for m, _u, _k in fake.calls], ["PUT"])

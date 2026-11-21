@@ -1078,6 +1078,8 @@ def upload_file(file_name):
 	frappe.db.savepoint("microsoft365_upload")
 	try:
 		item = _already_uploaded(file_doc, folder)
+		if not item and attempts > 1:
+			item = _left_by_an_earlier_attempt(file_doc, folder)
 		if not item:
 			try:
 				item = _upload(file_doc, folder)
@@ -1197,6 +1199,50 @@ def _already_uploaded(file_doc, folder):
 		# Moved out of the record's folder since, or the folder was recreated: not this file's copy.
 		return None
 	return item
+
+
+def _left_by_an_earlier_attempt(file_doc, folder):
+	"""The item an earlier attempt uploaded but did not live to record, if it is in the folder.
+
+	A worker killed between the upload and the commit of its ids leaves the bytes in SharePoint
+	and nothing here saying so; the retry would upload them again and SharePoint keep both, as
+	``report (1).pdf``. So a retry first looks in the record's folder for a file under the same
+	name with the same size, uploaded by this app rather than by a person, that no other File
+	claims, and adopts it.
+	"""
+	if not is_local(file_doc):
+		return None  # a link's size is only known once it is downloaded again
+	try:
+		size = os.path.getsize(file_doc.get_full_path())
+	except OSError:
+		return None
+	name = upload_name(file_doc, folder)
+	try:
+		item = graph.graph_request(
+			"GET",
+			f"/drives/{folder.drive_id}/items/{folder.item_id}:/{quote(name, safe='')}:",
+			APP,
+			params={"$select": "id,name,size,file,webUrl,parentReference,createdBy"},
+		)
+	except MsGraphNotFound:
+		_forget_message()
+		return None
+	if "file" not in item or cint(item.get("size")) != size or not _uploaded_by_this_app(item):
+		return None
+	if frappe.db.exists("File", {"custom_microsoft_item_id": item["id"], "name": ["!=", file_doc.name]}):
+		return None
+	return item
+
+
+def _uploaded_by_this_app(item):
+	"""Whether a driveItem was created by this app, as far as SharePoint says: by its client id
+	when SharePoint names the application, else by naming no signed-in user."""
+	created = item.get("createdBy") or {}
+	app_id = (created.get("application") or {}).get("id")
+	if app_id:
+		settings = graph.get_settings()
+		return app_id in {(settings.get("app_client_id") or "").strip(), (settings.get("client_id") or "").strip()} - {""}
+	return not (created.get("user") or {}).get("id")
 
 
 def _record_failure(file_name, attempts, error):
