@@ -210,7 +210,10 @@ def check_scopes(settings):
 			)
 		)
 
-	missing = [s for s in graph.derive_scopes(settings) if s not in override]
+	# The override itself counts as granted: one that lists OnlineMeetings.ReadWrite already
+	# covers the OnlineMeetings.Read transcripts derive, and calling Read missing would be wrong.
+	needed = graph.derive_scopes(settings, override)
+	missing = [s for s in needed if s not in override]
 	if missing:
 		out.append(
 			finding(
@@ -220,7 +223,7 @@ def check_scopes(settings):
 				_(
 					"The capabilities ticked in Microsoft Settings need {0}, but the override asks "
 					"only for {1}. Whatever is missing fails with a 403 the first time it is used."
-				).format(", ".join(graph.derive_scopes(settings)), ", ".join(override)),
+				).format(", ".join(needed), ", ".join(override)),
 				_(
 					"Add the missing scope to the override, or clear the override entirely and let "
 					"the capabilities decide."
@@ -338,6 +341,42 @@ def _connection_scope_rows():
 	if meta.has_field("authorization_error"):
 		fields.append("authorization_error")
 	return frappe.get_all("Microsoft Calendar", filters={"enabled": 1}, fields=fields, limit_page_length=0)
+
+
+def check_meeting_lookup_scope(settings, requested):
+	"""Which OnlineMeetings permission transcripts rely on here, said out loud.
+
+	Two sites with the same tickboxes can ask for different ones: a new setup asks for
+	OnlineMeetings.Read, the least Microsoft allows for finding a meeting from its join link,
+	while a site already granted OnlineMeetings.ReadWrite keeps asking for that so nobody is
+	sent through consent again. The admin looking at Entra has to know which row to look for.
+	"""
+	if not settings.get("use_transcripts"):
+		return []
+	from frappe_microsoft365.capabilities import MEETINGS_READ
+
+	scope = graph.meeting_lookup_scope(requested)
+	if scope not in requested:
+		# Only an override can leave both out, and check_scopes already reports it as missing.
+		return []
+	if scope == MEETINGS_READ:
+		why = _("It is the least privilege Microsoft allows for finding a meeting from its join link.")
+	elif settings.get("use_teams"):
+		why = _("Standalone Teams meetings need it, and it covers finding a meeting as well.")
+	else:
+		why = _(
+			"This site was already granted it, so it is still requested instead of {0} and nobody "
+			"is asked to consent again."
+		).format(MEETINGS_READ)
+	return [
+		finding(
+			"scopes.meeting_lookup",
+			PASS,
+			_("Transcripts find their meeting with {0}").format(scope),
+			why,
+			_("It is the row to look for under Entra ID > App registrations > your app > API permissions."),
+		)
+	]
 
 
 #: Azure identifiers are GUIDs. A secret VALUE never is, which is what makes the mix-up
@@ -1155,13 +1194,14 @@ def error_patterns():
 		# The permission people miss. They grant the transcript one and stop, but a transcript is
 		# addressed by meeting id, and getting that id from a join link is a different call with
 		# a different permission — a key to a door you cannot walk to.
-		r"OnlineMeetings\.ReadWrite|JoinWebUrl[^\n]{0,400}\b403\b|/me/onlineMeetings[^\n]{0,200}\b403\b",
+		r"OnlineMeetings\.Read|JoinWebUrl[^\n]{0,400}\b403\b|/me/onlineMeetings[^\n]{0,200}\b403\b",
 		_("Microsoft refused to look up the meeting behind this link"),
 		_(
-			"Mapping a join link to a meeting needs OnlineMeetings.ReadWrite, which the transcript "
-			"permission does not include. Tick Standalone Teams meetings in Microsoft Settings, "
-			"consent to it under Entra ID > App registrations > your app > API permissions, then "
-			"Re-authorize the Microsoft Calendar."
+			"Mapping a join link to a meeting needs OnlineMeetings.Read (sites set up before 1.2.0 "
+			"keep using OnlineMeetings.ReadWrite, which covers it), and the transcript permission "
+			"includes neither. Consent to the one this site requests — Run Diagnostics says which — "
+			"under Entra ID > App registrations > your app > API permissions, then Re-authorize "
+			"the Microsoft Calendar."
 		),
 	),
 	(
@@ -1948,6 +1988,7 @@ def run_diagnostics():
 			# Each connection against its own sign-in: the site-wide value only says what the
 			# last person to authorise asked for, and vouched for everybody else's token.
 			findings += check_connection_scopes(graph.get_scopes(settings), connections)
+		findings += check_meeting_lookup_scope(settings, graph.get_scopes(settings))
 		# The half of the setup that lives in Microsoft's portals. Reported here because this is
 		# the button people press when something is wrong, and the fault that cost a real tenant
 		# an hour — a tenant switch shipped off — is on this list and invisible to every check

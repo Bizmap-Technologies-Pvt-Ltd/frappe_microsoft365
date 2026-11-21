@@ -71,9 +71,12 @@ openid
 profile
 User.Read
 Calendars.ReadWrite
-OnlineMeetings.ReadWrite
+OnlineMeetings.Read
 OnlineMeetingTranscript.Read.All
 ```
+
+(`OnlineMeetings.ReadWrite` instead of `OnlineMeetings.Read` if you also tick **Standalone Teams
+meetings**, or if this site was set up before 1.2.0 and already holds it.)
 
 Then click **Grant admin consent for <tenant>** (the green check). Admin consent is required —
 `OnlineMeetingTranscript.Read.All` in particular will not work without it.
@@ -121,8 +124,9 @@ hold:
   been granted**. Speaker names additionally need Configure > Include speaker attribution > On.
 - The **delegated** scope `OnlineMeetingTranscript.Read.All` is granted **with tenant admin
   consent** (step 4).
-- The **delegated** scope `OnlineMeetings.ReadWrite` is granted too. A transcript is addressed by
-  online meeting id, and the only way to get that from a join link is
+- The **delegated** scope `OnlineMeetings.Read` is granted too (or `OnlineMeetings.ReadWrite`, on a
+  site that already had it — **Run Diagnostics** says which one this site requests). A transcript
+  is addressed by online meeting id, and the only way to get that from a join link is
   `GET /me/onlineMeetings?$filter=JoinWebUrl eq '...'`, which this scope covers. Granting the
   transcript scope alone is a key to a door you cannot walk to.
 

@@ -11,6 +11,8 @@ All entrypoints are whitelisted and owner-checked. Times are ISO 8601; naive dat
 interpreted in the system timezone.
 """
 
+import re
+
 import frappe
 from frappe import _
 from frappe.utils import add_to_date, get_datetime
@@ -105,17 +107,85 @@ def create_meeting(
 	}
 
 
-def _resolve_online_meeting_id(calendar_name, join_url):
-	"""Map a Teams joinWebUrl to its onlineMeeting id (needed for transcripts)."""
-	# OData string literal: escape single quotes by doubling them
-	safe = (join_url or "").replace("'", "''")
-	resp = graph.graph_request(
-		"GET",
-		f"/me/onlineMeetings?$filter=JoinWebUrl eq '{safe}'",
-		calendar_name,
-	)
+#: Characters that mean something to a query string itself. Written raw into the $filter they
+#: never reach Graph as part of the join URL: ``&`` starts another parameter, ``+`` is read as a
+#: space and ``#`` ends the URL. Percent-encoded, they arrive as the characters they are.
+#:
+#: Deliberately only these three. Everything else is left for graph_url to encode the way
+#: requests does, which is what old meetup-join links (full of %3a and %40) have been sent as
+#: all along, and Graph matches them that way.
+_QUERY_SPECIALS = (("&", "%26"), ("+", "%2B"), ("#", "%23"))
+
+#: The numeric meeting id in a new-style join link: https://teams.microsoft.com/meet/<id>?p=...
+_MEET_ID = re.compile(r"/meet/(\d+)")
+
+
+def _filter_literal(value):
+	"""``value`` as the inside of an OData string literal in a $filter written into the path."""
+	# OData string literal: escape single quotes by doubling them.
+	value = (value or "").replace("'", "''")
+	for char, encoded in _QUERY_SPECIALS:
+		value = value.replace(char, encoded)
+	return value
+
+
+def _first_meeting(calendar_name, condition):
+	resp = graph.graph_request("GET", f"/me/onlineMeetings?$filter={condition}", calendar_name)
 	value = resp.get("value") or []
 	return value[0]["id"] if value else None
+
+
+def _outlook_join_url(calendar_name, event_id):
+	"""The join link Outlook itself holds for this event, or None.
+
+	The link stored on a Frappe Event can be a different spelling of the same meeting — copied
+	from an invitation, or written before Teams switched to /meet/ links — and Graph matches the
+	string, not the meeting. The event's own onlineMeeting is the one Graph issued.
+
+	A 404 or 403 here is not the lookup failing, only this second opinion being unavailable, so
+	it answers None rather than replacing the real question's answer with its own error.
+	"""
+	try:
+		event = graph.graph_request("GET", f"/me/events/{event_id}?$select=onlineMeeting", calendar_name)
+	except graph.MsGraphNotFound:
+		return None
+	except graph.MsGraphError as e:
+		if "403" in str(e) or "Forbidden" in str(e):
+			return None
+		raise
+	return (event.get("onlineMeeting") or {}).get("joinUrl")
+
+
+def _resolve_online_meeting_id(calendar_name, join_url, event_id=None):
+	"""Map a Teams joinWebUrl to its onlineMeeting id (needed for transcripts).
+
+	Asked by join link first, as it always was. Only when that matches nothing does it try the
+	Outlook event's own join link (``event_id`` is its Graph id), and then the numeric meeting
+	id a /meet/ link carries — so a meeting that resolved before costs exactly the one call it
+	always did. Errors are raised, never turned into "no match": a 503 is not a foreign meeting.
+	"""
+	candidates = [join_url] if join_url else []
+	meeting_id = _first_meeting(calendar_name, f"JoinWebUrl eq '{_filter_literal(join_url)}'")
+	if meeting_id:
+		return meeting_id
+
+	if event_id:
+		outlook_url = _outlook_join_url(calendar_name, event_id)
+		if outlook_url and outlook_url != join_url:
+			candidates.append(outlook_url)
+			meeting_id = _first_meeting(calendar_name, f"JoinWebUrl eq '{_filter_literal(outlook_url)}'")
+			if meeting_id:
+				return meeting_id
+
+	for url in candidates:
+		match = _MEET_ID.search(url)
+		if match:
+			meeting_id = _first_meeting(
+				calendar_name, f"joinMeetingIdSettings/joinMeetingId eq '{match.group(1)}'"
+			)
+			if meeting_id:
+				return meeting_id
+	return None
 
 
 @frappe.whitelist()

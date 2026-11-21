@@ -77,7 +77,7 @@ Three causes account for most of the reports.
 - [A 403 on a permission you have already granted](#403-after-consent)
 - [`403` on `/transcripts`](#403-transcripts) — `OnlineMeetingTranscript.Read.All`
 - [`403` on `/recordings`](#403-recordings) — `OnlineMeetingRecording.Read.All`
-- [`403` on `/me/onlineMeetings`](#403-onlinemeetings) — `OnlineMeetings.ReadWrite`
+- [`403` on `/me/onlineMeetings`](#403-onlinemeetings) — `OnlineMeetings.Read`
 - [`Microsoft could not match this join link to a meeting`](#join-link-no-match)
 - [`Standalone meeting is not calendar-associated; transcripts are unavailable.`](#standalone-meeting)
 - [`Microsoft has not finished processing this meeting.`](#still-processing)
@@ -671,13 +671,15 @@ from meeting options.
 addressed by online meeting id, and the only documented way to get that id from a join link is this
 filtered call — which is a different permission. A key to a door you cannot walk to.
 
-**Fix.** Tick **Standalone Teams meetings** in Microsoft Settings, which is what adds
-**`OnlineMeetings.ReadWrite`** to the request, consent to it in Entra → your app → **API
-permissions**, then **Re-authorize**.
+**Fix.** Consent to the permission this site requests for the lookup in Entra → your app → **API
+permissions**, then **Re-authorize**. **Run Diagnostics** names it ("Transcripts find their
+meeting with …"): `OnlineMeetings.Read` on a new setup, `OnlineMeetings.ReadWrite` on a site that
+also ticks **Standalone Teams meetings** or was already granted it before 1.2.0.
 
 Microsoft lists `OnlineMeetings.Read` as the least-privileged permission for the lookup itself and
-`OnlineMeetings.ReadWrite` as the higher-privileged one that also works. This app requests
-`ReadWrite` because the same capability also creates standalone meetings. Note that on the `/me`
+`OnlineMeetings.ReadWrite` as the higher-privileged one that also works. Since 1.2.0 transcripts
+ask for `Read`; a site already granted `ReadWrite` keeps asking for that, because switching would
+be a new scope nobody consented to and every user would see a consent prompt. Note that on the `/me`
 path this call has **no** application-permission form at all — app-only has to use
 `/users/{id}/onlineMeetings`, with an application access policy behind it.
 

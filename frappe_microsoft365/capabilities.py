@@ -26,6 +26,15 @@ APPLICATION = "application"
 FRAPPE_RECORD = "frappe_record"
 
 
+#: Looking a meeting up by its join link. The least privilege Microsoft allows for it, and all
+#: transcripts need: GET /me/onlineMeetings?$filter=JoinWebUrl eq '...'.
+MEETINGS_READ = "OnlineMeetings.Read"
+
+#: Creating a standalone meeting (POST /me/onlineMeetings). It covers the lookup too, which is
+#: why sites set up before 1.2.0 — when transcripts were built on it — keep asking for it.
+MEETINGS_READ_WRITE = "OnlineMeetings.ReadWrite"
+
+
 @dataclass(frozen=True)
 class Capability:
 	id: str
@@ -68,12 +77,11 @@ CAPABILITIES = (
 		field="use_teams",
 		label="Standalone Teams meetings",
 		access=DELEGATED,
-		graph_scopes=("OnlineMeetings.ReadWrite",),
+		graph_scopes=(MEETINGS_READ_WRITE,),
 		azure_type="Microsoft Graph, Delegated",
 		note=(
-			"Only for meetings created outside a calendar event, and for resolving a join "
-			"URL back to a meeting. Tenants commonly refuse this one; leave it off unless "
-			"something asks for it."
+			"Only for meetings created outside a calendar event. Tenants commonly refuse this "
+			"one; leave it off unless something asks for it. Transcripts do not need it."
 		),
 	),
 	Capability(
@@ -81,14 +89,15 @@ CAPABILITIES = (
 		field="use_transcripts",
 		label="Meeting transcripts and recordings",
 		access=DELEGATED,
-		graph_scopes=("OnlineMeetingTranscript.Read.All", "OnlineMeetingRecording.Read.All"),
+		graph_scopes=(MEETINGS_READ, "OnlineMeetingTranscript.Read.All", "OnlineMeetingRecording.Read.All"),
 		azure_type="Microsoft Graph, Delegated",
 		note=(
-			"Transcripts are reached through the meeting behind a join URL, so this builds on "
-			"standalone Teams meetings. The meeting must also be calendar-associated and not "
-			"expired, or Graph returns nothing."
+			"Transcripts are reached through the meeting behind a join URL, and looking that "
+			"meeting up needs OnlineMeetings.Read. A site that already granted "
+			"OnlineMeetings.ReadWrite keeps asking for that instead, so nobody is asked to "
+			"consent again. The meeting must also be calendar-associated and not expired, or "
+			"Graph returns nothing."
 		),
-		requires=("teams",),
 	),
 	Capability(
 		id="mail",

@@ -119,9 +119,10 @@ def _graph_azure_permissions(field):
 	Taken from the same derivation get_scopes uses, so the Set Up dialog can never advertise a
 	permission the sign-in will not request — the mismatch that had admins granting Teams
 	permissions for a calendar-only setup. offline_access is appended because it is requested
-	on every sign-in and has to be consented like any other.
+	on every sign-in and has to be consented like any other. What the site was already granted
+	is passed on too, so a site that kept OnlineMeetings.ReadWrite is shown that, not Read.
 	"""
-	return [*graph.derive_scopes({field: 1}), OFFLINE_ACCESS]
+	return [*graph.derive_scopes({field: 1}, graph.granted_scopes()), OFFLINE_ACCESS]
 
 
 def capabilities():

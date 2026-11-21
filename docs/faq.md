@@ -189,7 +189,11 @@ Azure and what sign-in requests cannot drift apart.
 | --- | --- |
 | Outlook calendar (covers Teams meetings on an Event, and RSVP) | `User.Read` `Calendars.ReadWrite` |
 | Standalone Teams meetings | `User.Read` `OnlineMeetings.ReadWrite` |
-| Meeting transcripts and recordings | the row above, **plus** `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+| Meeting transcripts and recordings | `User.Read` `OnlineMeetings.Read` `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+
+A site set up before 1.2.0, when transcripts were built on standalone meetings, was granted
+`OnlineMeetings.ReadWrite` and keeps requesting it instead of `OnlineMeetings.Read`, so nobody is
+asked to consent again. **Run Diagnostics** says which of the two this site uses.
 
 `offline_access`, `openid` and `profile` are requested automatically at sign-in, but
 `offline_access` still has to be **granted** in Azure like any other permission — without it
@@ -202,7 +206,7 @@ Mail and sign-in are not Graph permissions; their lists are in
 Because Microsoft consents to them separately, and tenants routinely grant one and refuse
 another. `OnlineMeetingTranscript.Read.All` reads a transcript you can already address by
 meeting id — but you start from a join URL, and turning that into a meeting id is
-`OnlineMeetings.ReadWrite`. Reading the video is a third permission again. That split is why a
+`OnlineMeetings.Read`. Reading the video is a third permission again. That split is why a
 calendar-only setup never has to ask for any of them.
 
 ## Do I need to be a Global Administrator?
