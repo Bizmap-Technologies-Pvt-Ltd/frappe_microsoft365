@@ -46,6 +46,8 @@ All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.
 """
 
+import hashlib
+import json
 import time
 
 import frappe
@@ -1184,9 +1186,14 @@ def _upsert_event(doc, ev, existing_map=None):
 	if existing and event.get("custom_microsoft_orphaned"):
 		# Outlook has just said something about it, so it is not missing after all.
 		values["custom_microsoft_orphaned"] = 0
+	# Read before the save moves it: an Event edited in Frappe since the last sync has changes
+	# of its own still to send.
+	edited_locally = locally_originated and _edited_since(event, doc.last_sync)
 	changed = _apply(event, values)
 	if not existing:
 		changed = True
+	if locally_originated:
+		_record_what_outlook_has(event, edited_locally, changed)
 	if not changed:
 		# Nothing moved. Saving anyway would bump `modified` and make the push step
 		# re-patch this event on the next run, forever.
@@ -1205,6 +1212,35 @@ def _upsert_event(doc, ev, existing_map=None):
 		existing_map[ms_id] = event.name
 	_give_it_to_its_owner(event.name, doc.user)
 	return "created"
+
+
+def _edited_since(event, last_sync):
+	"""True when the Event may hold Frappe edits that have not been pushed yet."""
+	if not last_sync or not event.modified:
+		return True
+	return get_datetime(event.modified) > get_datetime(last_sync)
+
+
+def _record_what_outlook_has(event, edited_locally, changed):
+	"""Bring a Frappe-originated Event's sync state up to what the pull has just read.
+
+	The properties the pull wrote are, by definition, what Outlook has, so they are not Frappe
+	changes for the push to send back — even though the save that wrote them moves `modified`
+	past the last sync. An Event with no state yet (from before 1.2.0) gets one here, but only
+	when nothing was edited in Frappe since the last sync; otherwise it is sent in full once,
+	as before, so those edits are not lost.
+	"""
+	state = _stored_sync_state(event)
+	if state is None and edited_locally:
+		return
+	if state is not None and not changed:
+		return
+	current = _sync_state_of(_event_to_graph_body(event))
+	if state is None:
+		state = current
+	else:
+		state.update({key: current[key] for key in PULLED_STATE_KEYS})
+	_write_sync_state(event.name, state, event)
 
 
 def _give_it_to_its_owner(event_name, user):
@@ -1350,20 +1386,164 @@ def _create_in_graph(calendar_name, event_name, live_doc=None):
 		return False
 
 	event = live_doc if live_doc is not None else frappe.get_doc("Event", event_name)
-	created = _create_graph_event(calendar_name, event)
-	return _store_graph_response(event_name, created, calendar_name, live_doc=live_doc)
+	body = _event_to_graph_body(event)
+	created = graph.graph_request("POST", "/me/events", calendar_name, json=body)
+	if not _store_graph_response(event_name, created, calendar_name, live_doc=live_doc):
+		return False
+	_write_sync_state(event_name, _sync_state_of(body), live_doc)
+	return True
 
 
 def _patch_in_graph(calendar_name, event):
-	"""Send a Frappe Event that already exists in Microsoft to Graph. Returns True when sent."""
+	"""Send Graph what changed in a Frappe Event since Outlook last saw it. True when sent.
+
+	Only the properties that differ from the Event's sync state go out. Sending the whole Event
+	every time — Frappe's participants as the complete attendee list, Frappe's description as
+	the body — undid whatever had been changed in Outlook, on every edit and even on a save the
+	pull itself made because somebody replied to the invitation.
+	"""
+	state = _stored_sync_state(event)
+	full = _event_to_graph_body(event)
+	current = _sync_state_of(full)
+	body = _changed_properties(full, current, state or {})
+
+	if "attendees" in body:
+		merged = _merged_attendees(calendar_name, event.custom_microsoft_event_id, full, state)
+		if merged is None:
+			body.pop("attendees")
+		else:
+			body["attendees"] = merged
+
+	if not body:
+		if state is None:
+			# Nothing differs from what Outlook has, so this is what Outlook has.
+			_write_sync_state(event.name, current, event)
+		return False
+
 	patched = graph.graph_request(
 		"PATCH",
 		f"/me/events/{event.custom_microsoft_event_id}",
 		calendar_name,
-		json=_event_to_graph_body(event),
+		json=body,
 	)
 	_store_graph_response(event.name, patched or {}, calendar_name)
+	_write_sync_state(event.name, current, event)
 	return True
+
+
+# --- what Outlook last saw (sync state) ---------------------------------------------------
+#
+# A push can only send "what changed" if it knows what Outlook already has. The sync state is
+# that knowledge: per property a fingerprint of the value last sent to Outlook or last read from
+# it, and for attendees the addresses themselves, because merging needs to know who Frappe
+# removed. Written by every create, patch and pull; an Event from before 1.2.0 has none until
+# its first sync, and is then sent in full one last time.
+
+#: The properties the push writes, in the form _sync_state_of keys them.
+SYNC_STATE_KEYS = ("subject", "body", "start", "end", "isAllDay", "location", "recurrence", "attendees")
+
+#: What the pull writes onto an Event that originated in Frappe, as sync-state keys: these come
+#: from Outlook, so after a pull they are what Outlook has and are not Frappe's changes to send.
+PULLED_STATE_KEYS = ("subject", "start", "end", "isAllDay", "location")
+
+
+def _fingerprint(value):
+	if value is None:
+		return None
+	return hashlib.sha1(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _attendee_address(attendee):
+	return ((attendee.get("emailAddress") or {}).get("address") or "").strip().lower()
+
+
+def _sync_state_of(body):
+	"""The sync state of a full Graph body, as _event_to_graph_body builds it."""
+	state = {key: _fingerprint(body.get(key)) for key in ("subject", "body", "start", "end", "location", "recurrence")}
+	state["isAllDay"] = bool(body.get("isAllDay"))
+	state["attendees"] = sorted({_attendee_address(a) for a in body.get("attendees") or []} - {""})
+	return state
+
+
+def _stored_sync_state(event):
+	"""The Event's sync state, or None when it has none (or the field is not migrated yet)."""
+	raw = event.get("custom_microsoft_sync_state")
+	if not raw:
+		return None
+	try:
+		state = json.loads(raw)
+	except ValueError:
+		return None
+	return state if isinstance(state, dict) else None
+
+
+def _write_sync_state(event_name, state, live_doc=None):
+	if not _has_event_field("custom_microsoft_sync_state"):
+		return
+	raw = json.dumps(state, sort_keys=True)
+	frappe.db.set_value("Event", event_name, "custom_microsoft_sync_state", raw, update_modified=False)
+	if live_doc is not None:
+		live_doc.set("custom_microsoft_sync_state", raw)
+
+
+def _changed_properties(full, current, state):
+	"""The part of ``full`` that differs from ``state``: what a PATCH has to send.
+
+	A key missing from ``state`` counts as changed, so an Event with no sync state at all is
+	sent in full — except attendees, which are always merged, never replaced (_merged_attendees).
+	"""
+	body = {}
+	for key in ("subject", "body"):
+		if current[key] != state.get(key, "?"):
+			body[key] = full[key]
+	# Start, end and all-day travel together: Graph checks them against each other, and moving
+	# a start past the old end on its own would be refused.
+	if any(current[key] != state.get(key, "?") for key in ("start", "end", "isAllDay")):
+		body["start"], body["end"] = full["start"], full["end"]
+		body["isAllDay"] = current["isAllDay"]
+	if current["location"] != state.get("location", "?"):
+		body["location"] = full.get("location") or {"displayName": ""}
+	# Re-sending a recurrence can reset the exceptions made to single occurrences in Outlook, so
+	# it goes only when the series itself changed. Turning a series back into a one-off is not
+	# something Graph does with a PATCH, so a removed recurrence is not sent at all.
+	if current["recurrence"] != state.get("recurrence", "?") and full.get("recurrence"):
+		body["recurrence"] = full["recurrence"]
+	if current["attendees"] != state.get("attendees"):
+		body["attendees"] = full.get("attendees") or []
+	if full.get("isOnlineMeeting"):
+		body["isOnlineMeeting"] = full["isOnlineMeeting"]
+		body["onlineMeetingProvider"] = full["onlineMeetingProvider"]
+	return body
+
+
+def _merged_attendees(calendar_name, ms_id, full, state):
+	"""Outlook's attendees with Frappe's additions and removals applied, or None for no change.
+
+	Graph replaces the whole attendee list on a PATCH, so sending Frappe's participants removed
+	everybody who had been invited from Outlook. The list is read from Outlook first; Frappe then
+	adds whom it added and removes only whom it removed — relative to the sync state. With no
+	state there is no knowing whom Frappe removed, so nobody is.
+	"""
+	wanted = full.get("attendees") or []
+	wanted_addresses = {_attendee_address(a) for a in wanted}
+	removed = set((state or {}).get("attendees") or []) - wanted_addresses
+
+	current = graph.graph_request("GET", f"/me/events/{ms_id}?$select=attendees", calendar_name) or {}
+	in_outlook = current.get("attendees") or []
+
+	merged = []
+	seen = set()
+	for attendee in in_outlook:
+		address = _attendee_address(attendee)
+		if not address or address in removed or address in seen:
+			continue
+		seen.add(address)
+		# Only what may be written back: the response status belongs to the attendee.
+		merged.append({"emailAddress": attendee.get("emailAddress"), "type": attendee.get("type") or "required"})
+	added = [a for a in wanted if _attendee_address(a) not in seen]
+	if not added and len(merged) == len([a for a in in_outlook if _attendee_address(a)]):
+		return None
+	return merged + added
 
 
 def _email_fields(doctype):
@@ -1655,12 +1835,6 @@ def _undo_orphaned_graph_event(calendar_name, ms_id, event_name):
 		frappe.log_error(title=f"MS orphaned event could not be removed: {event_name}")
 
 
-def _create_graph_event(calendar_name, event):
-	return graph.graph_request(
-		"POST", "/me/events", calendar_name, json=_event_to_graph_body(event)
-	)
-
-
 # --- whose calendar is it? -------------------------------------------------------------
 
 def _calendar_user(calendar_name):
@@ -1824,6 +1998,7 @@ def event_on_update(doc, method=None):
 			return
 
 		if doc.custom_microsoft_event_id:
+			_remember_state_before_this_edit(doc, cal)
 			_queue_or_do_it_after_commit(
 				"frappe_microsoft365.microsoft_calendar_sync.patch_event_in_graph",
 				queue="short",
@@ -1848,6 +2023,21 @@ def event_on_update(doc, method=None):
 			)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
+
+
+def _remember_state_before_this_edit(doc, cal):
+	"""Give an Event from before 1.2.0 a sync state from how it stood before this save.
+
+	Without one, the queued patch would send the whole Event and overwrite whatever had been
+	changed in Outlook; with it, only this edit goes out. Taken from before the save only when
+	that version had itself been synced, so earlier unsent edits still go out with this one.
+	"""
+	if _stored_sync_state(doc) is not None or not _has_event_field("custom_microsoft_sync_state"):
+		return
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before or _edited_since(before, cal.last_sync):
+		return
+	_write_sync_state(doc.name, _sync_state_of(_event_to_graph_body(before)), doc)
 
 
 def _wants_new_teams_meeting(doc):

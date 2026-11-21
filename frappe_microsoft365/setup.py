@@ -290,6 +290,19 @@ def create_event_custom_fields(only_definitions=False):
 				),
 			},
 			{
+				# What Outlook was last sent, or last showed, for each property the push writes —
+				# fingerprints, plus the attendee addresses. A push sends only what differs from
+				# it, so an attendee or an agenda changed in Outlook is not overwritten by an
+				# unrelated edit in Frappe. Long Text: nothing queries it.
+				"fieldname": "custom_microsoft_sync_state",
+				"fieldtype": "Long Text",
+				"label": "Microsoft Sync State",
+				"insert_after": "custom_microsoft_seen_in_round",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+			{
 				# When this mirror was last seen in a full read of its calendar's window: the key of
 				# that read. A full read that ends without having seen a mirror is how one Outlook
 				# deleted while nobody was looking (a resync, a window reset) is told apart.

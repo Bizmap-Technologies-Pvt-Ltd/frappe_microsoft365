@@ -20,6 +20,7 @@ from frappe_microsoft365.tests.test_calendar_sync import (
 	CALENDAR,
 	HEALTHY_QUEUE,
 	SyncTestCase,
+	_ensure_user,
 	ms_attendee,
 	ms_event,
 )
@@ -500,3 +501,134 @@ class TestOneEventOneMeeting(GraphTestCase):
 			frappe.db.commit()
 
 		self.assertEqual([c[0] for c in fake.calls], ["POST"])
+
+
+# --- B2: a push sends what changed in Frappe, and only that ---------------------------------
+
+
+class TestOutlookEditsSurviveAPush(GraphTestCase):
+	ID = "AAMk-b2"
+
+	def setUp(self):
+		super().setUp()
+		self.xavier = _ensure_user("m365-b2-xavier@example.com")
+		self.fake = FakeGraph(
+			{
+				("POST", f"{GRAPH}/me/events"): {"id": self.ID},
+				("PATCH", f"{GRAPH}/me/events/{self.ID}"): {"id": self.ID},
+				("GET", f"{GRAPH}/me/events/{self.ID}?$select=attendees"): {
+					"attendees": [
+						ms_attendee("Xavier", self.xavier, "accepted"),
+						ms_attendee("Yusuf (added in Outlook)", "yusuf@partner.example"),
+					]
+				},
+			}
+		)
+		# Created by the push, the way every Frappe event reaches Outlook.
+		self.event = self._quiet_event(
+			subject="Design review",
+			description="<p>Frappe agenda</p>",
+			event_participants=[{"reference_doctype": "User", "reference_docname": self.xavier}],
+		)
+		with self._network(self.fake), patch.object(frappe.db, "commit"):
+			sync._push(self.calendar)
+		self.assertEqual(frappe.db.get_value("Event", self.event.name, "custom_microsoft_event_id"), self.ID)
+		self.fake.calls.clear()
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), seconds=1))
+		self.calendar.reload()
+
+	def _pulled_reply(self):
+		"""Outlook's copy: Yusuf added, the agenda rewritten, and Xavier has accepted."""
+		return ms_event(
+			self.ID,
+			subject="Design review",
+			preview="Agenda rewritten in Outlook",
+			start={"dateTime": "2026-09-15T09:00:00.0000000", "timeZone": "UTC"},
+			end={"dateTime": "2026-09-15T09:30:00.0000000", "timeZone": "UTC"},
+			location={"displayName": ""},
+			attendees=[
+				ms_attendee("Xavier", self.xavier, "accepted"),
+				ms_attendee("Yusuf (added in Outlook)", "yusuf@partner.example"),
+			],
+		)
+
+	def _edit(self, **values):
+		event = frappe.get_doc("Event", self.event.name)
+		event.update(values)
+		with patch.object(frappe, "enqueue"):
+			event.save()
+		with self._network(self.fake):
+			sync.patch_event_in_graph(self.event.name)
+
+	def test_an_attendee_reply_pulled_from_outlook_does_not_cause_a_patch(self):
+		"""Regression (#19): the pull saved the reply, and the same run's push sent Frappe's
+		participants and description back over Outlook's."""
+		# Synced a minute ago, untouched in Frappe since: only the pull's own save moves it.
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), minutes=-1))
+		self.calendar.reload()
+		frappe.db.set_value(
+			"Event",
+			self.event.name,
+			{
+				"starts_on": "2026-09-15 09:00:00",
+				"ends_on": "2026-09-15 09:30:00",
+				"location": "",
+				"modified": add_to_date(now_datetime(), minutes=-2),
+			},
+			update_modified=False,
+		)
+		with patch.object(sync, "get_system_timezone", return_value="UTC"):
+			self._pull_with([self._pulled_reply()])
+			self.assertGreater(
+				get_datetime(frappe.db.get_value("Event", self.event.name, "modified")),
+				get_datetime(self.calendar.last_sync),
+				"the pull's save makes the Event a push candidate",
+			)
+			self.assertIn("accepted", frappe.db.get_value("Event", self.event.name, "custom_microsoft_attendees"))
+			with self._network(self.fake), patch.object(frappe.db, "commit"):
+				sync._push(self.calendar)
+
+		self.assertEqual(self.fake.calls, [])
+
+	def test_an_attendee_added_in_outlook_survives_a_title_edit_in_frappe(self):
+		self._edit(subject="Design review (moved to Thursday)")
+
+		(method, url, body), = self.fake.calls
+		self.assertEqual((method, url), ("PATCH", f"{GRAPH}/me/events/{self.ID}"))
+		self.assertEqual(body, {"subject": "Design review (moved to Thursday)"})
+
+	def test_a_participant_added_in_frappe_is_merged_into_outlooks_list(self):
+		zara = _ensure_user("m365-b2-zara@example.com")
+		event = frappe.get_doc("Event", self.event.name)
+		event.append("event_participants", {"reference_doctype": "User", "reference_docname": zara})
+		with patch.object(frappe, "enqueue"):
+			event.save()
+		with self._network(self.fake):
+			sync.patch_event_in_graph(self.event.name)
+
+		self.assertEqual([c[0] for c in self.fake.calls], ["GET", "PATCH"])
+		body = self.fake.calls[1][2]
+		self.assertEqual(sorted(body), ["attendees"])
+		self.assertEqual(
+			[a["emailAddress"]["address"] for a in body["attendees"]],
+			[self.xavier, "yusuf@partner.example", zara],
+		)
+
+	def test_a_participant_removed_in_frappe_is_the_only_one_removed(self):
+		event = frappe.get_doc("Event", self.event.name)
+		event.event_participants = []
+		with patch.object(frappe, "enqueue"):
+			event.save()
+		with self._network(self.fake):
+			sync.patch_event_in_graph(self.event.name)
+
+		body = self.fake.of("PATCH")[0][2]
+		self.assertEqual([a["emailAddress"]["address"] for a in body["attendees"]], ["yusuf@partner.example"])
+
+	def test_an_event_from_before_the_fix_gets_its_state_from_the_version_before_the_edit(self):
+		frappe.db.set_value("Event", self.event.name, "custom_microsoft_sync_state", None, update_modified=False)
+		frappe.db.set_value("Event", self.event.name, "modified", add_to_date(now_datetime(), hours=-1), update_modified=False)
+
+		self._edit(subject="Renamed")
+
+		self.assertEqual(self.fake.of("PATCH")[0][2], {"subject": "Renamed"})
