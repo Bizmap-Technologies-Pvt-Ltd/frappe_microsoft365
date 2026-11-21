@@ -757,22 +757,54 @@ class TestOurSeriesFollowsOutlook(GraphTestCase):
 		self.assertEqual((mirror.subject, mirror.custom_pulled_from_microsoft), ("Standup (moved)", 1))
 		self.assertEqual(mirror.custom_microsoft_series_master_id, self.MASTER)
 
-	def test_deleting_an_app_created_series_in_outlook_removes_the_frappe_event(self):
-		"""Regression (#23): only the occurrences arrive as @removed, so nothing matched."""
+	def _series_deleted_in_outlook(self):
 		self._pull([self._occurrence("occ-1"), self._occurrence("occ-2", kind="exception")])
 		removals = [{"id": f"occ-{n}", "@removed": {"reason": "deleted"}} for n in (1, 2, 3)]
+		return self._pull(removals, master_status=404)
 
-		(_upserted, removed), fake = self._pull(removals, master_status=404)
+	def _orphaned(self):
+		return frappe.db.get_value("Event", self.series.name, "custom_microsoft_orphaned")
+
+	def test_a_series_deleted_in_outlook_is_flagged_not_deleted(self):
+		"""Regression (#23): only the occurrences arrive as @removed, so nothing matched. A 404
+		on the master is flagged rather than acted on: it is also what every old series answers
+		after the connection is re-authorised as a different Microsoft account."""
+		(_upserted, removed), fake = self._series_deleted_in_outlook()
 
 		self.assertIn(("GET", f"{GRAPH}/me/events/{self.MASTER}?$select=id", None), fake.calls)
+		self.assertTrue(frappe.db.exists("Event", self.series.name))
+		self.assertEqual(self._orphaned(), 1)
+		self.assertIsNone(self._event_for("occ-2"), "the occurrence's own @removed still applies")
+		self.assertEqual(removed, 1)
+		self.assertTrue(self.calendar.flags.orphans_flagged)
+
+		findings = [f for f in sync.upgrade_check_orphaned_events() if f.get("target") == CALENDAR]
+		self.assertEqual(len(findings), 1)
+		self.assertIn(self.series.name, findings[0]["detail"])
+		self.assertIn(self.series.name, sync.orphaned_event_findings()[0]["detail"])
+
+	def test_with_the_setting_on_a_series_deleted_in_outlook_is_deleted(self):
+		frappe.db.set_single_value("Microsoft Settings", "delete_orphaned_calendar_events", 1)
+		self.addCleanup(
+			frappe.db.set_single_value, "Microsoft Settings", "delete_orphaned_calendar_events", 0
+		)
+
+		(_upserted, removed), _fake = self._series_deleted_in_outlook()
+
 		self.assertFalse(frappe.db.exists("Event", self.series.name))
-		self.assertIsNone(self._event_for("occ-2"))
 		self.assertEqual(removed, 2)
 
 	def test_a_series_that_still_exists_is_kept(self):
 		self._pull([self._occurrence("occ-1")])
 		self._pull([{"id": "occ-1", "@removed": {"reason": "deleted"}}], master_status=200)
 		self.assertTrue(frappe.db.exists("Event", self.series.name))
+		self.assertEqual(self._orphaned(), 0)
+
+	def test_a_flagged_series_whose_master_answers_again_is_unflagged(self):
+		self._series_deleted_in_outlook()
+		self.assertEqual(self._orphaned(), 1)
+		self._pull([{"id": "occ-4", "@removed": {"reason": "deleted"}}], master_status=200)
+		self.assertEqual(self._orphaned(), 0)
 
 	def test_an_unconfirmed_series_is_never_deleted(self):
 		_result, fake = self._pull([{"id": "occ-9", "@removed": {"reason": "deleted"}}], master_status=404)

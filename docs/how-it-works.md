@@ -34,7 +34,8 @@ days you tick), monthly, quarterly, half-yearly or yearly, ending on **Repeat Ti
 The occurrences Microsoft generates from it are not mirrored back as separate Events: the
 repeating Event already represents them, exactly as one Graph series master represents its own.
 An occurrence changed on its own in Outlook (moved or renamed) is mirrored beside the repeating
-Event, and deleting the whole series in Outlook deletes the repeating Event. The recurrence is
+Event; when the whole series is deleted in Outlook, the repeating Event is marked **Missing From
+Outlook** (and deleted only if Microsoft Settings says to, see below). The recurrence is
 only sent again when it changes in Frappe. A frequency this app cannot map is sent as a single
 event rather than as a wrong series.
 
@@ -81,7 +82,8 @@ Worth knowing before you trust it with a real calendar:
   always pulled.
 - **Events deleted in Outlook during a resync.** A renewal first reads the old delta link for
   its deletions. After any full read of the window, an Event pulled from Outlook that the read
-  did not return is marked **Missing From Outlook** and listed by **Run Diagnostics**; it is
+  did not return is marked **Missing From Outlook** and listed by **Run Diagnostics**, as is a
+  repeating Event pushed from Frappe whose Outlook series is gone; either is
   deleted only if **Delete events missing from Outlook** is ticked in Microsoft Settings (off by
   default, because other records may link to those Events).
 - **Moving an Event to another Microsoft Calendar** deletes it from the old mailbox and creates

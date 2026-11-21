@@ -285,8 +285,8 @@ def create_event_custom_fields(only_definitions=False):
 				"no_copy": 1,
 				"depends_on": "eval:doc.custom_microsoft_orphaned",
 				"description": (
-					"A full read of the Outlook calendar no longer found this event. It was probably "
-					"deleted there; check, then delete it here if it is no longer needed."
+					"Outlook no longer has this event (or, for a repeating event, its series). It was "
+					"probably deleted there; check, then delete it here if it is no longer needed."
 				),
 			},
 			{

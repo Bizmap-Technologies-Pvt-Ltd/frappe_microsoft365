@@ -574,7 +574,7 @@ def _sync_locked(doc):
 	summary = f"Pulled {pulled}, deleted {deleted}, pushed {pushed}."
 	if doc.flags.orphans_flagged:
 		summary += " " + _(
-			"{0} events pulled from this calendar are no longer in Outlook and were marked Missing "
+			"{0} events synced with this calendar are no longer in Outlook and were marked Missing "
 			"From Outlook; Microsoft Settings > Troubleshoot > Run Diagnostics lists them."
 		).format(doc.flags.orphans_flagged)
 	if doc.flags.pull_unfinished:
@@ -936,7 +936,7 @@ def _settle_unseen_mirrors(doc, round_key):
 		{"names": tuple(names)},
 	)
 	if not _delete_orphans():
-		doc.flags.orphans_flagged = len(names)
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(names)
 		return 0
 
 	deleted = 0
@@ -956,7 +956,7 @@ def _settle_unseen_mirrors(doc, round_key):
 	finally:
 		frappe.flags.in_microsoft_sync = False
 	if deleted < len(names):
-		doc.flags.orphans_flagged = len(names) - deleted
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(names) - deleted
 	return deleted
 
 
@@ -1335,7 +1335,8 @@ def _is_ours(series_master_id):
 # whose custom_microsoft_event_id is that master's id, and custom_microsoft_series_master_id
 # records that Graph has confirmed it is one: set when the create returns a series master, or
 # filled in lazily the first time the pull sees one of its occurrences (series pushed before
-# 1.2.0). Only a confirmed master is ever checked, and so only one can ever be deleted here.
+# 1.2.0). Only a confirmed master is ever checked, and one Outlook no longer has is flagged
+# Missing From Outlook rather than deleted (see _settle_our_series).
 
 #: How many series one run asks Graph about. Each is a GET; a calendar with more confirmed
 #: series than this checks the rest on later runs that bring removals too.
@@ -1364,11 +1365,16 @@ def _note_series_change(doc, series_id, unknown=False):
 
 
 def _settle_our_series(doc):
-	"""Delete the Frappe series whose master Outlook no longer has. Returns how many.
+	"""Flag the Frappe series whose master Outlook no longer has. Returns how many were deleted.
 
 	Asked only when this pull brought a removal that may have been one of their occurrences. A
-	GET of the master answering 404 means the series was deleted in Outlook; anything else
-	(throttling, an outage) leaves it as it is for another run.
+	GET of the master answering 404 most likely means the series was deleted in Outlook — but
+	it is also what every old series answers once the connection has been re-authorised as a
+	different Microsoft account, so it is not proof enough to delete somebody's Events. Such a
+	series is marked Missing From Outlook, like a mirror a full read did not find, and listed by
+	Run Diagnostics; it is deleted (with its mirrored occurrences) only when the admin has ticked
+	Delete events missing from Outlook. A master that answers again clears the mark; anything
+	else (throttling, an outage) leaves it as it is for another run.
 	"""
 	if not _has_event_field("custom_microsoft_series_master_id"):
 		return 0
@@ -1390,8 +1396,9 @@ def _settle_our_series(doc):
 		)
 	doc.flags.series_to_check = None
 	doc.flags.unknown_removals = False
+	can_flag = _has_event_field("custom_microsoft_orphaned")
 
-	removed = 0
+	missing = []
 	for master in sorted(masters)[:SERIES_CHECKS_PER_RUN]:
 		name = frappe.db.get_value(
 			"Event",
@@ -1407,25 +1414,46 @@ def _settle_our_series(doc):
 			continue
 		try:
 			graph.graph_request("GET", f"/me/events/{master}?$select=id", doc.name)
+			if can_flag:
+				frappe.db.set_value("Event", name, "custom_microsoft_orphaned", 0, update_modified=False)
 			continue
 		except MsGraphNotFound:
-			pass
+			missing.append((name, master))
 		except MsGraphError:
 			continue
 
-		frappe.flags.in_microsoft_sync = True
-		try:
-			for exception in frappe.get_all(
-				"Event",
-				filters={"custom_microsoft_series_master_id": master, "custom_pulled_from_microsoft": 1},
-				pluck="name",
-			):
-				frappe.delete_doc("Event", exception, ignore_permissions=True, force=True)
-			frappe.delete_doc("Event", name, ignore_permissions=True, force=True)
-			removed += 1
-		finally:
-			frappe.flags.in_microsoft_sync = False
-	return removed
+	if not missing or not can_flag:
+		return 0
+	for name, _master in missing:
+		frappe.db.set_value("Event", name, "custom_microsoft_orphaned", 1, update_modified=False)
+	if not _delete_orphans():
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(missing)
+		return 0
+
+	deleted = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for name, master in missing:
+			frappe.db.savepoint("m365_orphan_series")
+			try:
+				for exception in frappe.get_all(
+					"Event",
+					filters={"custom_microsoft_series_master_id": master, "custom_pulled_from_microsoft": 1},
+					pluck="name",
+				):
+					frappe.delete_doc("Event", exception, ignore_permissions=True, force=True)
+				# Not forced, as for any Event missing from Outlook: one another record links to
+				# stays, flagged.
+				frappe.delete_doc("Event", name, ignore_permissions=True)
+				deleted += 1
+			except Exception:
+				frappe.db.rollback(save_point="m365_orphan_series")
+				frappe.log_error(title=f"MS Calendar: series missing from Outlook could not be deleted: {name}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	if deleted < len(missing):
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(missing) - deleted
+	return deleted
 
 
 def _apply(doc, values):
@@ -2521,7 +2549,10 @@ def upgrade_check_event_owners():
 
 
 def orphaned_event_findings(check="calendar.orphaned_events"):
-	"""Doctor findings: Events pulled from Outlook that a full read no longer found, per calendar.
+	"""Doctor findings: Events flagged Missing From Outlook, per calendar.
+
+	Mirrors a full read no longer found (_settle_unseen_mirrors) and series pushed from Frappe
+	whose master Outlook answers 404 for (_settle_our_series).
 
 	Read-only. The sync only flags these (see _settle_unseen_mirrors); this is where an admin
 	finds them, decides, and learns about the setting that deletes them instead.
@@ -2552,11 +2583,13 @@ def orphaned_event_findings(check="calendar.orphaned_events"):
 			doctor.finding(
 				check,
 				doctor.WARN,
-				_("{0} events pulled from Microsoft Calendar {1} are no longer in Outlook").format(len(events), calendar),
+				_("{0} events synced with Microsoft Calendar {1} are no longer in Outlook").format(len(events), calendar),
 				_(
-					"A full read of the Outlook calendar did not find these, so they were most likely "
-					"deleted there while the sync was resetting: {0}. They are marked Missing From "
-					"Outlook and were not deleted, because other records may link to them."
+					"Outlook no longer has these: a full read of the calendar did not find them, or, for a "
+					"repeating event, Outlook no longer knows its series. They were most likely deleted "
+					"there: {0}. They are marked Missing From Outlook and were not deleted, because other "
+					"records may link to them — and because a connection re-authorised as a different "
+					"Microsoft account sees none of the old account's events."
 				).format(sample),
 				_(
 					"Check them in Outlook and delete the ones that are gone. To have the sync delete "
@@ -2569,7 +2602,7 @@ def orphaned_event_findings(check="calendar.orphaned_events"):
 
 
 def upgrade_check_orphaned_events():
-	"""Upgrade report: Events pulled from Outlook that are flagged Missing From Outlook.
+	"""Upgrade report: Events flagged Missing From Outlook.
 
 	Events only get flagged by a full read of their calendar, which the first sync after
 	upgrading to 1.2.0 does, so right after `bench migrate` this normally has nothing to say;
