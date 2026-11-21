@@ -8,6 +8,7 @@ See docs/graph-api-reference.md for the verified endpoint/permission contract.
 """
 
 import time
+from contextlib import contextmanager
 from http import cookiejar
 from urllib.parse import urlsplit
 
@@ -15,7 +16,7 @@ import frappe
 import requests
 from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
-from frappe.utils.password import get_decrypted_password
+from frappe.utils.password import get_decrypted_password, set_encrypted_password
 from requests.adapters import HTTPAdapter
 from requests.utils import requote_uri
 
@@ -65,6 +66,9 @@ CALLBACK_METHOD = (
 #: anything longer is left to the next scheduled run.
 MAX_RETRY_AFTER_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 2
+
+#: How long a worker waits for another worker's refresh of the same connection to finish.
+TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS = 30
 
 #: Safety valve for link-following loops (nextLink / deltaLink paging). For a delta it is a
 #: per-run budget, not a limit: the calendar sync stores where it stopped and carries on.
@@ -343,18 +347,39 @@ def clear_token_cache(calendar_name=None):
 		_token_cache().pop(calendar_name, None)
 
 
-def _store_tokens(calendar_name, result):
+def _store_tokens(calendar_name, result, commit=True):
+	"""Write freshly minted tokens onto the connection, without loading or saving the document.
+
+	A ``doc.save()`` here is what put ``TimestampMismatchError`` in production's Error Log: the
+	sync holds the calendar for a whole run, a refresh in another worker (an Event's patch job)
+	saved the row under it, and the next save from either side found ``modified`` moved. Tokens
+	are not an edit anybody made, so they are written column by column, ``modified`` is left
+	alone (a person with the form open can still save it), and the write is committed straight
+	away: the refresh token Microsoft just rotated has to outlive whatever the caller does next,
+	and the other worker waiting on the refresh lock has to be able to read it.
+
+	``commit=False`` is for the OAuth callback, which commits the tokens together with the rest
+	of what a sign-in changes.
+	"""
 	expiry = add_to_date(now_datetime(), seconds=(result.get("expires_in") or 3600) - 300)
-	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
-	doc.access_token = result.get("access_token")
-	if result.get("refresh_token"):
-		doc.refresh_token = result["refresh_token"]
-	doc.token_expiry = expiry
+	updates = {"token_expiry": expiry}
+	# Password fields: the secret goes to __Auth and the column gets the mask a save would give
+	# it. Leaving the column empty would be read by the next form save as "cleared" and delete
+	# the stored token.
+	for fieldname in ("access_token", "refresh_token"):
+		value = result.get(fieldname)
+		if value:
+			set_encrypted_password("Microsoft Calendar", calendar_name, value, fieldname)
+			updates[fieldname] = "*" * len(value)
 	claims = result.get("id_token_claims") or {}
-	if claims.get("preferred_username") and not doc.microsoft_user_email:
-		doc.microsoft_user_email = claims.get("preferred_username")
-	doc.flags.ignore_permissions = True
-	doc.save()
+	if claims.get("preferred_username") and not frappe.db.get_value(
+		"Microsoft Calendar", calendar_name, "microsoft_user_email"
+	):
+		updates["microsoft_user_email"] = claims.get("preferred_username")
+	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
+	frappe.clear_document_cache("Microsoft Calendar", calendar_name)
+	if commit:
+		frappe.db.commit()  # nosemgrep
 
 	# Whatever the rest of the request does next has to use the token that was just minted; the
 	# cache still holds the one this refresh replaced.
@@ -363,7 +388,17 @@ def _store_tokens(calendar_name, result):
 		_cache_token(calendar_name, token, expiry)
 	else:
 		clear_token_cache(calendar_name)
-	return doc
+	return expiry
+
+
+def _stored_token(name):
+	"""``(access_token, expiry, row)`` as stored now. Raises when the connection cannot be used."""
+	row = frappe.db.get_value("Microsoft Calendar", name, ["authorized", "token_expiry"], as_dict=True)
+	if not row:
+		frappe.throw(_("Microsoft Calendar {0} does not exist.").format(name), MsGraphError)
+	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
+	expiry = get_datetime(row.token_expiry) if row.token_expiry else None
+	return token, expiry, row
 
 
 def get_valid_access_token(calendar):
@@ -381,19 +416,71 @@ def get_valid_access_token(calendar):
 		if cached_expiry > add_to_date(now_datetime(), seconds=TOKEN_CACHE_LEEWAY_SECONDS):
 			return cached_token
 
-	doc = frappe.get_doc("Microsoft Calendar", name)
-	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
-	expiry = get_datetime(doc.token_expiry) if doc.token_expiry else None
+	token, expiry, _row = _stored_token(name)
 	if token and expiry and expiry > now_datetime():
 		_cache_token(name, token, expiry)
 		return token
-	# refresh
-	refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
-	if not refresh:
-		frappe.throw(f"Microsoft Calendar '{name}' is not authorized. Click Authorize.", MsGraphError)
-	result = refresh_tokens(refresh)
-	_store_tokens(name, result)
-	return result.get("access_token")
+	return _refresh_access_token(name)
+
+
+def _refresh_access_token(name):
+	"""Refresh one connection's tokens, once, however many workers want it at the same moment.
+
+	Two workers finding the same expired token used to both refresh it and both save the row:
+	the second save failed with TimestampMismatchError, and with refresh-token rotation the
+	first one's new refresh token could be overwritten by a staler answer. Now the refresh runs
+	under a per-connection lock, and the token is read again once the lock is held: when another
+	worker has refreshed meanwhile, its token is used and Microsoft is not asked twice.
+	"""
+	with _refresh_lock(name):
+		# The re-read has to see what the other worker committed. Inside a transaction that
+		# began before that commit, REPEATABLE READ keeps answering from the old snapshot, so the
+		# snapshot is ended first. A refresh is already a commit point (_store_tokens commits),
+		# so this moves it a few statements earlier rather than adding a new one.
+		frappe.db.commit()  # nosemgrep
+		token, expiry, _row = _stored_token(name)
+		if token and expiry and expiry > now_datetime():
+			_cache_token(name, token, expiry)
+			return token
+
+		refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
+		if not refresh:
+			frappe.throw(_("Microsoft Calendar '{0}' is not authorized. Click Authorize.").format(name), MsGraphError)
+		result = refresh_tokens(refresh)
+		_store_tokens(name, result)
+		return result.get("access_token")
+
+
+@contextmanager
+def _refresh_lock(name):
+	"""A per-connection lock in Redis, shared by every worker of this site on every server.
+
+	Redis rather than a row lock: a SELECT ... FOR UPDATE would be held until the caller's
+	transaction ends, which for a sync is the whole run — the very wait this is meant to end. If
+	the lock cannot be had (Redis down, or another refresh hung past the timeout) the refresh
+	goes ahead without it: two refreshes are wasteful, no refresh at all is an outage.
+	"""
+	lock = None
+	try:
+		cache = frappe.cache()
+		lock = cache.lock(
+			cache.make_key(f"microsoft365:token-refresh:{name}"),
+			timeout=TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS * 2,
+			blocking_timeout=TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS,
+		)
+		if not lock.acquire():
+			lock = None
+	except Exception:
+		lock = None
+	try:
+		yield
+	finally:
+		if lock is not None:
+			try:
+				lock.release()
+			except Exception:
+				# Expired under us (a refresh slower than the lock timeout); nothing to release.
+				pass
 
 
 # --- application (client credentials) tokens -------------------------------------------
