@@ -12,7 +12,13 @@ from unittest.mock import patch
 
 from frappe_microsoft365 import microsoft_graph as graph
 
-REASONS = {200: "OK", 403: "Forbidden", 404: "Not Found", 429: "Too Many Requests", 503: "Service Unavailable"}
+REASONS = {
+	200: "OK",
+	403: "Forbidden",
+	404: "Not Found",
+	429: "Too Many Requests",
+	503: "Service Unavailable",
+}
 
 
 class Response:
@@ -52,9 +58,10 @@ def fake_graph(router):
 		calls.append((method, url, kwargs))
 		return router(method, url, kwargs)
 
-	with patch.object(graph, "_http_request", side_effect=http_request), patch.object(
-		graph, "get_valid_access_token", return_value="token"
-	), patch.object(graph, "get_app_access_token", return_value="app-token"), patch(
-		"time.sleep"
+	with (
+		patch.object(graph, "_http_request", side_effect=http_request),
+		patch.object(graph, "get_valid_access_token", return_value="token"),
+		patch.object(graph, "get_app_access_token", return_value="app-token"),
+		patch("time.sleep"),
 	):
 		yield calls

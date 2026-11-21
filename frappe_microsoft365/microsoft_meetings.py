@@ -146,9 +146,7 @@ def _outlook_join_url(calendar_name, event_id):
 	it answers None rather than replacing the real question's answer with its own error.
 	"""
 	try:
-		event = graph.graph_request(
-			"GET", f"/me/events/{event_id}?$select=onlineMeeting", calendar_name
-		)
+		event = graph.graph_request("GET", f"/me/events/{event_id}?$select=onlineMeeting", calendar_name)
 	except graph.MsGraphNotFound:
 		return None
 	except graph.MsGraphError as e:
@@ -175,9 +173,7 @@ def _resolve_online_meeting_id(calendar_name, join_url, event_id=None):
 		outlook_url = _outlook_join_url(calendar_name, event_id)
 		if outlook_url and outlook_url != join_url:
 			candidates.append(outlook_url)
-			meeting_id = _first_meeting(
-				calendar_name, f"JoinWebUrl eq '{_filter_literal(outlook_url)}'"
-			)
+			meeting_id = _first_meeting(calendar_name, f"JoinWebUrl eq '{_filter_literal(outlook_url)}'")
 			if meeting_id:
 				return meeting_id
 
