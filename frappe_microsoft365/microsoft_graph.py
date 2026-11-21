@@ -17,6 +17,7 @@ from frappe import _
 from frappe.utils import add_to_date, get_datetime, get_url, now_datetime
 from frappe.utils.password import get_decrypted_password
 from requests.adapters import HTTPAdapter
+from requests.utils import requote_uri
 
 from frappe_microsoft365 import capabilities
 
@@ -575,9 +576,15 @@ def graph_url(path):
 	Graph returns. Everything else is refused, because the caller is about to attach a bearer
 	token, and a stored link that has been pointed somewhere else would hand that token to
 	whoever answers there.
+
+	The URL is percent-encoded first, exactly as requests does just before sending it: a query
+	written into the path ("$filter=JoinWebUrl eq '...'") has spaces, which go out as %20 and
+	must not be mistaken for the whitespace tricks is_graph_url refuses. Encoding does not change
+	the host, so a link pointed elsewhere is still refused.
 	"""
 	path = path or ""
 	url = f"{GRAPH_BASE}{path}" if path.startswith("/") and not path.startswith("//") else path
+	url = requote_uri(url)
 	if not is_graph_url(url):
 		frappe.throw(
 			_("Refusing to send a Microsoft token outside {0}: only Microsoft Graph over HTTPS is allowed.").format(

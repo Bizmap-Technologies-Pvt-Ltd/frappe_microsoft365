@@ -365,6 +365,31 @@ class TestTokensOnlyGoToGraph(BaseTestCase):
 				graph.graph_request("GET", path, "cal")
 				self.assertEqual(http.call_args[0][1], expected)
 
+	def test_a_query_written_into_the_path_is_encoded_not_refused(self):
+		"""Regression (1.1.1): the Teams join-link lookup has spaces in its $filter, and the
+		whitespace rule refused it, so no new meeting ever got its transcript."""
+		join = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0?context=%7b%7d"
+		with patch.object(graph, "get_valid_access_token", return_value="token"), patch.object(
+			graph, "_http_request", return_value=_response(200, {"value": []})
+		) as http:
+			graph.graph_request("GET", f"/me/onlineMeetings?$filter=JoinWebUrl eq '{join}'", "cal")
+		self.assertEqual(
+			http.call_args[0][1],
+			"https://graph.microsoft.com/v1.0/me/onlineMeetings?$filter=JoinWebUrl%20eq%20"
+			f"'{join}'",
+		)
+
+	def test_the_join_link_lookup_reaches_graph(self):
+		"""The lookup itself, mocked only at the network seam, so the URL guard runs."""
+		from frappe_microsoft365 import microsoft_meetings
+
+		join = "https://teams.microsoft.com/meet/123456789?p=abcDEF"
+		with patch.object(graph, "get_valid_access_token", return_value="token"), patch.object(
+			graph, "_http_request", return_value=_response(200, {"value": [{"id": "MSo1"}]})
+		) as http:
+			self.assertEqual(microsoft_meetings._resolve_online_meeting_id("cal", join), "MSo1")
+		self.assertIn("JoinWebUrl%20eq%20", http.call_args[0][1])
+
 	def test_a_stored_delta_link_off_graph_is_never_called(self):
 		"""The scenario end to end: a delta pull handed a link to somewhere else."""
 		with patch.object(graph, "get_valid_access_token", return_value="token"), patch.object(
