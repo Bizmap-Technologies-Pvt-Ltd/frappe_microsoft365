@@ -496,3 +496,98 @@ class TestTheJobDoesNotStarve(ScheduleTestCase):
 		self.assertEqual([r["id"] for r in json.loads(self._fields(event).recordings)], ["r1", "r2"])
 		# The transcript it already had was not downloaded again.
 		self.assertFalse([u for _m, u, _k in calls if u.endswith("/content")])
+
+
+class TestTranscriptsFromOtherOccurrences(ScheduleTestCase):
+	"""What 1.1.x attached to the wrong occurrence: reported on upgrade, removed only on request."""
+
+	def _mis_attached(self):
+		"""The 5 May stand-up as 1.1.x left it: its own transcript plus the next two weeks'."""
+		start = add_to_date(now_datetime(), days=-20).replace(hour=10, minute=0, second=0, microsecond=0)
+		event = self._finished_meeting(starts_on=start, ends_on=add_to_date(start, minutes=30))
+		for week in range(3):
+			day = utc(add_to_date(start, days=7 * week, minutes=20))[:10]
+			suffix = f"-part-{week + 1}"
+			artifacts._save_transcript(
+				f"teams-transcript-{day}{suffix}.vtt", f"WEBVTT\n\nweek {week}\n", event.name
+			)
+		return event, utc(add_to_date(start, minutes=20))[:10]
+
+	def test_the_upgrade_check_names_the_event_and_counts(self):
+		from frappe_microsoft365 import doctor
+
+		event, _own = self._mis_attached()
+
+		found = [f for f in artifacts.upgrade_check_misplaced_transcripts() if f["target"] == event.name]
+
+		self.assertEqual(len(found), 1)
+		self.assertEqual(found[0]["check"], "upgrade.transcripts_outside_occurrence")
+		self.assertEqual(found[0]["status"], doctor.WARN)
+		self.assertIn("2 of the 3", found[0]["title"])
+		self.assertIn("Remove Other Meetings' Transcripts", found[0]["fix"])
+
+	def test_the_upgrade_check_only_reads(self):
+		event, _own = self._mis_attached()
+
+		with patch.object(frappe, "delete_doc") as deleted, patch.object(frappe.db, "set_value") as written:
+			artifacts.upgrade_check_misplaced_transcripts()
+
+		deleted.assert_not_called()
+		written.assert_not_called()
+		self.assertEqual(len(self._files(event)), 3)
+
+	def test_an_event_with_only_its_own_transcript_is_not_reported(self):
+		event = self._meeting()
+		day = utc(get_datetime(event.starts_on))[:10]
+		artifacts._save_transcript(f"teams-transcript-{day}.vtt", "WEBVTT\n\nown\n", event.name)
+
+		self.assertFalse(
+			[f for f in artifacts.upgrade_check_misplaced_transcripts() if f["target"] == event.name]
+		)
+
+	def test_the_count_is_confirmed_before_anything_is_removed(self):
+		event, own = self._mis_attached()
+		self.assertEqual(artifacts.misplaced_transcript_count(event.name)["count"], 2)
+
+		with self.assertRaises(frappe.ValidationError):
+			artifacts.remove_misplaced_transcripts(event.name, expected=3)
+		self.assertEqual(len(self._files(event)), 3)
+
+		removed = artifacts.remove_misplaced_transcripts(event.name, expected=2)
+
+		self.assertEqual(removed["removed"], 2)
+		files = self._files(event)
+		self.assertEqual(len(files), 1)
+		self.assertTrue(files[0].startswith(f"teams-transcript-{own}"))
+
+	def test_only_a_system_manager_can_remove_them(self):
+		event, _own = self._mis_attached()
+		user = "ms.tidy.reader@example.com"
+		if not frappe.db.exists("User", user):
+			frappe.get_doc(
+				{"doctype": "User", "email": user, "first_name": "Reader", "send_welcome_email": 0}
+			).insert(ignore_permissions=True)
+		event.db_set("event_type", "Public", update_modified=False)
+
+		frappe.set_user(user)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				artifacts.remove_misplaced_transcripts(event.name, expected=2)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(len(self._files(event)), 3)
+
+	def test_a_repeating_events_earlier_weeks_are_its_own(self):
+		first = add_to_date(now_datetime(), days=-14).replace(hour=10, minute=0, second=0, microsecond=0)
+		event = self._finished_meeting(
+			starts_on=first, ends_on=add_to_date(first, minutes=30), repeat_this_event=1, repeat_on="Weekly"
+		)
+		for week in range(3):
+			day = utc(add_to_date(first, days=7 * week, minutes=20))[:10]
+			artifacts._save_transcript(
+				f"teams-transcript-{day}-w{week}.vtt", f"WEBVTT\n\n{week}\n", event.name
+			)
+		stray = utc(add_to_date(first, days=3))[:10]
+		artifacts._save_transcript(f"teams-transcript-{stray}.vtt", "WEBVTT\n\nad hoc\n", event.name)
+
+		self.assertEqual(artifacts.misplaced_transcript_count(event.name)["count"], 1)

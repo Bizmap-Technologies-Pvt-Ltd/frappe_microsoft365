@@ -186,6 +186,53 @@ frappe_microsoft365.add_artifact_buttons = function (frm) {
 			group
 		);
 	}
+
+	if (frappe.user.has_role("System Manager")) {
+		frappe_microsoft365.offer_misplaced_cleanup(frm);
+	}
+};
+
+// Before 1.2.0 every occurrence of a recurring meeting was given every occurrence's
+// transcripts. Offered only where there are some, and only ever removes those: the count is
+// shown first and sent back, so the server refuses if it changed in between.
+frappe_microsoft365.offer_misplaced_cleanup = function (frm) {
+	frappe.call({
+		method: "frappe_microsoft365.microsoft_meeting_artifacts.misplaced_transcript_count",
+		args: { event: frm.doc.name },
+		callback: (r) => {
+			const found = r.message || {};
+			if (!found.count) return;
+			frm.add_custom_button(
+				__("Remove Other Meetings' Transcripts"),
+				() => {
+					const esc = frappe.utils.escape_html;
+					frappe.confirm(
+						__(
+							"{0} transcript(s) on this Event were created outside this meeting, by other occurrences of the same recurring meeting. Remove these {0}? Transcripts from this meeting are kept.",
+							[found.count]
+						) +
+							"<ul>" +
+							(found.files || []).map((f) => `<li>${esc(f)}</li>`).join("") +
+							"</ul>",
+						() =>
+							frappe.call({
+								method: "frappe_microsoft365.microsoft_meeting_artifacts.remove_misplaced_transcripts",
+								args: { event: frm.doc.name, expected: found.count },
+								freeze: true,
+								callback: (res) => {
+									frappe.show_alert({
+										message: __("Removed {0} transcript(s).", [(res.message || {}).removed]),
+										indicator: "green",
+									});
+									frm.reload_doc();
+								},
+							})
+					);
+				},
+				__("Microsoft")
+			);
+		},
+	});
 };
 
 frappe_microsoft365.download_recording = function (frm, recordings) {

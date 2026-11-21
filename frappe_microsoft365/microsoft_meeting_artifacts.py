@@ -1118,6 +1118,141 @@ def _due_repeating_events(calendars, now):
 	return due
 
 
+# --- transcripts attached to the wrong occurrence (before 1.2.0) ---------------------
+#
+# Before 1.2.0 every occurrence of a recurring meeting received every occurrence's transcripts.
+# Removing attachments is not something to do silently, so nothing here runs by itself: the
+# upgrade check reports the Events, and a System Manager removes the extra files from each one
+# after seeing how many there are.
+
+
+def misplaced_transcripts(doc):
+	"""Transcript Files on this Event named for a date outside every occurrence of it."""
+	out = []
+	for existing in _transcript_files(doc):
+		day = _stamp_day(existing.file_name)
+		if day and not _day_in_some_occurrence(doc, day):
+			out.append(existing)
+	return out
+
+
+@frappe.whitelist()
+def misplaced_transcript_count(event: str):
+	"""How many transcripts on this Event belong to other meetings. System Manager; reads only."""
+	frappe.only_for("System Manager")
+	doc = frappe.get_doc("Event", event)
+	doc.check_permission("read")
+	files = misplaced_transcripts(doc)
+	return {"count": len(files), "files": sorted(f.file_name for f in files)}
+
+
+@frappe.whitelist(methods=["POST"])
+def remove_misplaced_transcripts(event: str, expected: int):
+	"""Delete the transcripts on this Event that are dated outside its own occurrence.
+
+	``expected`` is the count the person was shown and agreed to. If it no longer matches —
+	someone fetched or removed files in between — nothing is deleted, because what they agreed
+	to is no longer what would happen. Transcripts dated inside the occurrence are never touched.
+	"""
+	frappe.only_for("System Manager")
+	doc = frappe.get_doc("Event", event)
+	doc.check_permission("write")
+	files = misplaced_transcripts(doc)
+	if cint(expected) != len(files):
+		frappe.throw(
+			_(
+				"This Event now has {0} transcript(s) from other meetings, not the {1} you confirmed. "
+				"Nothing was removed; look again and confirm the new number."
+			).format(len(files), cint(expected))
+		)
+	for existing in files:
+		frappe.delete_doc("File", existing.name, force=True, ignore_permissions=True)
+	return {"removed": len(files), "files": sorted(f.file_name for f in files)}
+
+
+#: How many Events the upgrade check names; the count in the title covers the rest.
+UPGRADE_SAMPLE_SIZE = 20
+
+_EVENT_FIELDS = ["name", "subject", "starts_on", "ends_on", "repeat_this_event", "repeat_on", "repeat_till", *_WEEKDAYS]
+
+
+def upgrade_check_misplaced_transcripts():
+	"""Events holding transcripts dated outside their own occurrence. Reads only; changes nothing.
+
+	Production showed the shape: the Events of a weekly series each carrying six, eight and nine
+	transcripts, one of them their own. New fetches are filtered from 1.2.0 on; what was already
+	attached stays until a person removes it.
+	"""
+	from frappe_microsoft365 import doctor
+
+	if not frappe.db.has_column("Event", "custom_teams_join_url"):
+		return []
+	rows = frappe.db.sql(
+		"""
+		select attached_to_name as event, count(*) as files
+		from `tabFile`
+		where attached_to_doctype = 'Event' and file_name like %(prefix)s
+		group by attached_to_name
+		""",
+		{"prefix": f"{TRANSCRIPT_PREFIX}%"},
+		as_dict=True,
+	)
+	if not rows:
+		return []
+
+	events = {
+		e.name: e
+		for e in frappe.get_all(
+			"Event", filters={"name": ["in", [r.event for r in rows]]}, fields=_EVENT_FIELDS
+		)
+	}
+	affected = []
+	for row in rows:
+		doc = events.get(row.event)
+		if not doc:
+			continue
+		misplaced = len(misplaced_transcripts(doc))
+		if misplaced:
+			affected.append((doc, misplaced, row.files))
+	if not affected:
+		return []
+
+	affected.sort(key=lambda a: a[0].name)
+	findings = []
+	for doc, misplaced, total in affected[:UPGRADE_SAMPLE_SIZE]:
+		findings.append(
+			doctor.finding(
+				"upgrade.transcripts_outside_occurrence",
+				doctor.WARN,
+				_("{0} of the {1} transcripts on Event {2} are from other meetings").format(
+					misplaced, total, doc.name
+				),
+				_(
+					"Event {0} ({1}, {2}) is one occurrence of a recurring Teams meeting, and before "
+					"this version every occurrence was given every occurrence's transcripts. Those "
+					"dated outside this Event's own meeting were left in place: nothing was removed."
+				).format(doc.name, doc.subject or "", frappe.utils.format_datetime(doc.starts_on)),
+				_(
+					"Open Event {0} and choose Microsoft > Remove Other Meetings' Transcripts. It "
+					"shows how many it will remove and removes only those."
+				).format(doc.name),
+				target=doc.name,
+			)
+		)
+	more = len(affected) - UPGRADE_SAMPLE_SIZE
+	if more > 0:
+		findings.append(
+			doctor.finding(
+				"upgrade.transcripts_outside_occurrence",
+				doctor.WARN,
+				_("{0} more Events hold transcripts from other meetings").format(more),
+				", ".join(doc.name for doc, _m, _t in affected[UPGRADE_SAMPLE_SIZE:]),
+				_("Remove them the same way, from each Event's Microsoft menu."),
+			)
+		)
+	return findings
+
+
 # --- download ------------------------------------------------------------------------
 
 

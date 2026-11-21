@@ -34,6 +34,9 @@ microsoft365_upgrade_checks = {
 	"1.1.2": [
 		"frappe_microsoft365.microsoft_files.upgrade_check_files_in_other_records_folders",
 	],
+	"1.2.0": [
+		"frappe_microsoft365.microsoft_meeting_artifacts.upgrade_check_misplaced_transcripts",
+	],
 }
 
 doc_events = {
