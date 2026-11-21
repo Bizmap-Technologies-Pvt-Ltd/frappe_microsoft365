@@ -704,9 +704,10 @@ def download_recording(event: str, recording_id: str | None = None):
 				)
 			)
 		recording_id = stored[0]["id"]
-	elif stored and recording_id not in [r.get("id") for r in stored]:
+	elif recording_id not in [r.get("id") for r in stored]:
 		# The id has to have come from this Event, or this endpoint becomes a way to pull any
-		# recording the connected account can reach by guessing ids.
+		# recording the connected account can reach by guessing ids. That holds just as much
+		# when nothing is stored yet: an empty list means no id belongs here, not that any does.
 		frappe.throw(_("That recording does not belong to this meeting."), frappe.PermissionError)
 
 	part = next((i for i, r in enumerate(stored, start=1) if r.get("id") == recording_id), 1)
