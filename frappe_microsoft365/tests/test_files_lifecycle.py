@@ -734,3 +734,64 @@ class TestReattachedFileMoves(FilesTestCase):
 		doc = frappe.get_doc("File", self.file.name)
 		doc.save()
 		self.assertEqual(fake.calls, [])
+
+
+# --- B30: get_content never reads a huge file into memory -------------------------------------
+
+
+class Unread(HttpResponse):
+	"""A response whose body must not be touched as a whole."""
+
+	@property
+	def content(self):
+		raise AssertionError("the whole body was read")
+
+	@content.setter
+	def content(self, value):
+		self._body = value
+
+	def iter_content(self, chunk_size=1):
+		for i in range(0, len(self._body), chunk_size):
+			yield self._body[i : i + chunk_size]
+
+
+class TestBigFilesAreNotReadWhole(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		self.file = self.attach(name="clip.txt", content=f"small {frappe.generate_hash()}".encode())
+		files.upload_file(self.file.name)
+		real_graph(self)
+
+	def serve(self, body, length=None):
+		headers = {"Content-Length": str(length if length is not None else len(body))}
+		return network(self, lambda method, url, kwargs: Unread(200, body=body, headers=headers))
+
+	def test_a_file_over_the_limit_is_refused_before_it_is_read(self):
+		fake = self.serve(b"x" * 10, length=6 * 1024**3)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			frappe.get_doc("File", self.file.name).get_content()
+		self.assertIn("MB", str(caught.exception))
+		method, url, kwargs = fake.calls[0]
+		self.assertEqual((method, url), ("GET", f"{GRAPH}/drives/DRIVE/items/ITEM-clip.txt/content"))
+		self.assertTrue(kwargs["stream"])
+
+	def test_a_body_that_runs_past_the_limit_is_refused_too(self):
+		self.serve(b"x" * 64, length=0)
+		with patch.object(files, "max_content_bytes", return_value=32):
+			with self.assertRaises(frappe.ValidationError):
+				files.fetch_content("DRIVE", "ITEM-clip.txt")
+
+	def test_a_file_under_the_limit_is_returned(self):
+		self.serve(b"hello from teams")
+		self.assertEqual(frappe.get_doc("File", self.file.name).get_content(), "hello from teams")
+
+	def test_the_limit_is_frappes_upload_limit_unless_the_site_sets_one(self):
+		from frappe.core.api.file import get_max_file_size
+
+		self.assertEqual(files.max_content_bytes(), get_max_file_size())
+		with patch.dict(frappe.conf, {"microsoft365_max_content_bytes": 1234}):
+			self.assertEqual(files.max_content_bytes(), 1234)
+
+	def test_streaming_callers_get_every_piece(self):
+		self.serve(b"y" * (files.DOWNLOAD_CHUNK_BYTES + 3))
+		self.assertEqual(sum(len(p) for p in files.iter_content("DRIVE", "ITEM-clip.txt")), files.DOWNLOAD_CHUNK_BYTES + 3)

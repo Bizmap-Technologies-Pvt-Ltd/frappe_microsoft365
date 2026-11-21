@@ -228,6 +228,12 @@ reads a moved attachment's bytes (`File.get_content()`, used for example to atta
 outgoing email) is answered from SharePoint through v16's `extend_doctype_class` hook; v15 has no
 such hook, so those readers would get no content. The other capabilities work on v15 as before.
 
+`File.get_content()` returns the whole file at once, so it reads at most Frappe's upload limit
+(*System Settings → Max File Size*) from SharePoint; a bigger file is refused
+with a message saying so, before any of it is downloaded. Set `microsoft365_max_content_bytes` in
+`site_config.json` to choose another limit. Opening a file from the form streams it and has no
+such limit.
+
 ## Graph endpoints used
 
 All Graph v1.0, application permission `Sites.Selected`:

@@ -2265,13 +2265,71 @@ def open_file(file: str, download: int = 0):
 	return response
 
 
-def fetch_content(drive_id, item_id):
-	"""The whole content of a driveItem as bytes. For File.get_content; not for big files."""
+#: The default for max_content_bytes when Frappe names no upload limit of its own.
+DEFAULT_MAX_CONTENT_BYTES = 25 * 1024 * 1024
+
+
+def max_content_bytes():
+	"""The largest file File.get_content reads from SharePoint, in bytes.
+
+	get_content hands back the whole file as one value (to attach it to an email, a print, an
+	import), so a multi-gigabyte video would take a worker's memory with it. The limit is
+	Frappe's own upload limit, the size Frappe already holds in memory when a file is attached,
+	unless site_config.json sets ``microsoft365_max_content_bytes``.
+	"""
+	configured = cint(frappe.conf.get("microsoft365_max_content_bytes"))
+	if configured:
+		return configured
+	try:
+		from frappe.core.api.file import get_max_file_size
+
+		return cint(get_max_file_size()) or DEFAULT_MAX_CONTENT_BYTES
+	except ImportError:
+		return DEFAULT_MAX_CONTENT_BYTES
+
+
+def _too_big(size, limit):
+	frappe.throw(
+		_(
+			"This file is {0} MB, more than the {1} MB that can be read from SharePoint in one piece (to attach it to an email, a print or an import). Open it from the record instead, or send a link to it."
+		).format(round(size / (1024 * 1024), 1), round(limit / (1024 * 1024), 1)),
+		title=_("File too large"),
+	)
+
+
+def iter_content(drive_id, item_id, chunk_size=DOWNLOAD_CHUNK_BYTES):
+	"""A driveItem's bytes in pieces, for callers that can take them as a stream. Any size."""
 	resp = graph.graph_request(
-		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, timeout=120
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, stream=True, timeout=120
 	)
 	try:
-		return resp.content
+		yield from resp.iter_content(chunk_size)
+	finally:
+		graph._release(resp)
+
+
+def fetch_content(drive_id, item_id):
+	"""The whole content of a driveItem as bytes, for File.get_content.
+
+	Streamed and counted, so that a file over max_content_bytes is refused with a clear message
+	— from its Content-Length before any of it is read, or as soon as the count passes the
+	limit — instead of being read into memory whole. iter_content serves callers that stream.
+	"""
+	limit = max_content_bytes()
+	resp = graph.graph_request(
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, stream=True, timeout=120
+	)
+	try:
+		length = cint((resp.headers or {}).get("Content-Length"))
+		if length > limit:
+			_too_big(length, limit)
+		parts, size = [], 0
+		for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
+			size += len(chunk)
+			if size > limit:
+				_too_big(size, limit)
+			parts.append(chunk)
+		return b"".join(parts)
 	finally:
 		graph._release(resp)
 
