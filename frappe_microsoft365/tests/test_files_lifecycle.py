@@ -22,7 +22,7 @@ from frappe_microsoft365 import microsoft_files as files
 from frappe_microsoft365 import microsoft_graph as graph
 from frappe_microsoft365.microsoft_graph import MsGraphError
 from frappe_microsoft365.tests.base import BaseTestCase
-from frappe_microsoft365.tests.test_files import MAPPED, FilesTestCase, configure
+from frappe_microsoft365.tests.test_files import MAPPED, FilesTestCase, configure, upgrade_checks
 
 
 def setUpModule():
@@ -157,3 +157,136 @@ class TestLinkDownloadIsPinned(BaseTestCase):
 				with files._download_link(f"http://{self.HOST}/start"):
 					pass
 		self.assertEqual(pool_class.call_count, 1)  # never connected to 10.0.0.5
+
+
+# --- S8: a kept local copy follows the File's privacy and leaves with it ----------------------
+
+
+class KeptCopyTestCase(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		configure(self, files_keep_local_copy=1)
+
+	def moved_public(self, content=None, name=None, shared_with=False):
+		"""A public attachment moved with its local copy kept; optionally a second, unmoved File
+		that shares its bytes (Frappe stores identical content once)."""
+		content = content or f"kept {frappe.generate_hash()}".encode()
+		name = name or f"kept-{frappe.generate_hash(length=6)}.txt"
+		f = self.attach(content=content, name=name, is_private=0)
+		local = f.file_url
+		self.assertTrue(local.startswith("/files/"))
+		if shared_with:
+			other = frappe.get_doc({"doctype": "File", "file_name": name, "content": content, "is_private": 0}).insert()
+			self.assertEqual(other.file_url, local)
+		files.upload_file(f.name)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.STORED)
+		for url in (local, "/private" + local):
+			self.addCleanup(lambda p=files.local_path(url): os.path.exists(p) and os.remove(p))
+		return f, local
+
+	def kept(self, f):
+		return frappe.db.get_value("File", f.name, "custom_microsoft_local_url")
+
+
+class TestKeptCopyFollowsPrivacy(KeptCopyTestCase):
+	def test_making_a_moved_file_private_moves_its_kept_copy_out_of_public_files(self):
+		f, local = self.moved_public()
+		doc = frappe.get_doc("File", f.name)
+		doc.is_private = 1
+		doc.save()
+		self.assertFalse(os.path.exists(files.local_path(local)))
+		self.assertEqual(self.kept(f), "/private" + local)
+		self.assertTrue(os.path.exists(files.local_path("/private" + local)))
+
+	def test_bring_back_restores_a_private_file_to_private_files(self):
+		f, local = self.moved_public()
+		# As 1.1.x left it: made private without the copy following.
+		frappe.db.set_value("File", f.name, "is_private", 1)
+		calls = len(self.graph.calls)
+		target = files.bring_back(f.name)
+		self.assertEqual(target, "/private" + local)
+		self.assertEqual(frappe.db.get_value("File", f.name, "file_url"), target)
+		self.assertFalse(os.path.exists(files.local_path(local)))
+		self.assertEqual(self.graph.calls[calls:], [])  # the kept copy was reused, not downloaded
+
+	def test_bytes_another_file_uses_are_copied_not_taken(self):
+		f, local = self.moved_public(shared_with=True)
+		doc = frappe.get_doc("File", f.name)
+		doc.is_private = 1
+		doc.save()
+		self.assertTrue(os.path.exists(files.local_path(local)))  # still the other File's
+		self.assertTrue(self.kept(f).startswith("/private/files/"))
+
+
+class TestKeptCopyLeavesWithItsFile(KeptCopyTestCase):
+	def test_deleting_a_moved_file_removes_its_kept_copy(self):
+		f, local = self.moved_public()
+		frappe.delete_doc("File", f.name)
+		self.assertFalse(os.path.exists(files.local_path(local)))
+
+	def test_a_kept_copy_another_file_still_uses_stays(self):
+		f, local = self.moved_public(shared_with=True)
+		frappe.delete_doc("File", f.name)
+		self.assertTrue(os.path.exists(files.local_path(local)))
+
+	def test_bytes_that_are_no_longer_the_files_are_never_removed(self):
+		f, local = self.moved_public()
+		with open(files.local_path(local), "wb") as fh:
+			fh.write(b"someone else's file now")
+		frappe.delete_doc("File", f.name)
+		self.assertTrue(os.path.exists(files.local_path(local)))
+
+
+class TestKeptCopyPatchAndCheck(KeptCopyTestCase):
+	def patch(self):
+		from frappe_microsoft365.patches import move_public_kept_copies_of_private_files
+
+		move_public_kept_copies_of_private_files.execute()
+
+	def test_the_patch_moves_public_copies_of_private_files_and_can_run_twice(self):
+		f, local = self.moved_public()
+		frappe.db.set_value("File", f.name, "is_private", 1)  # as 1.1.x left it
+		self.patch()
+		self.assertEqual(self.kept(f), "/private" + local)
+		self.assertFalse(os.path.exists(files.local_path(local)))
+		self.patch()
+		self.assertEqual(self.kept(f), "/private" + local)
+		self.assertTrue(os.path.exists(files.local_path("/private" + local)))
+
+	def test_the_patch_leaves_public_files_alone(self):
+		f, local = self.moved_public()
+		self.patch()
+		self.assertEqual(self.kept(f), local)
+		self.assertTrue(os.path.exists(files.local_path(local)))
+
+	def test_the_patch_does_nothing_where_storage_was_never_switched_on(self):
+		f, local = self.moved_public()
+		frappe.db.set_value("File", f.name, "is_private", 1)
+		with patch.object(frappe.db, "has_column", return_value=False):
+			self.patch()
+		self.assertEqual(self.kept(f), local)
+
+	def deleted_as_before(self, f):
+		"""Delete a moved File the way 1.1.x did: its kept copy stays on disk."""
+		with patch.object(files, "_drop_kept_copy"):
+			frappe.delete_doc("File", f.name)
+
+	def test_kept_copies_of_deleted_files_are_reported_not_deleted(self):
+		f, local = self.moved_public()
+		self.deleted_as_before(f)
+		found = files.upgrade_check_orphaned_kept_copies()
+		self.assertEqual(len(found), 1)
+		self.assertEqual(found[0]["check"], "upgrade.sharepoint_orphaned_kept_copies")
+		self.assertIn(local, found[0]["detail"])
+		self.assertTrue(os.path.exists(files.local_path(local)))
+
+	def test_a_copy_removed_since_or_used_by_another_file_is_not_reported(self):
+		f, local = self.moved_public()
+		self.deleted_as_before(f)
+		os.remove(files.local_path(local))
+		self.assertEqual(files.upgrade_check_orphaned_kept_copies(), [])
+
+	def test_the_check_is_registered_for_the_upgrade_report(self):
+		self.assertIn(
+			"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies", upgrade_checks()
+		)

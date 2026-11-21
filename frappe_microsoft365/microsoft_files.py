@@ -31,9 +31,11 @@ Graph contract used (all v1.0, see docs/graph-api-reference.md):
 """
 
 import ipaddress
+import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import tempfile
 from urllib.parse import quote, urlparse
@@ -1411,6 +1413,68 @@ def _remove_local_copy(local_url):
 		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=local_url)
 
 
+def _privacy_prefix(file_doc):
+	"""Where a File's bytes belong on disk, by its privacy as it is now."""
+	return "/private/files/" if cint(file_doc.get("is_private")) else "/files/"
+
+
+def _blob_users(url, except_name):
+	"""Other File rows that use the bytes at a local URL, as their address or as their kept copy."""
+	return frappe.get_all(
+		"File",
+		filters={"name": ["!=", except_name or ""]},
+		or_filters={"file_url": url, "custom_microsoft_local_url": url},
+		pluck="name",
+	)
+
+
+def follow_privacy(file_doc):
+	"""Put a moved File's kept local copy where its privacy says: public/files or private/files.
+
+	Frappe moves a File's bytes when its privacy changes, but a moved File's file_url is the
+	open_file address, so Frappe leaves the kept copy alone. Left in public/files, the copy of a
+	File made private would stay readable by anyone through the web server. Moved when no other
+	File uses those bytes, copied when one does (that File's bytes are its own business).
+	Returns the kept copy's new URL, or None when there was nothing to move.
+	"""
+	local = file_doc.get("custom_microsoft_local_url")
+	if file_doc.get("custom_microsoft_status") != STORED or not local or ".." in local.split("/"):
+		return None
+	prefix = _privacy_prefix(file_doc)
+	if local.startswith(prefix) or not own_local_copy(file_doc, local):
+		# In place already, or nothing of this File's is there to move (keep-local off, or the
+		# name belongs to another file by now).
+		return None
+	basename = local.rsplit("/", 1)[-1]
+	target = prefix + basename
+	if os.path.exists(local_path(target)) or _blob_users(target, file_doc.name):
+		target = prefix + f"{file_doc.name}-{basename}"
+		if os.path.exists(local_path(target)):
+			target = prefix + f"{file_doc.name}-{frappe.generate_hash(length=8)}-{basename}"
+	source, destination = local_path(local), local_path(target)
+	if _blob_users(local, file_doc.name):
+		shutil.copyfile(source, destination)
+	else:
+		os.replace(source, destination)
+	frappe.db.set_value("File", file_doc.name, "custom_microsoft_local_url", target, update_modified=False)
+	file_doc.custom_microsoft_local_url = target
+	return target
+
+
+def _drop_kept_copy(file_doc):
+	"""Remove a moved File's kept local copy, unless another File still uses those bytes."""
+	local = file_doc.get("custom_microsoft_local_url")
+	if file_doc.get("custom_microsoft_status") != STORED or not local:
+		return
+	if _blob_users(local, file_doc.name) or not own_local_copy(file_doc, local):
+		return
+	try:
+		# own_local_copy accepted the URL: a /files or /private/files path without "..".
+		os.remove(local_path(local))  # nosemgrep
+	except OSError:
+		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=local)
+
+
 # --- deletes and renames -----------------------------------------------------------------
 
 
@@ -1450,6 +1514,32 @@ def on_file_trash(doc, method=None):
 	except Exception:
 		# Removing the attachment in Frappe must not fail because SharePoint was unreachable.
 		frappe.log_error(title=_("Microsoft 365: could not remove file from SharePoint"))
+
+
+def on_file_update(doc, method=None):
+	"""File.on_update: keep a moved file's kept local copy in step with the File's privacy."""
+	if doc.get("custom_microsoft_status") != STORED or not doc.has_value_changed("is_private"):
+		return
+	try:
+		follow_privacy(doc)
+	except Exception:
+		frappe.log_error(title=_("Microsoft 365: could not move the kept local copy"), message=doc.name)
+		if cint(doc.is_private):
+			# A copy that could not follow the File into private/files must not stay public.
+			# SharePoint holds the file; the kept copy is only a spare.
+			_drop_kept_copy(doc)
+
+
+def on_file_delete(doc, method=None):
+	"""File.after_delete: remove a moved file's kept local copy with it.
+
+	Frappe deletes a File's bytes only when it has a content_hash, which the move clears, so
+	without this the kept copy would stay on disk (in public/files, for a public file) forever.
+	"""
+	try:
+		_drop_kept_copy(doc)
+	except Exception:
+		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=doc.name)
 
 
 def on_doc_trash(doc, method=None):
@@ -2143,10 +2233,15 @@ def bring_back(file_name):
 		return file_doc.file_url
 
 	old_url = file_doc.file_url
+	# A kept copy in the wrong place for the File's privacy is moved first, so that what comes
+	# back is where the File's privacy says, never at the old public address of a private file.
+	follow_privacy(file_doc)
 	target = file_doc.get("custom_microsoft_local_url")
-	prefix = "/private/files/" if file_doc.is_private else "/files/"
-	if not target or ".." in target.split("/"):
-		target = prefix + safe_file_name(file_doc.file_name or file_doc.name)
+	prefix = _privacy_prefix(file_doc)
+	if not target or ".." in target.split("/") or not target.startswith(prefix):
+		target = prefix + safe_file_name(
+			(target or "").rsplit("/", 1)[-1] or file_doc.file_name or file_doc.name
+		)
 	path = local_path(target)
 
 	# A kept copy is reused only if it is still this file's bytes (see own_local_copy).
@@ -2486,3 +2581,57 @@ def upgrade_check_file_items():
 			)
 		)
 	return out
+
+
+def upgrade_check_orphaned_kept_copies():
+	"""Kept local copies of moved Files that were deleted before 1.2.0, still on disk.
+
+	Frappe removes a File's bytes only when it has a content_hash, which the move clears, so until
+	1.2.0 deleting a moved File left its kept copy behind (in public/files for a public file). The
+	deleted rows are read back from Deleted Document; a copy is listed when it is still on disk,
+	no File uses it, and, where the bytes were hashed at the move, they are still those bytes.
+	Read only: nothing is deleted, because only a person can say nothing else needs the file.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	if not has_file_fields() or not frappe.db.table_exists("Deleted Document"):
+		return []
+	filters = {"deleted_doctype": "File", "data": ["like", '%"custom_microsoft_local_url": "/%']}
+	if frappe.get_meta("Deleted Document").has_field("restored"):
+		filters["restored"] = 0
+	left = []
+	for row in frappe.get_all(
+		"Deleted Document", filters=filters, fields=["deleted_name", "data"], order_by="creation asc"
+	):
+		try:
+			data = frappe._dict(json.loads(row.data))
+		except ValueError:
+			continue
+		local = data.get("custom_microsoft_local_url") or ""
+		if data.get("custom_microsoft_status") != STORED or local in left:
+			continue
+		if ".." in local.split("/") or not local.startswith(("/files/", "/private/files/")):
+			continue
+		path = local_path(local)
+		if not os.path.isfile(path) or _blob_users(local, None):
+			continue
+		recorded = data.get("custom_microsoft_content_hash")
+		if recorded and _hash_of(path) != recorded:
+			continue
+		left.append(local)
+	if not left:
+		return []
+	public = [url for url in left if url.startswith("/files/")]
+	return [
+		finding(
+			"upgrade.sharepoint_orphaned_kept_copies",
+			WARN,
+			_("{0} kept local copies of deleted Files are still on this server ({1} in public files)").format(
+				len(left), len(public)
+			),
+			_names(left),
+			_(
+				"These Files were moved to SharePoint with Keep Local Copy on and deleted later; their copies on disk were never removed, and the ones under /files/ can be downloaded by anyone who has the address. Nothing in Frappe uses them. Delete them from the site's public/files and private/files folders unless something outside Frappe needs them. Files deleted from 1.2.0 on take their kept copy with them."
+			),
+		)
+	]

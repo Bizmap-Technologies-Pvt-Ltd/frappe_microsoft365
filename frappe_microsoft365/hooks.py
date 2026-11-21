@@ -34,6 +34,9 @@ microsoft365_upgrade_checks = {
 	"1.1.2": [
 		"frappe_microsoft365.microsoft_files.upgrade_check_files_in_other_records_folders",
 	],
+	"1.2.0": [
+		"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies",
+	],
 }
 
 doc_events = {
@@ -49,7 +52,9 @@ doc_events = {
 		# switched off, so their fields stay protected too.
 		"validate": "frappe_microsoft365.microsoft_files.on_file_validate",
 		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
+		"on_update": "frappe_microsoft365.microsoft_files.on_file_update",
 		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
+		"after_delete": "frappe_microsoft365.microsoft_files.on_file_delete",
 	},
 	"*": {
 		"on_trash": "frappe_microsoft365.microsoft_files.on_doc_trash",
