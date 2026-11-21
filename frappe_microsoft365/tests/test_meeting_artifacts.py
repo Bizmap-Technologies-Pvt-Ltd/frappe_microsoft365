@@ -478,7 +478,9 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 		with patch.object(artifacts, "_fetch_into") as fetch:
 			artifacts.fetch_pending()
 
-		fetch.assert_not_called()
+		# Only this test's event: a site upgraded from an earlier release keeps other calendars'
+		# meetings, which the job rightly picks up.
+		self.assertNotIn(event.name, [c.args[0].name for c in fetch.call_args_list if c.args])
 
 	def test_the_job_attaches_what_it_finds(self):
 		event = self._finished_meeting()
