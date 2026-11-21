@@ -23,9 +23,28 @@ SERVER_MANAGED_FIELDS = (
 	"delta_window_end",
 	"delta_next_link",
 	"delta_next_window_end",
-	# Written when Microsoft stops accepting the connection's sign-in, cleared by the next one.
+	# Written by the OAuth callback and the token refresh. The doctor trusts authorized_scopes
+	# to say what a token can do, and the account id is how a re-authorisation tells whether it
+	# is still the same mailbox, so neither may be typed in.
+	"authorized_scopes",
+	"microsoft_account_id",
 	"authorization_error",
 )
+
+#: What a sync knows about one Microsoft mailbox. Signing in as a different account makes all of
+#: it point at the wrong mailbox: the delta links would be replayed with the new account's token,
+#: and the calendar id names a calendar the new account does not have.
+ACCOUNT_SYNC_STATE = {
+	"delta_link": "",
+	"delta_window_end": None,
+	"delta_next_link": None,
+	"delta_next_window_end": None,
+	"ms_calendar_id": "",
+	"ms_calendar_name": "",
+	# Push catches up edits made "since the last sync"; with another mailbox there has been none.
+	"last_sync": None,
+	"last_error": "",
+}
 
 
 class MicrosoftCalendar(Document):
@@ -124,20 +143,40 @@ def callback(
 			)
 
 		result = graph.exchange_code(code)
-		graph._store_tokens(name, result)  # stores access/refresh/expiry + email from claims
-		frappe.db.set_value(
-			"Microsoft Calendar",
-			name,
-			_only_existing(
-				{"authorized": 1, "oauth_state": "", "oauth_state_expiry": None, "authorization_error": ""}
-			),
-		)
+		previous = frappe.db.get_value(
+			"Microsoft Calendar", name, _existing_fields("microsoft_account_id", "microsoft_user_email"),
+			as_dict=True,
+		) or {}
+		# Committed below together with everything else a sign-in changes, so a failure part-way
+		# can never leave the new account's tokens on the old account's sync state.
+		graph._store_tokens(name, result, commit=False)
+		me = _whoami_or_none(name)
+		account_id = _account_id(result, me)
+
+		updates = {
+			"authorized": 1,
+			"oauth_state": "",
+			"oauth_state_expiry": None,
+			"authorization_error": "",
+			"authorized_scopes": " ".join(result.get("requested_scopes") or graph.get_scopes()),
+			"microsoft_account_id": account_id or previous.get("microsoft_account_id") or "",
+		}
+		switched = _is_another_account(previous, account_id, result, me)
+		if switched:
+			updates.update(ACCOUNT_SYNC_STATE)
+			email = _account_email(result, me)
+			if email:
+				updates["microsoft_user_email"] = email
+		frappe.db.set_value("Microsoft Calendar", name, _only_existing(updates))
+		unlinked = _unlink_events_of_previous_account(name) if switched else 0
+		if switched:
+			_note_account_switch(name, previous, updates.get("microsoft_user_email"), unlinked)
 		# OAuth callback is a GET; without this the tokens we just stored would be discarded.
 		frappe.db.commit()  # nosemgrep
 
 		# best-effort: fill account email + default calendar
 		try:
-			_fill_account_details(name)
+			_fill_account_details(name, me)
 		except Exception:
 			frappe.log_error(title="MS Calendar post-auth detail fetch failed")
 
@@ -196,8 +235,109 @@ def _only_existing(values):
 	return {k: v for k, v in values.items() if k in existing}
 
 
-def _fill_account_details(calendar_name):
-	me = graph.whoami(calendar_name)
+def _whoami_or_none(calendar_name):
+	"""/me for the account that has just signed in, or None: identification must not fail sign-in."""
+	try:
+		return graph.whoami(calendar_name) or None
+	except Exception:
+		frappe.log_error(title=f"MS Calendar could not read the signed-in account: {calendar_name}")
+		return None
+
+
+def _account_id(result, me):
+	"""The signed-in account's object id: from the ID token, else from /me (which is the same id)."""
+	claims = result.get("id_token_claims") or {}
+	return (claims.get("oid") or (me or {}).get("id") or "").strip()
+
+
+def _account_email(result, me):
+	me = me or {}
+	claims = result.get("id_token_claims") or {}
+	return me.get("mail") or me.get("userPrincipalName") or claims.get("preferred_username") or ""
+
+
+def _account_names(result, me):
+	"""Every address the signed-in account is known by, lower-cased."""
+	me = me or {}
+	claims = result.get("id_token_claims") or {}
+	names = (
+		me.get("mail"),
+		me.get("userPrincipalName"),
+		claims.get("preferred_username"),
+		claims.get("email"),
+		claims.get("upn"),
+	)
+	return {n.strip().lower() for n in names if n and n.strip()}
+
+
+def _is_another_account(previous, account_id, result, me):
+	"""Did this sign-in pick a different Microsoft account from the one the sync state belongs to?
+
+	Compared by object id whenever both sides have one. A connection authorised before 1.2.0
+	never stored an id, so it falls back to the address it recorded — matched against every
+	address the new account goes by, because the form shows /me's mail while the ID token says
+	the UPN, and one person's two addresses must not look like two people. With nothing to
+	compare (a first sign-in) there is no old state to clear.
+	"""
+	stored_id = (previous.get("microsoft_account_id") or "").strip()
+	if stored_id and account_id:
+		return stored_id.lower() != account_id.lower()
+	stored_email = (previous.get("microsoft_user_email") or "").strip().lower()
+	names = _account_names(result, me)
+	if stored_email and names:
+		return stored_email not in names
+	return False
+
+
+def _unlink_events_of_previous_account(calendar_name):
+	"""Detach the Events this connection had created in the previous account's mailbox.
+
+	Their Microsoft ids name events in the OLD mailbox. Left alone, every edit would PATCH the
+	new account with an id it does not have (404); cleared but still ticked, the next push would
+	create each one again in the new mailbox and send every attendee a second invitation. So the
+	link is dropped and the tick taken off: the meetings stay in the old mailbox, the Frappe
+	Events stay as they are, and ticking one again sends it to the new account on purpose.
+
+	Events pulled from the old mailbox are left untouched: a pull never pushes them back, and
+	the new account's pull cannot match their ids, so they are inert history.
+	"""
+	filters = {
+		"custom_microsoft_calendar": calendar_name,
+		"custom_pulled_from_microsoft": 0,
+		"custom_microsoft_event_id": ["is", "set"],
+	}
+	if not frappe.db.has_column("Event", "custom_microsoft_event_id"):
+		return 0
+	names = frappe.get_all("Event", filters=filters, pluck="name")
+	for event_name in names:
+		frappe.db.set_value(
+			"Event",
+			event_name,
+			{"custom_microsoft_event_id": None, "custom_sync_with_microsoft_calendar": 0},
+			update_modified=False,
+		)
+	return len(names)
+
+
+def _note_account_switch(calendar_name, previous, new_email, unlinked):
+	"""Leave a timeline comment: the person should not have to wonder why the sync restarted."""
+	text = _(
+		"Signed in as a different Microsoft account ({0}, previously {1}). The sync starts afresh "
+		"from the new account's calendar."
+	).format(new_email or _("unknown"), previous.get("microsoft_user_email") or _("unknown"))
+	if unlinked:
+		text += " " + _(
+			"{0} Event(s) created in the previous account's calendar were unlinked and no longer "
+			"sync; tick Sync with Microsoft Calendar on one to send it to the new account."
+		).format(unlinked)
+	try:
+		frappe.get_doc("Microsoft Calendar", calendar_name).add_comment("Info", text)
+	except Exception:
+		frappe.log_error(title=f"MS Calendar account switch note failed: {calendar_name}")
+
+
+def _fill_account_details(calendar_name, me=None):
+	me = me or graph.whoami(calendar_name)
 	updates = {}
 	email = me.get("mail") or me.get("userPrincipalName")
 	if email:

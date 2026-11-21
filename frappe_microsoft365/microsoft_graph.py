@@ -335,6 +335,10 @@ def exchange_code(code):
 	)
 	_raise_on_token_error(result)
 	_record_authorized_scopes(scopes)
+	# What was asked for travels with the tokens, so the callback can record it on the one
+	# connection that just signed in (see _record_authorized_scopes for why the request is what
+	# is kept).
+	result["requested_scopes"] = list(scopes)
 	return result
 
 
@@ -352,6 +356,10 @@ def _record_authorized_scopes(scopes):
 
 	Written straight to the Singles row so the OAuth callback — which runs as whoever signed
 	in, not necessarily a System Manager — is never blocked by permissions on Settings.
+
+	This site-wide value is only what the LAST sign-in asked for. Each Microsoft Calendar also
+	keeps its own copy (``authorized_scopes``, written by the callback), and that is what the
+	doctor compares: one person re-authorising must not vouch for everybody else's token.
 	"""
 	frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", " ".join(scopes))
 

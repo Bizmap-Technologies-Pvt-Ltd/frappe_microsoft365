@@ -14,9 +14,12 @@ import frappe
 from frappe.utils import add_to_date, now_datetime
 from frappe.utils.password import get_decrypted_password
 
+from frappe_microsoft365 import doctor
 from frappe_microsoft365 import microsoft_calendar_sync as sync
 from frappe_microsoft365 import microsoft_graph as graph
+from frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar import microsoft_calendar as mc
 from frappe_microsoft365.microsoft_graph import MsGraphAuthorizationLost, MsGraphError, MsGraphThrottled
+from frappe_microsoft365.patches import copy_authorized_scopes_to_calendars
 from frappe_microsoft365.tests.base import BaseTestCase
 
 SETTINGS = frappe._dict(
@@ -440,3 +443,285 @@ class TestPushStopsWhenThrottled(ConnectionTestCase):
 		self.assertEqual(http.call_args.args[:2], ("POST", "https://graph.microsoft.com/v1.0/me/events"))
 		logged.assert_not_called()
 		self.assertIn("throttling", doc.flags.push_warning)
+
+
+# --- B12 / B13: what a sign-in records -----------------------------------------------------
+
+
+CURRENT_SCOPES = ("User.Read", "Calendars.ReadWrite", "OnlineMeetings.ReadWrite")
+
+
+class TestSignInRecords(ConnectionTestCase):
+	OLD_DELTA = "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=OLD"
+
+	def _sign_in(self, cal, claims, me, calendars=None):
+		"""Run the real callback with Microsoft's answers faked at the network boundary."""
+		state = "state-" + frappe.generate_hash(length=8)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			cal,
+			{"oauth_state": state, "oauth_state_expiry": add_to_date(now_datetime(), minutes=5)},
+		)
+		code_result = {
+			"access_token": "tok-new",
+			"refresh_token": "rt-new",
+			"expires_in": 3600,
+			"id_token_claims": claims,
+		}
+		calendars = calendars or [{"id": "AAMk-NEW", "name": "Calendar", "isDefaultCalendar": True}]
+
+		def http(method, url, **kwargs):
+			if url.endswith("/me"):
+				return _response(200, me)
+			if "/me/calendars" in url:
+				return _response(200, {"value": calendars})
+			return _response(404, {"error": {"code": "ErrorItemNotFound"}})
+
+		frappe.local.response = frappe._dict()
+		with (
+			self._msal(code_result=code_result),
+			patch.object(graph, "_http_request", side_effect=http) as sent,
+			patch.object(frappe, "respond_as_web_page") as failure_page,
+			patch.object(frappe, "log_error"),
+		):
+			mc.callback(code="code", state=state)
+		failure_page.assert_not_called()
+		return sent
+
+	def _connected(self, **values):
+		# Server-managed fields are wiped by validate, so they are written the way the app writes
+		# them: straight to the row.
+		server = {k: values.pop(k) for k in ("microsoft_account_id", "authorization_error") if k in values}
+		cal = self._calendar(
+			microsoft_user_email="a.old@contoso.example",
+			ms_calendar_id="AAMk-OLD",
+			ms_calendar_name="Old calendar",
+			last_sync=add_to_date(now_datetime(), hours=-1),
+			**values,
+		)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			cal,
+			{
+				"delta_link": self.OLD_DELTA,
+				"delta_window_end": add_to_date(now_datetime(), days=90),
+				**server,
+			},
+			update_modified=False,
+		)
+		return cal
+
+	def _event(self, cal, ms_id, pulled=0):
+		frappe.flags.in_microsoft_sync = True
+		try:
+			return (
+				frappe.get_doc(
+					{
+						"doctype": "Event",
+						"subject": ms_id,
+						"event_type": "Private",
+						"starts_on": "2026-12-01 10:00:00",
+						"ends_on": "2026-12-01 10:30:00",
+						"custom_sync_with_microsoft_calendar": 1,
+						"custom_microsoft_calendar": cal,
+						"custom_microsoft_event_id": ms_id,
+						"custom_pulled_from_microsoft": pulled,
+					}
+				)
+				.insert(ignore_permissions=True)
+				.name
+			)
+		finally:
+			frappe.flags.in_microsoft_sync = False
+
+	def test_signing_in_as_another_account_clears_the_old_sync_state(self):
+		cal = self._connected(microsoft_account_id="oid-old")
+		local = self._event(cal, "old-local-1")
+		pulled = self._event(cal, "old-pulled-1", pulled=1)
+
+		sent = self._sign_in(
+			cal,
+			{"oid": "oid-new", "tid": "tenant-new", "preferred_username": "b.new@fabrikam.example"},
+			{"id": "oid-new", "mail": "b.new@fabrikam.example"},
+		)
+
+		row = frappe.db.get_value("Microsoft Calendar", cal, ["*"], as_dict=True)
+		self.assertFalse(row.delta_link)
+		self.assertIsNone(row.delta_window_end)
+		self.assertIsNone(row.last_sync)
+		self.assertEqual(row.ms_calendar_id, "AAMk-NEW")  # the new account's default calendar
+		self.assertEqual(row.microsoft_account_id, "oid-new")
+		self.assertEqual(row.microsoft_user_email, "b.new@fabrikam.example")
+		self.assertEqual(row.authorized, 1)
+		# Graph was really called with the new account's token for /me and its calendars.
+		self.assertEqual(
+			[
+				(c.args[0], c.args[1].split("?")[0], c.kwargs["headers"]["Authorization"])
+				for c in sent.call_args_list
+			],
+			[
+				("GET", "https://graph.microsoft.com/v1.0/me", "Bearer tok-new"),
+				("GET", "https://graph.microsoft.com/v1.0/me/calendars", "Bearer tok-new"),
+			],
+		)
+		# A Frappe-made Event no longer points into the old mailbox, and is no longer pushed.
+		self.assertEqual(
+			frappe.db.get_value(
+				"Event", local, ["custom_microsoft_event_id", "custom_sync_with_microsoft_calendar"]
+			),
+			(None, 0),
+		)
+		# A pulled copy of an old-mailbox event is left as it was.
+		self.assertEqual(frappe.db.get_value("Event", pulled, "custom_microsoft_event_id"), "old-pulled-1")
+		self.assertTrue(
+			frappe.db.exists(
+				"Comment",
+				{
+					"reference_doctype": "Microsoft Calendar",
+					"reference_name": cal,
+					"content": ["like", "%different Microsoft account%"],
+				},
+			)
+		)
+
+	def test_signing_in_again_as_the_same_account_keeps_the_sync_state(self):
+		cal = self._connected(microsoft_account_id="oid-old")
+		local = self._event(cal, "old-local-1")
+
+		self._sign_in(
+			cal, {"oid": "oid-old", "preferred_username": "a.old@contoso.example"}, {"id": "oid-old"}
+		)
+
+		row = frappe.db.get_value(
+			"Microsoft Calendar", cal, ["delta_link", "ms_calendar_id", "last_sync"], as_dict=True
+		)
+		self.assertEqual(row.delta_link, self.OLD_DELTA)
+		self.assertEqual(row.ms_calendar_id, "AAMk-OLD")
+		self.assertIsNotNone(row.last_sync)
+		self.assertEqual(frappe.db.get_value("Event", local, "custom_microsoft_event_id"), "old-local-1")
+
+	def test_a_connection_from_before_the_upgrade_is_matched_by_any_of_its_addresses(self):
+		"""No stored id yet; the ID token says the UPN while the form recorded /me's mail."""
+		cal = self._connected()
+
+		self._sign_in(
+			cal,
+			{"oid": "oid-old", "preferred_username": "a.old.upn@contoso.example"},
+			{
+				"id": "oid-old",
+				"mail": "A.Old@contoso.example",
+				"userPrincipalName": "a.old.upn@contoso.example",
+			},
+		)
+
+		row = frappe.db.get_value(
+			"Microsoft Calendar", cal, ["delta_link", "microsoft_account_id"], as_dict=True
+		)
+		self.assertEqual(row.delta_link, self.OLD_DELTA)
+		self.assertEqual(row.microsoft_account_id, "oid-old")  # recorded from now on
+
+	def test_a_sign_in_records_its_scopes_on_the_connection_and_clears_a_lost_authorization(self):
+		cal = self._connected(authorized=0, authorization_error="AADSTS50173: revoked")
+
+		self._sign_in(cal, {"oid": "oid-old"}, {"id": "oid-old", "mail": "a.old@contoso.example"})
+
+		row = frappe.db.get_value(
+			"Microsoft Calendar",
+			cal,
+			["authorized", "authorization_error", "authorized_scopes"],
+			as_dict=True,
+		)
+		self.assertEqual(row.authorized, 1)
+		self.assertFalse(row.authorization_error)
+		self.assertEqual(row.authorized_scopes, " ".join(graph.get_scopes(SETTINGS)))
+
+	def test_recorded_scopes_and_account_id_cannot_be_typed_in(self):
+		cal = self._calendar()
+		frappe.db.set_value(
+			"Microsoft Calendar", cal, {"authorized_scopes": "User.Read", "microsoft_account_id": "oid-1"}
+		)
+		doc = frappe.get_doc("Microsoft Calendar", cal)
+		doc.authorized_scopes = "User.Read OnlineMeetings.ReadWrite"
+		doc.microsoft_account_id = "oid-2"
+		doc.save(ignore_permissions=True)
+		self.assertEqual(
+			frappe.db.get_value("Microsoft Calendar", cal, ["authorized_scopes", "microsoft_account_id"]),
+			("User.Read", "oid-1"),
+		)
+
+
+class TestPerConnectionScopes(BaseTestCase):
+	def test_the_doctor_flags_a_connection_authorised_before_a_capability_was_added(self):
+		found = doctor.check_connection_scopes(
+			list(CURRENT_SCOPES),
+			[
+				{"name": "A", "authorized": 1, "authorized_scopes": "User.Read Calendars.ReadWrite"},
+				{"name": "B", "authorized": 1, "authorized_scopes": " ".join(list(CURRENT_SCOPES))},
+			],
+		)
+		self.assertEqual([(f["check"], f["target"]) for f in found], [("scopes.connection_missing", "A")])
+		self.assertIn("OnlineMeetings.ReadWrite", found[0]["title"])
+
+	def test_nothing_recorded_means_nothing_reported(self):
+		self.assertEqual(
+			doctor.check_connection_scopes(
+				list(CURRENT_SCOPES), [{"name": "A", "authorized": 1, "authorized_scopes": ""}]
+			),
+			[],
+		)
+
+	def test_a_connection_microsoft_stopped_accepting_is_reported(self):
+		found = doctor.check_connection_scopes(
+			list(CURRENT_SCOPES),
+			[
+				{
+					"name": "A",
+					"authorized": 0,
+					"authorized_scopes": "User.Read",
+					"authorization_error": "AADSTS50173",
+				},
+				{"name": "B", "authorized": 0, "authorized_scopes": "User.Read"},
+			],
+		)
+		self.assertEqual([(f["check"], f["target"]) for f in found], [("calendar.authorization_lost", "A")])
+
+
+class TestCopyAuthorizedScopesPatch(ConnectionTestCase):
+	def test_copies_the_site_wide_value_onto_authorised_connections_and_runs_twice(self):
+		site_wide = "User.Read Calendars.ReadWrite"
+		previous = frappe.db.get_single_value("Microsoft Settings", "authorized_scopes")
+		frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", site_wide)
+		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "authorized_scopes", previous or "")
+		empty = self._calendar("_Test Robust Empty")
+		recorded = self._calendar("_Test Robust Recorded")
+		frappe.db.set_value("Microsoft Calendar", recorded, "authorized_scopes", "User.Read")
+		unauthorised = self._calendar("_Test Robust Off", authorized=0)
+
+		copy_authorized_scopes_to_calendars.execute()
+		copy_authorized_scopes_to_calendars.execute()
+
+		scopes = dict(
+			frappe.get_all(
+				"Microsoft Calendar",
+				filters={"name": ["in", [empty, recorded, unauthorised]]},
+				fields=["name", "authorized_scopes"],
+				as_list=True,
+			)
+		)
+		self.assertEqual(scopes[empty], site_wide)
+		self.assertEqual(scopes[recorded], "User.Read")  # a post-upgrade sign-in is never overwritten
+		self.assertFalse(scopes[unauthorised])
+		# Nobody is told to re-authorise because of the upgrade.
+		connections = doctor._connection_scope_rows()
+		ours = [c for c in connections if c.name == empty]
+		self.assertEqual(doctor.check_connection_scopes(graph.parse_scopes(site_wide), ours), [])
+
+	def test_does_nothing_when_nothing_was_ever_recorded(self):
+		previous = frappe.db.get_single_value("Microsoft Settings", "authorized_scopes")
+		frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", "")
+		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "authorized_scopes", previous or "")
+		cal = self._calendar()
+
+		copy_authorized_scopes_to_calendars.execute()
+
+		self.assertFalse(frappe.db.get_value("Microsoft Calendar", cal, "authorized_scopes"))
