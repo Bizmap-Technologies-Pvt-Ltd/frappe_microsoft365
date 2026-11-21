@@ -237,7 +237,8 @@ class TestPull(SyncTestCase):
 			CALENDAR,
 			{
 				"delta_link": "https://graph.microsoft.com/v1.0/delta?token=abc",
-				"delta_window_end": add_to_date(now_datetime(), days=90),
+				# Still covers the whole look-ahead. A window that covers less is renewed (#21).
+				"delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20),
 			},
 		)
 		self.calendar.reload()
@@ -743,7 +744,7 @@ class TestSyncCost(SyncTestCase):
 			CALENDAR,
 			{
 				"delta_link": "https://graph.microsoft.com/v1.0/delta?token=warm",
-				"delta_window_end": add_to_date(now_datetime(), days=90),
+				"delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20),
 				"last_sync": now_datetime(),
 			},
 			update_modified=False,
@@ -2062,7 +2063,7 @@ class TestALargeCalendarCatchesUp(SyncTestCase):
 
 	def test_an_incremental_round_keeps_its_old_watermark_until_it_ends(self):
 		old = f"{GRAPH}/me/calendarView/delta?$deltatoken=old"
-		window_end = add_to_date(now_datetime(), days=90)
+		window_end = add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20)
 		frappe.db.set_value(
 			"Microsoft Calendar", CALENDAR, {"delta_link": old, "delta_window_end": window_end}
 		)
@@ -2083,7 +2084,7 @@ class TestALargeCalendarCatchesUp(SyncTestCase):
 		frappe.db.set_value(
 			"Microsoft Calendar",
 			CALENDAR,
-			{"delta_next_link": self.fake.link(3), "delta_next_window_end": add_to_date(now_datetime(), days=100)},
+			{"delta_next_link": self.fake.link(3), "delta_next_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20)},
 		)
 		calls = []
 
@@ -2106,7 +2107,7 @@ class TestALargeCalendarCatchesUp(SyncTestCase):
 		frappe.db.set_value(
 			"Microsoft Calendar",
 			CALENDAR,
-			{"delta_next_link": stuck, "delta_next_window_end": add_to_date(now_datetime(), days=100)},
+			{"delta_next_link": stuck, "delta_next_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20)},
 		)
 		self.calendar.reload()
 		page = {"value": [], "@odata.nextLink": stuck}

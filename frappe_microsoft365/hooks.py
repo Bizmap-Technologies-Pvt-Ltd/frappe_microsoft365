@@ -34,6 +34,9 @@ microsoft365_upgrade_checks = {
 	"1.1.2": [
 		"frappe_microsoft365.microsoft_files.upgrade_check_files_in_other_records_folders",
 	],
+	"1.2.0": [
+		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events",
+	],
 }
 
 doc_events = {

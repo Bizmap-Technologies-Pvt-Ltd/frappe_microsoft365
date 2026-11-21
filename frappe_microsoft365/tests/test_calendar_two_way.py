@@ -220,3 +220,159 @@ class TestCorrectPulledAllDayEventsPatch(SyncTestCase):
 		with patch.object(frappe.db, "set_value") as written:
 			patch_module.execute()
 		written.assert_not_called()
+
+
+# --- B4: the look-ahead ----------------------------------------------------------------
+
+
+class TestTheLookAheadNeverShrinks(GraphTestCase):
+	def _pull_at(self, when):
+		"""Run one pull with the clock at ``when``; returns the first URL it asked Graph for."""
+		fake = FakeGraph({("GET", f"{GRAPH}/me/calendarView/delta"): {"value": [], "@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=next"}})
+		self.calendar.reload()
+		with patch.object(sync, "now_datetime", return_value=get_datetime(when)), self._network(fake):
+			sync._pull(self.calendar)
+		return fake.calls[0][1]
+
+	def test_an_event_inside_the_look_ahead_is_pulled_late_in_the_windows_life(self):
+		"""Regression (#21): the window was renewed 14 days before its end, so on day 166 of a
+		180-day window an event 100 days ahead was outside it and not pulled."""
+		first = self._pull_at("2026-09-13 12:00:00")
+		self.assertIn("startDateTime=", first)
+		window_end = get_datetime(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_window_end"))
+
+		for day in range(1, 200, 7):
+			now = add_to_date(get_datetime("2026-09-13 12:00:00"), days=day)
+			url = self._pull_at(now)
+			if "startDateTime=" in url:
+				window_end = get_datetime(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_window_end"))
+			# Whatever the run, the window it read covers an event booked the full look-ahead out.
+			self.assertGreaterEqual(window_end, add_to_date(now, days=sync.WINDOW_FUTURE_DAYS), f"day {day}")
+
+	def test_a_window_from_before_the_fix_is_renewed_on_its_first_run(self):
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": f"{GRAPH}/me/calendarView/delta?$deltatoken=OLD",
+				# What 1.1.x stored: connection day + 180, here 69 days on.
+				"delta_window_end": add_to_date(now_datetime(), days=111),
+			},
+		)
+		url = self._pull_at(now_datetime())
+		self.assertIn("startDateTime=", url)
+		end = get_datetime(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_window_end"))
+		self.assertGreaterEqual(end, add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS))
+
+	def test_a_window_that_still_covers_the_look_ahead_is_reused(self):
+		old = f"{GRAPH}/me/calendarView/delta?$deltatoken=OLD"
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{"delta_link": old, "delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 5)},
+		)
+		self.assertEqual(self._pull_at(now_datetime()), old)
+
+
+# --- B5: mirrors Outlook no longer has ---------------------------------------------------
+
+
+class TestMirrorsMissingFromOutlook(GraphTestCase):
+	OLD = f"{GRAPH}/me/calendarView/delta?$deltatoken=OLD"
+
+	def setUp(self):
+		super().setUp()
+		self._delete_setting(0)
+		# Three mirrors from an earlier sync, inside the window.
+		self._pull_with([ms_event(f"ms-o{i}", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+			end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"}) for i in (1, 2, 3)])
+
+	def _delete_setting(self, value):
+		frappe.db.set_single_value("Microsoft Settings", "delete_orphaned_calendar_events", value)
+		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "delete_orphaned_calendar_events", 0)
+
+	def _resync(self, old_answer):
+		"""A run whose stored link Graph answers with ``old_answer``; the fresh read has o1 and o3."""
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, {"delta_link": self.OLD, "delta_window_end": add_to_date(now_datetime(), days=5)}
+		)
+		self.calendar.reload()
+		fake = FakeGraph(
+			{
+				("GET", f"{GRAPH}/me/calendarView/delta?startDateTime="): {
+					"value": [ms_event("ms-o1", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+						end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"}),
+						ms_event("ms-o3", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+						end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"})],
+					"@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=FRESH",
+				},
+				("GET", self.OLD): old_answer,
+			}
+		)
+		with self._network(fake), patch.object(frappe.db, "commit"):
+			result = sync._sync_locked(self.calendar)
+		return result, fake
+
+	def _flag(self, ms_id):
+		event = self._event_for(ms_id)
+		return None if event is None else event.custom_microsoft_orphaned
+
+	def test_a_mirror_missing_from_a_full_resync_is_flagged_not_deleted(self):
+		result, _fake = self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self._flag("ms-o2"), 1)
+		self.assertEqual((self._flag("ms-o1"), self._flag("ms-o3")), (0, 0))
+		self.assertIn("Missing From Outlook", result["message"])
+
+	def test_with_the_setting_on_it_is_deleted(self):
+		self._delete_setting(1)
+		result, _fake = self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
+
+		self.assertIsNone(self._event_for("ms-o2"))
+		self.assertEqual(result["deleted"], 1)
+		self.assertIsNotNone(self._event_for("ms-o1"))
+
+	def test_a_renewal_first_reads_the_old_link_to_the_end(self):
+		"""A deletion still waiting behind the old link is applied as a deletion, not a flag."""
+		result, fake = self._resync({"value": [{"id": "ms-o2", "@removed": {"reason": "deleted"}}],
+			"@odata.deltaLink": self.OLD + "-2"})
+
+		self.assertIsNone(self._event_for("ms-o2"))
+		self.assertEqual(result["deleted"], 1)
+		self.assertIn(("GET", self.OLD, None), fake.calls)
+
+	def test_after_a_410_the_mirror_is_flagged(self):
+		result, fake = self._resync(410)
+
+		self.assertEqual(self._flag("ms-o2"), 1)
+		self.assertEqual([c[1] for c in fake.calls].count(self.OLD), 1, "an expired link is not asked twice")
+
+	def test_a_frappe_event_is_never_flagged(self):
+		local = self._quiet_event("ms-local-unseen", starts_on="2026-12-02 10:00:00", ends_on="2026-12-02 11:00:00")
+		self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
+		self.assertEqual(frappe.db.get_value("Event", local.name, "custom_microsoft_orphaned"), 0)
+
+	def test_a_flagged_mirror_that_comes_back_is_unflagged(self):
+		self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
+		self.assertEqual(self._flag("ms-o2"), 1)
+		self._pull_with([ms_event("ms-o2", subject="Back again")])
+		self.assertEqual(self._flag("ms-o2"), 0)
+
+	def test_the_doctor_and_the_upgrade_report_list_them(self):
+		self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
+		name = self._event_for("ms-o2").name
+
+		for check, findings in (
+			("calendar.orphaned_events", sync.orphaned_event_findings()),
+			("upgrade.calendar_orphaned_events", sync.upgrade_check_orphaned_events()),
+		):
+			mine = [f for f in findings if f.get("target") == CALENDAR]
+			self.assertEqual(len(mine), 1, findings)
+			self.assertEqual(mine[0]["check"], check)
+			self.assertIn(name, mine[0]["detail"])
+
+	def test_the_upgrade_check_is_registered_for_1_2_0(self):
+		hooks = frappe.get_hooks("microsoft365_upgrade_checks")
+		paths = [p for paths in (hooks.get("1.2.0") or []) for p in ([paths] if isinstance(paths, str) else paths)]
+		self.assertIn("frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events", paths)

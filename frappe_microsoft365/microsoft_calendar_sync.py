@@ -76,10 +76,16 @@ EVENT_SELECT = (
 )
 
 #: How much of the calendar the delta window covers. Graph fixes the window when the delta
-#: is initialised, so we re-initialise before the far edge gets close.
+#: is initialised and never moves it, so its far edge comes closer every day.
 WINDOW_PAST_DAYS = 30
+#: The look-ahead the sync promises: an event starting less than this far ahead is always
+#: inside the window. The window used to be re-initialised only 14 days before it ran out, so
+#: by then it saw two weeks ahead, and a meeting booked for next quarter was not pulled at all.
 WINDOW_FUTURE_DAYS = 180
-WINDOW_REFRESH_MARGIN_DAYS = 14
+#: How often the window is re-initialised. It is asked for this much further ahead than the
+#: look-ahead, and renewed as soon as the look-ahead would drop below WINDOW_FUTURE_DAYS, so a
+#: renewal (one full read of the window) happens about once a month.
+WINDOW_RESET_DAYS = 30
 
 #: How many Microsoft ids go into one prefetch query. A delta page can carry thousands of them,
 #: and at that size an ``IN`` clause stops behaving like a lookup: the statement grows past what
@@ -549,6 +555,11 @@ def _sync_locked(doc):
 	frappe.db.commit()  # nosemgrep
 
 	summary = f"Pulled {pulled}, deleted {deleted}, pushed {pushed}."
+	if doc.flags.orphans_flagged:
+		summary += " " + _(
+			"{0} events pulled from this calendar are no longer in Outlook and were marked Missing "
+			"From Outlook; Microsoft Settings > Troubleshoot > Run Diagnostics lists them."
+		).format(doc.flags.orphans_flagged)
 	if doc.flags.pull_unfinished:
 		# Not an error: a large calendar is read over several runs, and this says so.
 		summary += " " + _("More changes are waiting in Microsoft; the next sync carries on from here.")
@@ -581,7 +592,7 @@ def background_reasons(doc):
 		elif not doc.delta_link:
 			reasons.append(_("This is a first sync, so the whole calendar window is read."))
 		elif _delta_window_is_stale(doc):
-			reasons.append(_("The sync window has run out, so the calendar is read again in full."))
+			reasons.append(_("The sync window is due to be renewed, so the calendar is read again in full."))
 
 	if doc.push_to_microsoft_calendar:
 		pending = _pending_push_count(doc)
@@ -625,19 +636,33 @@ def _pending_push_count(doc):
 def _initial_delta_path(now=None):
 	now = now or now_datetime()
 	start = _iso_utc(add_to_date(now, days=-WINDOW_PAST_DAYS))
-	end = _iso_utc(add_to_date(now, days=WINDOW_FUTURE_DAYS))
+	end = _iso_utc(_window_end_from(now))
 	return (
 		f"/me/calendarView/delta?startDateTime={start}&endDateTime={end}"
 		f"&$select={EVENT_SELECT}"
 	)
 
 
+def _window_end_from(now):
+	"""Where a window initialised at ``now`` ends."""
+	return add_to_date(now, days=WINDOW_FUTURE_DAYS + WINDOW_RESET_DAYS)
+
+
+def _window_start_of(window_end):
+	"""Where the window that ends at ``window_end`` started (its round's ``now`` minus the past)."""
+	return add_to_date(get_datetime(window_end), days=-(WINDOW_PAST_DAYS + WINDOW_FUTURE_DAYS + WINDOW_RESET_DAYS))
+
+
 def _window_end_is_stale(window_end):
-	"""True when a delta window ending at ``window_end`` is too close to its end to keep using."""
+	"""True once a delta window ending at ``window_end`` no longer covers the full look-ahead.
+
+	That is the schedule: a window starts WINDOW_RESET_DAYS longer than the look-ahead, so it is
+	renewed about once a month and an event up to WINDOW_FUTURE_DAYS ahead is always inside it.
+	A window from before 1.2.0 was sized to the look-ahead alone, so it is renewed on its first run.
+	"""
 	if not window_end:
 		return True
-	margin = add_to_date(now_datetime(), days=WINDOW_REFRESH_MARGIN_DAYS)
-	return get_datetime(window_end) <= margin
+	return get_datetime(window_end) < add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS)
 
 
 def _delta_window_is_stale(doc):
@@ -682,8 +707,10 @@ def _start_of_pull(doc):
 
 
 def _new_round():
+	# The window end doubles as the round's key (see _mark_seen). Datetime columns keep the
+	# microseconds, so it round-trips exactly and two rounds a moment apart still differ.
 	now = now_datetime()
-	return _initial_delta_path(now), add_to_date(now, days=WINDOW_FUTURE_DAYS)
+	return _initial_delta_path(now), _window_end_from(now)
 
 
 def _pull(doc):
@@ -693,14 +720,23 @@ def _pull(doc):
 	unfinished: the link to the next page is stored as the resume point and the next run
 	carries on from it, so a large calendar catches up over a few runs instead of re-reading
 	the same first pages forever. ``doc.flags.pull_unfinished`` tells the caller this happened.
+
+	A round that reads the whole window (a first sync, a renewal, a resync after Graph refused
+	the old link) is also the one moment the full list of what Outlook still has is known, so it
+	ends by settling the mirrors it did not see: see _settle_unseen_mirrors.
 	"""
 	path, round_window_end = _start_of_pull(doc)
+	# The watermark of the last completed round. A renewal reads the window afresh, and the
+	# changes still waiting behind this link — deletions above all — would otherwise be lost.
+	previous_link = doc.delta_link
 
 	try:
 		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 	except MsGraphResyncRequired:
 		# Token expired or the mailbox was moved: start the window again from scratch. A resume
 		# point belongs to the round Graph has just refused, so it goes with it.
+		if path == previous_link:
+			previous_link = None
 		path, round_window_end = _new_round()
 		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 
@@ -724,12 +760,20 @@ def _pull(doc):
 	finally:
 		frappe.flags.in_microsoft_sync = False
 
+	if round_window_end:
+		_mark_seen(items, round_window_end)
+
 	resumable = _has_resume_point_fields()
 
 	# Only store the new watermark once every page of the round was consumed without raising.
 	# Until then the old deltaLink stays exactly as it was: a round that never finishes repeats
 	# work, but never skips any.
 	if delta_link:
+		if round_window_end:
+			# The whole window has just been read. First what the old link still had to say, then
+			# whatever Outlook no longer has that nothing said was deleted.
+			removed += _drain_previous_round(doc, previous_link)
+			removed += _settle_unseen_mirrors(doc, round_window_end)
 		updates = {"delta_link": delta_link}
 		if round_window_end:
 			updates["delta_window_end"] = round_window_end
@@ -765,6 +809,144 @@ def _pull(doc):
 		)
 
 	return upserted, removed
+
+
+def _has_event_field(fieldname):
+	"""Whether this site's Event already has one of the app's newer custom fields.
+
+	The sync is scheduled, so it can run between the code update and `bench migrate`, before the
+	fields exist. What needs them is skipped until then rather than failing the whole pull.
+	"""
+	return frappe.get_meta("Event").has_field(fieldname)
+
+
+def _mark_seen(items, round_key):
+	"""Record that the mirrors of these events were seen in the full read keyed ``round_key``.
+
+	One UPDATE per PREFETCH_CHUNK ids rather than a save per event: the mark is bookkeeping, it
+	must not count as an edit, and a full read touches every mirror in the window. Seeing a
+	mirror also clears its Missing From Outlook mark — it is there after all.
+	"""
+	if not (_has_event_field("custom_microsoft_seen_in_round") and _has_event_field("custom_microsoft_orphaned")):
+		return
+	ids = [ev.get("id") for ev in items if ev.get("id") and not _is_removed(ev)]
+	ids = list(dict.fromkeys(ids))
+	for start in range(0, len(ids), PREFETCH_CHUNK):
+		chunk = ids[start : start + PREFETCH_CHUNK]
+		frappe.db.sql(
+			"""
+			update `tabEvent`
+			set custom_microsoft_seen_in_round = %(round)s, custom_microsoft_orphaned = 0
+			where custom_pulled_from_microsoft = 1 and custom_microsoft_event_id in %(ids)s
+			""",
+			{"round": round_key, "ids": tuple(chunk)},
+		)
+
+
+def _drain_previous_round(doc, link):
+	"""Apply the deletions still waiting behind the link a renewal is about to replace.
+
+	Read only for its deletions: what still exists has just been read afresh with the new window.
+	Best effort — the link may have expired, or have more pages than one run reads — because
+	anything it cannot deliver is caught by _settle_unseen_mirrors straight afterwards, just
+	flagged instead of deleted. Returns how many mirrors it deleted.
+	"""
+	if not link or not graph.is_graph_url(link):
+		return 0
+	try:
+		items, _delta, _next = graph.graph_delta(link, doc.name, headers=UTC_PREFER)
+	except MsGraphError:
+		return 0
+
+	gone = [ev for ev in items if _is_removed(ev)]
+	existing_map = _existing_event_map(ev.get("id") for ev in gone)
+	removed = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for ev in gone:
+			try:
+				if _upsert_event(doc, ev, existing_map) == "deleted":
+					removed += 1
+			except Exception:
+				frappe.log_error(title=f"MS event upsert failed: {ev.get('id')}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	return removed
+
+
+def _unseen_mirrors(calendar_name, round_key):
+	"""Mirrors in the window of the full read ``round_key`` that the read did not return."""
+	return frappe.db.sql(
+		"""
+		select name from `tabEvent`
+		where custom_microsoft_calendar = %(calendar)s
+			and custom_pulled_from_microsoft = 1
+			and custom_sync_with_microsoft_calendar = 1
+			and coalesce(custom_microsoft_event_id, '') != ''
+			and starts_on >= %(start)s and starts_on < %(end)s
+			and (custom_microsoft_seen_in_round is null or custom_microsoft_seen_in_round != %(round)s)
+		order by starts_on
+		""",
+		{
+			"calendar": calendar_name,
+			"start": _window_start_of(round_key),
+			"end": round_key,
+			"round": round_key,
+		},
+		pluck=True,
+	)
+
+
+def _settle_unseen_mirrors(doc, round_key):
+	"""Mark the mirrors a full read of the window did not return as Missing From Outlook.
+
+	A full read lists everything Outlook has in the window, so a mirror it did not return is one
+	whose event was deleted without the deletion ever reaching us — in the gap a resync or a
+	window renewal leaves. They are flagged, and listed by the doctor, rather than deleted:
+	other records may link to these Events. Deleting them is the admin's choice, made with
+	Microsoft Settings' "Delete events missing from Outlook". Returns how many were deleted.
+	"""
+	if not (_has_event_field("custom_microsoft_seen_in_round") and _has_event_field("custom_microsoft_orphaned")):
+		return 0
+
+	names = _unseen_mirrors(doc.name, round_key)
+	if not names:
+		return 0
+
+	frappe.db.sql(
+		"update `tabEvent` set custom_microsoft_orphaned = 1 where name in %(names)s",
+		{"names": tuple(names)},
+	)
+	if not _delete_orphans():
+		doc.flags.orphans_flagged = len(names)
+		return 0
+
+	deleted = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for name in names:
+			# A savepoint each, so one Event that cannot go takes nothing else with it.
+			frappe.db.savepoint("m365_orphan")
+			try:
+				# Not forced: an Event another record still links to stays, flagged, rather than
+				# leaving that record pointing at nothing.
+				frappe.delete_doc("Event", name, ignore_permissions=True)
+				deleted += 1
+			except Exception:
+				frappe.db.rollback(save_point="m365_orphan")
+				frappe.log_error(title=f"MS Calendar: event missing from Outlook could not be deleted: {name}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	if deleted < len(names):
+		doc.flags.orphans_flagged = len(names) - deleted
+	return deleted
+
+
+def _delete_orphans():
+	"""The admin's choice: delete mirrors missing from Outlook, or only flag them (the default)."""
+	if not frappe.get_meta("Microsoft Settings").has_field("delete_orphaned_calendar_events"):
+		return False
+	return bool(cint(frappe.db.get_single_value("Microsoft Settings", "delete_orphaned_calendar_events")))
 
 
 def _is_removed(ev):
@@ -995,6 +1177,9 @@ def _upsert_event(doc, ev, existing_map=None):
 		locally_originated = False
 
 	values = _target_values(doc, ev, locally_originated)
+	if existing and event.get("custom_microsoft_orphaned"):
+		# Outlook has just said something about it, so it is not missing after all.
+		values["custom_microsoft_orphaned"] = 0
 	changed = _apply(event, values)
 	if not existing:
 		changed = True
@@ -1789,6 +1974,64 @@ def upgrade_check_event_owners():
 			)
 		)
 	return findings
+
+
+def orphaned_event_findings(check="calendar.orphaned_events"):
+	"""Doctor findings: Events pulled from Outlook that a full read no longer found, per calendar.
+
+	Read-only. The sync only flags these (see _settle_unseen_mirrors); this is where an admin
+	finds them, decides, and learns about the setting that deletes them instead.
+	"""
+	from frappe_microsoft365 import doctor
+
+	if not frappe.db.has_column("Event", "custom_microsoft_orphaned"):
+		return []
+
+	rows = frappe.get_all(
+		"Event",
+		filters={"custom_microsoft_orphaned": 1},
+		fields=["name", "subject", "starts_on", "custom_microsoft_calendar as calendar"],
+		order_by="custom_microsoft_calendar, starts_on",
+		limit_page_length=0,
+	)
+	by_calendar = {}
+	for row in rows:
+		by_calendar.setdefault(row.calendar or _("no calendar"), []).append(row)
+
+	findings = []
+	for calendar, events in by_calendar.items():
+		sample = ", ".join(f"{row.name} ({row.subject})" for row in events[:UPGRADE_SAMPLE_SIZE])
+		more = len(events) - UPGRADE_SAMPLE_SIZE
+		if more > 0:
+			sample += " " + _("and {0} more").format(more)
+		findings.append(
+			doctor.finding(
+				check,
+				doctor.WARN,
+				_("{0} events pulled from Microsoft Calendar {1} are no longer in Outlook").format(len(events), calendar),
+				_(
+					"A full read of the Outlook calendar did not find these, so they were most likely "
+					"deleted there while the sync was resetting: {0}. They are marked Missing From "
+					"Outlook and were not deleted, because other records may link to them."
+				).format(sample),
+				_(
+					"Check them in Outlook and delete the ones that are gone. To have the sync delete "
+					"such events itself, tick Delete events missing from Outlook in Microsoft Settings."
+				),
+				target=calendar,
+			)
+		)
+	return findings
+
+
+def upgrade_check_orphaned_events():
+	"""Upgrade report: Events pulled from Outlook that are flagged Missing From Outlook.
+
+	Events only get flagged by a full read of their calendar, which the first sync after
+	upgrading to 1.2.0 does, so right after `bench migrate` this normally has nothing to say;
+	Run Diagnostics shows the same list from then on.
+	"""
+	return orphaned_event_findings("upgrade.calendar_orphaned_events")
 
 
 def _events_of_others(calendar=None):

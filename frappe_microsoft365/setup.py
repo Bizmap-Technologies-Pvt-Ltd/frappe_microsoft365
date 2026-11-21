@@ -276,6 +276,31 @@ def create_event_custom_fields(only_definitions=False):
 				"description": "Everyone invited, with their reply. Refreshed by each sync.",
 				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
+			{
+				"fieldname": "custom_microsoft_orphaned",
+				"fieldtype": "Check",
+				"label": "Missing From Outlook",
+				"insert_after": "custom_microsoft_attendees",
+				"read_only": 1,
+				"no_copy": 1,
+				"depends_on": "eval:doc.custom_microsoft_orphaned",
+				"description": (
+					"A full read of the Outlook calendar no longer found this event. It was probably "
+					"deleted there; check, then delete it here if it is no longer needed."
+				),
+			},
+			{
+				# When this mirror was last seen in a full read of its calendar's window: the key of
+				# that read. A full read that ends without having seen a mirror is how one Outlook
+				# deleted while nobody was looking (a resync, a window reset) is told apart.
+				"fieldname": "custom_microsoft_seen_in_round",
+				"fieldtype": "Datetime",
+				"label": "Seen In Calendar Read",
+				"insert_after": "custom_microsoft_orphaned",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
 		]
 	}
 	if only_definitions:
