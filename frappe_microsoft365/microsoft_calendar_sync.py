@@ -1724,17 +1724,17 @@ def _events_of_others(calendar=None):
 	deleting one of those is a write to the mailbox even when sync was later unticked.
 	"""
 	return frappe.db.sql(
-		f"""
+		"""
 		select e.name, e.owner, e.custom_microsoft_calendar as calendar, c.`user` as calendar_user
 		from `tabEvent` e
 		inner join `tabMicrosoft Calendar` c on c.name = e.custom_microsoft_calendar
 		where (e.custom_sync_with_microsoft_calendar = 1
 				or coalesce(e.custom_microsoft_event_id, '') != '')
 			and (coalesce(c.`user`, '') = '' or e.owner != c.`user`)
-			{"and c.name = %(calendar)s" if calendar else ""}
+			and (%(calendar)s = '' or c.name = %(calendar)s)
 		order by e.custom_microsoft_calendar, e.creation
 		""",
-		{"calendar": calendar},
+		{"calendar": calendar or ""},
 		as_dict=True,
 	)
 

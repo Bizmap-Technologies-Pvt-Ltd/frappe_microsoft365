@@ -143,11 +143,16 @@ def assert_patches(manifest):
 	patches = app_patches()
 	for patch in patches:
 		check(frappe.db.exists("Patch Log", {"patch": patch}), f"{patch} is recorded as run")
+	before = set(manifest.get("patches_before") or [])
 	for fragment, expectation in PATCH_EXPECTATIONS.items():
-		if any(fragment in patch for patch in patches):
-			expectation(manifest)
-		else:
+		matching = [patch for patch in patches if fragment in patch]
+		if not matching:
 			print(f"  (no patch matching '{fragment}' in this release)")
+		elif all(patch in before for patch in matching):
+			# Recorded as run when the previous release was installed, before the data existed.
+			print(f"  ({', '.join(matching)} was already applied by the previous release)")
+		else:
+			expectation(manifest)
 
 
 # --- upgrade report -------------------------------------------------------------------
