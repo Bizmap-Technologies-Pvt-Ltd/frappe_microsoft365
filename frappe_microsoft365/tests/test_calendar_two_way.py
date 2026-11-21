@@ -58,7 +58,10 @@ class FakeGraph:
 				if callable(answer):
 					answer = answer(url, body)
 				if isinstance(answer, int):
-					return _response(answer, {"error": {"code": "ErrorItemNotFound", "message": "x"}} if answer >= 400 else None)
+					return _response(
+						answer,
+						{"error": {"code": "ErrorItemNotFound", "message": "x"}} if answer >= 400 else None,
+					)
 				return _response(200, answer)
 		return _response(404, {"error": {"code": "ErrorItemNotFound", "message": "not routed"}})
 
@@ -142,7 +145,7 @@ class TestAllDayEvents(GraphTestCase):
 				fake.calls.clear()
 				with self._network(fake):
 					sync._push(self.calendar)
-			(method, url, body), = fake.of("POST")
+			((method, url, body),) = fake.of("POST")
 			self.assertEqual((method, url), ("POST", f"{GRAPH}/me/events"))
 			self.assertTrue(body["isAllDay"])
 			self.assertEqual(body["start"], {"dateTime": "2026-12-25T00:00:00", "timeZone": tz})
@@ -153,7 +156,9 @@ class TestAllDayEvents(GraphTestCase):
 		self.assertEqual((start["dateTime"], end["dateTime"]), ("2026-12-25T00:00:00", "2026-12-26T00:00:00"))
 
 	def test_an_end_already_at_the_next_midnight_is_not_pushed_a_day_further(self):
-		start, end = sync._all_day_to_ms(get_datetime("2026-12-25 00:00:00"), get_datetime("2026-12-27 00:00:00"))
+		_start, end = sync._all_day_to_ms(
+			get_datetime("2026-12-25 00:00:00"), get_datetime("2026-12-27 00:00:00")
+		)
 		self.assertEqual(end["dateTime"], "2026-12-27T00:00:00")
 
 
@@ -229,7 +234,14 @@ class TestCorrectPulledAllDayEventsPatch(SyncTestCase):
 class TestTheLookAheadNeverShrinks(GraphTestCase):
 	def _pull_at(self, when):
 		"""Run one pull with the clock at ``when``; returns the first URL it asked Graph for."""
-		fake = FakeGraph({("GET", f"{GRAPH}/me/calendarView/delta"): {"value": [], "@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=next"}})
+		fake = FakeGraph(
+			{
+				("GET", f"{GRAPH}/me/calendarView/delta"): {
+					"value": [],
+					"@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=next",
+				}
+			}
+		)
 		self.calendar.reload()
 		with patch.object(sync, "now_datetime", return_value=get_datetime(when)), self._network(fake):
 			sync._pull(self.calendar)
@@ -246,7 +258,9 @@ class TestTheLookAheadNeverShrinks(GraphTestCase):
 			now = add_to_date(get_datetime("2026-09-13 12:00:00"), days=day)
 			url = self._pull_at(now)
 			if "startDateTime=" in url:
-				window_end = get_datetime(frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_window_end"))
+				window_end = get_datetime(
+					frappe.db.get_value("Microsoft Calendar", CALENDAR, "delta_window_end")
+				)
 			# Whatever the run, the window it read covers an event booked the full look-ahead out.
 			self.assertGreaterEqual(window_end, add_to_date(now, days=sync.WINDOW_FUTURE_DAYS), f"day {day}")
 
@@ -270,7 +284,10 @@ class TestTheLookAheadNeverShrinks(GraphTestCase):
 		frappe.db.set_value(
 			"Microsoft Calendar",
 			CALENDAR,
-			{"delta_link": old, "delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 5)},
+			{
+				"delta_link": old,
+				"delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 5),
+			},
 		)
 		self.assertEqual(self._pull_at(now_datetime()), old)
 
@@ -285,26 +302,46 @@ class TestMirrorsMissingFromOutlook(GraphTestCase):
 		super().setUp()
 		self._delete_setting(0)
 		# Three mirrors from an earlier sync, inside the window.
-		self._pull_with([ms_event(f"ms-o{i}", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
-			end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"}) for i in (1, 2, 3)])
+		self._pull_with(
+			[
+				ms_event(
+					f"ms-o{i}",
+					start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+					end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"},
+				)
+				for i in (1, 2, 3)
+			]
+		)
 
 	def _delete_setting(self, value):
 		frappe.db.set_single_value("Microsoft Settings", "delete_orphaned_calendar_events", value)
-		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "delete_orphaned_calendar_events", 0)
+		self.addCleanup(
+			frappe.db.set_single_value, "Microsoft Settings", "delete_orphaned_calendar_events", 0
+		)
 
 	def _resync(self, old_answer):
 		"""A run whose stored link Graph answers with ``old_answer``; the fresh read has o1 and o3."""
 		frappe.db.set_value(
-			"Microsoft Calendar", CALENDAR, {"delta_link": self.OLD, "delta_window_end": add_to_date(now_datetime(), days=5)}
+			"Microsoft Calendar",
+			CALENDAR,
+			{"delta_link": self.OLD, "delta_window_end": add_to_date(now_datetime(), days=5)},
 		)
 		self.calendar.reload()
 		fake = FakeGraph(
 			{
 				("GET", f"{GRAPH}/me/calendarView/delta?startDateTime="): {
-					"value": [ms_event("ms-o1", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
-						end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"}),
-						ms_event("ms-o3", start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
-						end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"})],
+					"value": [
+						ms_event(
+							"ms-o1",
+							start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+							end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"},
+						),
+						ms_event(
+							"ms-o3",
+							start={"dateTime": "2026-12-02T09:00:00", "timeZone": "UTC"},
+							end={"dateTime": "2026-12-02T09:30:00", "timeZone": "UTC"},
+						),
+					],
 					"@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=FRESH",
 				},
 				("GET", self.OLD): old_answer,
@@ -336,21 +373,27 @@ class TestMirrorsMissingFromOutlook(GraphTestCase):
 
 	def test_a_renewal_first_reads_the_old_link_to_the_end(self):
 		"""A deletion still waiting behind the old link is applied as a deletion, not a flag."""
-		result, fake = self._resync({"value": [{"id": "ms-o2", "@removed": {"reason": "deleted"}}],
-			"@odata.deltaLink": self.OLD + "-2"})
+		result, fake = self._resync(
+			{
+				"value": [{"id": "ms-o2", "@removed": {"reason": "deleted"}}],
+				"@odata.deltaLink": self.OLD + "-2",
+			}
+		)
 
 		self.assertIsNone(self._event_for("ms-o2"))
 		self.assertEqual(result["deleted"], 1)
 		self.assertIn(("GET", self.OLD, None), fake.calls)
 
 	def test_after_a_410_the_mirror_is_flagged(self):
-		result, fake = self._resync(410)
+		_result, fake = self._resync(410)
 
 		self.assertEqual(self._flag("ms-o2"), 1)
 		self.assertEqual([c[1] for c in fake.calls].count(self.OLD), 1, "an expired link is not asked twice")
 
 	def test_a_frappe_event_is_never_flagged(self):
-		local = self._quiet_event("ms-local-unseen", starts_on="2026-12-02 10:00:00", ends_on="2026-12-02 11:00:00")
+		local = self._quiet_event(
+			"ms-local-unseen", starts_on="2026-12-02 10:00:00", ends_on="2026-12-02 11:00:00"
+		)
 		self._resync({"value": [], "@odata.deltaLink": self.OLD + "-2"})
 		self.assertEqual(frappe.db.get_value("Event", local.name, "custom_microsoft_orphaned"), 0)
 
@@ -375,7 +418,9 @@ class TestMirrorsMissingFromOutlook(GraphTestCase):
 
 	def test_the_upgrade_check_is_registered_for_1_2_0(self):
 		hooks = frappe.get_hooks("microsoft365_upgrade_checks")
-		paths = [p for paths in (hooks.get("1.2.0") or []) for p in ([paths] if isinstance(paths, str) else paths)]
+		paths = [
+			p for paths in (hooks.get("1.2.0") or []) for p in ([paths] if isinstance(paths, str) else paths)
+		]
 		self.assertIn("frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events", paths)
 
 
@@ -401,8 +446,9 @@ class TestASyncDoesNotHoldItsLocks(GraphTestCase):
 
 		for n in range(2):
 			self._quiet_event(subject=f"Pending {n}")
-		with patch.object(graph, "_http_request", side_effect=network), patch.object(
-			frappe.db, "commit", side_effect=lambda *a, **k: timeline.append("COMMIT")
+		with (
+			patch.object(graph, "_http_request", side_effect=network),
+			patch.object(frappe.db, "commit", side_effect=lambda *a, **k: timeline.append("COMMIT")),
 		):
 			result = sync._sync_locked(self.calendar)
 
@@ -420,7 +466,9 @@ class TestOneEventOneMeeting(GraphTestCase):
 	def test_a_second_create_for_an_event_that_already_has_an_id_is_skipped(self):
 		event = self._quiet_event(subject="Board meeting")
 		# Another worker created it a moment ago; this one still holds the old copy.
-		frappe.db.set_value("Event", event.name, "custom_microsoft_event_id", "AAMk-first", update_modified=False)
+		frappe.db.set_value(
+			"Event", event.name, "custom_microsoft_event_id", "AAMk-first", update_modified=False
+		)
 		fake = FakeGraph({("POST", f"{GRAPH}/me/events"): {"id": "AAMk-second"}})
 
 		with self._network(fake):
@@ -457,7 +505,7 @@ class TestOneEventOneMeeting(GraphTestCase):
 
 		with self._network(fake), patch.object(frappe.db, "commit"):
 			sync.create_event_in_graph(call[1]["event_name"])
-		(method, url, body), = fake.calls
+		((method, url, body),) = fake.calls
 		self.assertEqual((method, url, body["subject"]), ("POST", f"{GRAPH}/me/events", "Plain"))
 		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-later")
 
@@ -479,10 +527,13 @@ class TestOneEventOneMeeting(GraphTestCase):
 			self.assertEqual(event.custom_teams_join_url, "https://teams.microsoft.com/l/meetup-join/x")
 			frappe.db.rollback()
 
-		self.assertEqual([c[:2] for c in fake.calls], [
-			("POST", f"{GRAPH}/me/events"),
-			("DELETE", f"{GRAPH}/me/events/AAMk-teams"),
-		])
+		self.assertEqual(
+			[c[:2] for c in fake.calls],
+			[
+				("POST", f"{GRAPH}/me/events"),
+				("DELETE", f"{GRAPH}/me/events/AAMk-teams"),
+			],
+		)
 
 	def test_a_rollback_to_a_savepoint_is_caught_at_the_commit(self):
 		fake = self._teams_fake()
@@ -534,7 +585,9 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 			sync._push(self.calendar)
 		self.assertEqual(frappe.db.get_value("Event", self.event.name, "custom_microsoft_event_id"), self.ID)
 		self.fake.calls.clear()
-		frappe.db.set_value("Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), seconds=1))
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), seconds=1)
+		)
 		self.calendar.reload()
 
 	def _pulled_reply(self):
@@ -564,7 +617,9 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 		"""Regression (#19): the pull saved the reply, and the same run's push sent Frappe's
 		participants and description back over Outlook's."""
 		# Synced a minute ago, untouched in Frappe since: only the pull's own save moves it.
-		frappe.db.set_value("Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), minutes=-1))
+		frappe.db.set_value(
+			"Microsoft Calendar", CALENDAR, "last_sync", add_to_date(now_datetime(), minutes=-1)
+		)
 		self.calendar.reload()
 		frappe.db.set_value(
 			"Event",
@@ -584,7 +639,9 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 				get_datetime(self.calendar.last_sync),
 				"the pull's save makes the Event a push candidate",
 			)
-			self.assertIn("accepted", frappe.db.get_value("Event", self.event.name, "custom_microsoft_attendees"))
+			self.assertIn(
+				"accepted", frappe.db.get_value("Event", self.event.name, "custom_microsoft_attendees")
+			)
 			with self._network(self.fake), patch.object(frappe.db, "commit"):
 				sync._push(self.calendar)
 
@@ -593,7 +650,7 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 	def test_an_attendee_added_in_outlook_survives_a_title_edit_in_frappe(self):
 		self._edit(subject="Design review (moved to Thursday)")
 
-		(method, url, body), = self.fake.calls
+		((method, url, body),) = self.fake.calls
 		self.assertEqual((method, url), ("PATCH", f"{GRAPH}/me/events/{self.ID}"))
 		self.assertEqual(body, {"subject": "Design review (moved to Thursday)"})
 
@@ -626,8 +683,12 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 		self.assertEqual([a["emailAddress"]["address"] for a in body["attendees"]], ["yusuf@partner.example"])
 
 	def test_an_event_from_before_the_fix_gets_its_state_from_the_version_before_the_edit(self):
-		frappe.db.set_value("Event", self.event.name, "custom_microsoft_sync_state", None, update_modified=False)
-		frappe.db.set_value("Event", self.event.name, "modified", add_to_date(now_datetime(), hours=-1), update_modified=False)
+		frappe.db.set_value(
+			"Event", self.event.name, "custom_microsoft_sync_state", None, update_modified=False
+		)
+		frappe.db.set_value(
+			"Event", self.event.name, "modified", add_to_date(now_datetime(), hours=-1), update_modified=False
+		)
 
 		self._edit(subject="Renamed")
 
@@ -669,7 +730,9 @@ class TestOurSeriesFollowsOutlook(GraphTestCase):
 	def _pull(self, items, master_status=200):
 		fake = FakeGraph(
 			{
-				("GET", f"{GRAPH}/me/events/{self.MASTER}?$select=id"): {"id": self.MASTER} if master_status == 200 else master_status,
+				("GET", f"{GRAPH}/me/events/{self.MASTER}?$select=id"): {"id": self.MASTER}
+				if master_status == 200
+				else master_status,
 				("GET", self.DELTA): {"value": items, "@odata.deltaLink": f"{self.DELTA}?$deltatoken=NEXT"},
 			}
 		)
@@ -765,7 +828,9 @@ class TestMovingAndUnticking(GraphTestCase):
 
 	def _drop_other_calendar(self):
 		with patch.object(frappe, "enqueue"):
-			for name in frappe.get_all("Event", filters={"custom_microsoft_calendar": OTHER_CALENDAR}, pluck="name"):
+			for name in frappe.get_all(
+				"Event", filters={"custom_microsoft_calendar": OTHER_CALENDAR}, pluck="name"
+			):
 				frappe.delete_doc("Event", name, force=True, ignore_permissions=True)
 		frappe.delete_doc("Microsoft Calendar", OTHER_CALENDAR, force=True, ignore_permissions=True)
 
@@ -784,7 +849,11 @@ class TestMovingAndUnticking(GraphTestCase):
 		with self._network_by_token(fake), patch.object(frappe.db, "commit"):
 			for call in enqueued.call_args_list:
 				method = frappe.get_attr(call[0][0])
-				kwargs = {k: v for k, v in call[1].items() if k not in ("queue", "timeout", "job_id", "deduplicate", "enqueue_after_commit")}
+				kwargs = {
+					k: v
+					for k, v in call[1].items()
+					if k not in ("queue", "timeout", "job_id", "deduplicate", "enqueue_after_commit")
+				}
 				method(**kwargs)
 
 	def test_changing_the_calendar_recreates_the_event_in_the_new_mailbox(self):
@@ -807,11 +876,16 @@ class TestMovingAndUnticking(GraphTestCase):
 		self._run_jobs(enqueued, fake)
 
 		self.assertEqual(fake.tokens, [("DELETE", "token-first"), ("POST", "token-second")])
-		self.assertEqual([c[:2] for c in fake.calls], [
-			("DELETE", f"{GRAPH}/me/events/AAMk-in-first"),
-			("POST", f"{GRAPH}/me/events"),
-		])
-		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-in-second")
+		self.assertEqual(
+			[c[:2] for c in fake.calls],
+			[
+				("DELETE", f"{GRAPH}/me/events/AAMk-in-first"),
+				("POST", f"{GRAPH}/me/events"),
+			],
+		)
+		self.assertEqual(
+			frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-in-second"
+		)
 
 	def test_an_ordinary_edit_does_not_move_anything(self):
 		event = self._quiet_event("AAMk-stays", subject="Stay")
@@ -827,14 +901,20 @@ class TestMovingAndUnticking(GraphTestCase):
 
 	def test_the_pull_leaves_an_unticked_event_alone(self):
 		"""Regression (#28): the pull ticked Sync with Microsoft Calendar again on every change."""
-		local = self._quiet_event("AAMk-unticked", subject="Do not sync", custom_sync_with_microsoft_calendar=0)
+		local = self._quiet_event(
+			"AAMk-unticked", subject="Do not sync", custom_sync_with_microsoft_calendar=0
+		)
 		self._pull_with([ms_event("AAMk-mirror", subject="Mirror")])
-		frappe.db.set_value("Event", self._event_for("AAMk-mirror").name, "custom_sync_with_microsoft_calendar", 0)
+		frappe.db.set_value(
+			"Event", self._event_for("AAMk-mirror").name, "custom_sync_with_microsoft_calendar", 0
+		)
 
-		self._pull_with([
-			ms_event("AAMk-unticked", subject="Renamed in Outlook"),
-			ms_event("AAMk-mirror", subject="Mirror renamed in Outlook"),
-		])
+		self._pull_with(
+			[
+				ms_event("AAMk-unticked", subject="Renamed in Outlook"),
+				ms_event("AAMk-mirror", subject="Mirror renamed in Outlook"),
+			]
+		)
 
 		local.reload()
 		mirror = self._event_for("AAMk-mirror")

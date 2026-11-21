@@ -14,13 +14,22 @@ things a filter cannot:
   * a watermark we only advance once every page has been consumed, so a failure mid-run
     means the next run repeats the work instead of skipping it.
 
+The window is renewed about once a month so it always reaches WINDOW_FUTURE_DAYS ahead. A
+read of the whole window (a first sync, a renewal, a resync) is the one moment the full list of
+what Outlook has is known; mirrors it did not return are flagged Missing From Outlook.
+
 Origin matters
 --------------
 An Event that originated in Frappe (we pushed it) keeps
 ``custom_pulled_from_microsoft = 0`` forever. The pull never flips that flag and never
 overwrites the description of such an event, because Graph only hands back a truncated
 plain-text ``bodyPreview``. Events that originated in Microsoft are mirrors and are fully
-overwritten by the pull.
+overwritten by the pull. Either kind, once somebody unticks Sync with Microsoft Calendar on it,
+is left alone by the pull.
+
+The push sends only what changed in Frappe: every Event keeps a sync state of what Outlook was
+last sent or last showed (see "what Outlook last saw"), so changes made in Outlook survive an
+unrelated edit in Frappe, and a save the pull makes is never echoed back.
 
 Attendees
 ---------
@@ -34,13 +43,15 @@ Third-party meeting links (Zoom, Google Meet) are *not* extracted: Microsoft onl
 
 What waits for Graph, and what does not
 --------------------------------------
-Saving an Event that Microsoft has never seen calls Graph inside the save: the join link Graph
-hands back is written onto the very document the browser is waiting for, and a link that turns
-up "in a minute" is not one anybody can paste into the invitation they are writing. Every other
-Graph call a save triggers — patching an event that already exists, deleting one — is queued
-instead, because nothing on screen depends on the answer and a throttled Graph can otherwise
-hold a save open for ten seconds. The scheduled pass queues as well, one job per calendar, so
-that a slow calendar cannot spend the budget of the calendars behind it in the list.
+Saving an Event that asks for a new Teams meeting calls Graph inside the save: the join link
+Graph hands back is written onto the very document the browser is waiting for, and a link that
+turns up "in a minute" is not one anybody can paste into the invitation they are writing. If
+that save rolls back, the meeting is deleted again. Every other Graph call a save triggers —
+creating an ordinary event, patching one that exists, deleting one — is queued to run once the
+save has committed, because nothing on screen depends on the answer, a throttled Graph can
+otherwise hold a save open for ten seconds, and a save that rolls back must leave nothing in
+Outlook. The scheduled pass queues as well, one job per calendar, so that a slow calendar cannot
+spend the budget of the calendars behind it in the list; it commits event by event.
 
 All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors).
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.

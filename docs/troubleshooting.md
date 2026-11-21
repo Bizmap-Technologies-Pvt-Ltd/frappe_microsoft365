@@ -503,7 +503,7 @@ Work through these in order:
 | --- | --- |
 | Is the direction switched on? | Microsoft Calendar → **Pull events from Microsoft** / **Push Frappe events to Microsoft**. Push is off by default, on purpose |
 | Is the Frappe event marked for sync? | The Event's **Sync with Microsoft Calendar** tickbox |
-| Is anything inside the window? | The pull covers 30 days back and 180 days forward. Events outside that are not pulled |
+| Is anything inside the window? | The pull covers 30 days back and at least 180 days forward. Events outside that are not pulled |
 | Did the job actually run? | [Background jobs](#background-jobs) — a queued sync with no worker stays "queued" forever |
 | Is the connection enabled and authorised? | Both tickboxes on the Microsoft Calendar record |
 
