@@ -36,6 +36,7 @@ microsoft365_upgrade_checks = {
 	],
 	"1.2.0": [
 		"frappe_microsoft365.sign_in.upgrade_check_multi_tenant_refused",
+		"frappe_microsoft365.patches.clear_legacy_default_scopes.upgrade_check_meeting_capabilities_off",
 	],
 }
 
