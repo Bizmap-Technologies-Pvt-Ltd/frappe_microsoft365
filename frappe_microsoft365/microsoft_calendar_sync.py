@@ -200,6 +200,71 @@ def _system_dt_to_ms(dt):
 	return {"dateTime": dt.isoformat(), "timeZone": get_system_timezone()}
 
 
+# --- all-day events -------------------------------------------------------------------
+#
+# An all-day event is a run of calendar dates, not a span of time. Graph stores it as
+# midnight-to-midnight with an exclusive end (25 Dec is 25 Dec 00:00 to 26 Dec 00:00) and hands
+# it back in whatever timezone the request preferred, which for this sync is UTC. Converting
+# that midnight into the site's timezone, as a timed event is converted, moved Christmas to
+# 05:30 on a Kolkata site and to 19:00 on Christmas Eve on a New York one. So the dates are
+# read and written as they are, with no conversion in either direction.
+#
+# Frappe keeps the end inclusive: its calendar stores an all-day event as 00:00:00 on the first
+# day to 23:59:59 on the last, and draws it from those dates.
+
+
+def _graph_date(dt):
+	"""The calendar date of a Graph dateTimeTimeZone dict, read as written (no conversion)."""
+	from dateutil import parser
+
+	if not dt or not dt.get("dateTime"):
+		return None
+	return parser.parse(dt["dateTime"]).date()
+
+
+def _all_day_to_system(start, end):
+	"""Graph's all-day ``start``/``end`` dicts as Frappe's (first day 00:00, last day 23:59:59)."""
+	import datetime
+
+	first = _graph_date(start)
+	if not first:
+		return None, None
+	after = _graph_date(end)
+	# Graph's end is the midnight after the last day. An end on or before the start would be an
+	# event of no days at all, which is read as the one day it starts on.
+	last = after - datetime.timedelta(days=1) if after and after > first else first
+	return (
+		datetime.datetime.combine(first, datetime.time.min),
+		datetime.datetime.combine(last, datetime.time(23, 59, 59)),
+	)
+
+
+def _all_day_to_ms(starts_on, ends_on):
+	"""A Frappe all-day Event's dates as Graph's midnight ``start`` and exclusive midnight ``end``.
+
+	Graph refuses an all-day event whose start or end is not a midnight, so an end of 23:59:59 —
+	what Frappe's own calendar stores — is turned into the midnight after that day. An end that
+	is already a later midnight is taken as the exclusive end it looks like.
+	"""
+	import datetime
+
+	first = get_datetime(starts_on).date()
+	end = get_datetime(ends_on) if ends_on else None
+	if end and end.time() == datetime.time.min and end.date() > first:
+		after = end.date()
+	elif end:
+		after = end.date() + datetime.timedelta(days=1)
+	else:
+		after = first + datetime.timedelta(days=1)
+	if after <= first:
+		after = first + datetime.timedelta(days=1)
+	tz = get_system_timezone()
+	return (
+		{"dateTime": f"{first.isoformat()}T00:00:00", "timeZone": tz},
+		{"dateTime": f"{after.isoformat()}T00:00:00", "timeZone": tz},
+	)
+
+
 def _iso_utc(dt):
 	"""Render a naive/system datetime as a UTC ISO8601 string for Graph query params."""
 	from zoneinfo import ZoneInfo
@@ -824,6 +889,13 @@ def _people_values(ev):
 	}
 
 
+def _ms_times(ev):
+	"""A Graph event's start and end as Frappe datetimes: floating dates when it is all day."""
+	if ev.get("isAllDay"):
+		return _all_day_to_system(ev.get("start"), ev.get("end"))
+	return _ms_dt_to_system(ev.get("start")), _ms_dt_to_system(ev.get("end"))
+
+
 def _target_values(doc, ev, locally_originated):
 	"""The Frappe Event field values a Microsoft event maps to."""
 	values = {
@@ -832,8 +904,7 @@ def _target_values(doc, ev, locally_originated):
 		"custom_microsoft_calendar": doc.name,
 		"custom_sync_with_microsoft_calendar": 1,
 	}
-	starts_on = _ms_dt_to_system(ev.get("start"))
-	ends_on = _ms_dt_to_system(ev.get("end"))
+	starts_on, ends_on = _ms_times(ev)
 	if starts_on:
 		values["starts_on"] = starts_on
 	if ends_on:
@@ -1231,11 +1302,13 @@ def _event_to_graph_body(event):
 	body = {
 		"subject": event.subject or "(No subject)",
 		"body": {"contentType": "HTML", "content": event.description or ""},
-		"start": _system_dt_to_ms(starts_on),
-		"end": _system_dt_to_ms(_end_after_start(starts_on, event.ends_on)),
 	}
 	if getattr(event, "all_day", 0):
+		body["start"], body["end"] = _all_day_to_ms(starts_on, event.ends_on)
 		body["isAllDay"] = True
+	else:
+		body["start"] = _system_dt_to_ms(starts_on)
+		body["end"] = _system_dt_to_ms(_end_after_start(starts_on, event.ends_on))
 	if getattr(event, "location", None):
 		body["location"] = {"displayName": event.location}
 
@@ -1638,12 +1711,13 @@ def fetch_events(calendar_name: str, start_datetime: str | None = None, end_date
 	out = []
 	for ev in items:
 		online = ev.get("onlineMeeting") or {}
+		start, end = _ms_times(ev)
 		out.append(
 			{
 				"id": ev.get("id"),
 				"subject": ev.get("subject"),
-				"start": _ms_dt_to_system(ev.get("start")),
-				"end": _ms_dt_to_system(ev.get("end")),
+				"start": start,
+				"end": end,
 				"is_all_day": bool(ev.get("isAllDay")),
 				"location": (ev.get("location") or {}).get("displayName"),
 				"join_url": online.get("joinUrl"),
