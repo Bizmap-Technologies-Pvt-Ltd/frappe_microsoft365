@@ -632,3 +632,105 @@ class TestOutlookEditsSurviveAPush(GraphTestCase):
 		self._edit(subject="Renamed")
 
 		self.assertEqual(self.fake.of("PATCH")[0][2], {"subject": "Renamed"})
+
+
+# --- B6: series this app pushed ---------------------------------------------------------------
+
+
+class TestOurSeriesFollowsOutlook(GraphTestCase):
+	MASTER = "AAMk-series-master"
+	DELTA = f"{GRAPH}/me/calendarView/delta"
+
+	def setUp(self):
+		super().setUp()
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			CALENDAR,
+			{
+				"delta_link": f"{self.DELTA}?$deltatoken=OLD",
+				"delta_window_end": add_to_date(now_datetime(), days=sync.WINDOW_FUTURE_DAYS + 20),
+			},
+		)
+		self.calendar.reload()
+		self.series = self._quiet_event(
+			self.MASTER,
+			subject="Standup",
+			starts_on="2026-12-01 10:00:00",
+			ends_on="2026-12-01 10:15:00",
+			repeat_this_event=1,
+			repeat_on="Weekly",
+			tuesday=1,
+		)
+
+	def _occurrence(self, ms_id, kind="occurrence", **extra):
+		extra.setdefault("subject", "Standup")
+		return ms_event(ms_id, type=kind, seriesMasterId=self.MASTER, **extra)
+
+	def _pull(self, items, master_status=200):
+		fake = FakeGraph(
+			{
+				("GET", f"{GRAPH}/me/events/{self.MASTER}?$select=id"): {"id": self.MASTER} if master_status == 200 else master_status,
+				("GET", self.DELTA): {"value": items, "@odata.deltaLink": f"{self.DELTA}?$deltatoken=NEXT"},
+			}
+		)
+		self.calendar.reload()
+		with self._network(fake):
+			result = sync._pull(self.calendar)
+		return result, fake
+
+	def _master_field(self):
+		return frappe.db.get_value("Event", self.series.name, "custom_microsoft_series_master_id")
+
+	def test_seeing_an_occurrence_confirms_the_series_lazily(self):
+		self.assertFalse(self._master_field())
+		self._pull([self._occurrence("occ-1")])
+		self.assertEqual(self._master_field(), self.MASTER)
+		self.assertFalse(frappe.db.exists("Event", {"custom_microsoft_event_id": "occ-1"}))
+
+	def test_an_occurrence_changed_in_outlook_is_mirrored_beside_its_series(self):
+		self._pull([self._occurrence("occ-2", kind="exception", subject="Standup (moved)")])
+		mirror = self._event_for("occ-2")
+		self.assertIsNotNone(mirror)
+		self.assertEqual((mirror.subject, mirror.custom_pulled_from_microsoft), ("Standup (moved)", 1))
+		self.assertEqual(mirror.custom_microsoft_series_master_id, self.MASTER)
+
+	def test_deleting_an_app_created_series_in_outlook_removes_the_frappe_event(self):
+		"""Regression (#23): only the occurrences arrive as @removed, so nothing matched."""
+		self._pull([self._occurrence("occ-1"), self._occurrence("occ-2", kind="exception")])
+		removals = [{"id": f"occ-{n}", "@removed": {"reason": "deleted"}} for n in (1, 2, 3)]
+
+		(_upserted, removed), fake = self._pull(removals, master_status=404)
+
+		self.assertIn(("GET", f"{GRAPH}/me/events/{self.MASTER}?$select=id", None), fake.calls)
+		self.assertFalse(frappe.db.exists("Event", self.series.name))
+		self.assertIsNone(self._event_for("occ-2"))
+		self.assertEqual(removed, 2)
+
+	def test_a_series_that_still_exists_is_kept(self):
+		self._pull([self._occurrence("occ-1")])
+		self._pull([{"id": "occ-1", "@removed": {"reason": "deleted"}}], master_status=200)
+		self.assertTrue(frappe.db.exists("Event", self.series.name))
+
+	def test_an_unconfirmed_series_is_never_deleted(self):
+		_result, fake = self._pull([{"id": "occ-9", "@removed": {"reason": "deleted"}}], master_status=404)
+		self.assertTrue(frappe.db.exists("Event", self.series.name))
+		self.assertEqual(len(fake.calls), 1, "nothing to ask about a series Graph never confirmed")
+
+	def test_a_title_edit_does_not_resend_the_recurrence(self):
+		fake = FakeGraph({("PATCH", f"{GRAPH}/me/events/{self.MASTER}"): {"id": self.MASTER}})
+		state = sync._sync_state_of(sync._event_to_graph_body(self.series))
+		sync._write_sync_state(self.series.name, state)
+
+		event = frappe.get_doc("Event", self.series.name)
+		event.subject = "Daily standup"
+		with self._network(fake):
+			sync._patch_in_graph(CALENDAR, event)
+		self.assertEqual(fake.of("PATCH")[0][2], {"subject": "Daily standup"})
+
+		event.thursday = 1
+		fake.calls.clear()
+		with self._network(fake):
+			sync._patch_in_graph(CALENDAR, event)
+		body = fake.of("PATCH")[0][2]
+		self.assertEqual(sorted(body), ["recurrence"])
+		self.assertIn("thursday", body["recurrence"]["pattern"]["daysOfWeek"])

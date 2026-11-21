@@ -62,7 +62,7 @@ from frappe.utils import (
 
 from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired
+from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphNotFound, MsGraphResyncRequired
 
 EVENT_SELECT = (
 	"id,subject,bodyPreview,start,end,location,isAllDay,isCancelled,"
@@ -814,6 +814,7 @@ def _pull(doc):
 			_("Microsoft ended the calendar read without a sync link, so the next run reads it again.")
 		)
 
+	removed += _settle_our_series(doc)
 	return upserted, removed
 
 
@@ -1145,8 +1146,13 @@ def _upsert_event(doc, ev, existing_map=None):
 	else:
 		existing = existing_map.get(ms_id)
 
+	series_id = ev.get("seriesMasterId")
+
 	if _is_removed(ev):
 		if existing:
+			if not series_id and _has_event_field("custom_microsoft_series_master_id"):
+				# A removal carries no seriesMasterId; a mirrored exception remembers its series.
+				series_id = frappe.db.get_value("Event", existing, "custom_microsoft_series_master_id")
 			frappe.delete_doc("Event", existing, ignore_permissions=True, force=True)
 			# The map is this page's picture of what exists, so it has to follow what the page
 			# does to it. One delta page can carry the same id twice — an event changed twice
@@ -1154,7 +1160,12 @@ def _upsert_event(doc, ev, existing_map=None):
 			# that has just been deleted.
 			if existing_map is not None:
 				existing_map.pop(ms_id, None)
+			_note_series_change(doc, series_id)
 			return "deleted"
+		# A removal for an event we hold nothing for. Deleting a whole series in Outlook arrives
+		# exactly like this — calendarView only ever names the occurrences, never the master —
+		# so it is the cue to ask Graph whether the series this app pushed still exist.
+		_note_series_change(doc, series_id, unknown=True)
 		return "skipped"
 
 	# calendarView returns occurrences; a seriesMaster would duplicate all of them.
@@ -1168,9 +1179,16 @@ def _upsert_event(doc, ev, existing_map=None):
 	#
 	# calendarView never returns that master, so this is the only place the relationship is
 	# visible at all.
-	series_id = ev.get("seriesMasterId")
-	if series_id and _is_ours(series_id):
-		return "skipped"
+	#
+	# An occurrence that was changed on its own in Outlook (moved, renamed: type "exception") is
+	# the one exception. The repeating Event cannot say "this one is different", so the changed
+	# occurrence is mirrored beside it, tied to its series by custom_microsoft_series_master_id.
+	if series_id and not existing:
+		series_event = _is_ours(series_id)
+		if series_event:
+			_note_series_master(series_event, series_id)
+			if ev.get("type") != "exception":
+				return "skipped"
 
 	if existing:
 		event = frappe.get_doc("Event", existing)
@@ -1180,6 +1198,8 @@ def _upsert_event(doc, ev, existing_map=None):
 		event.custom_microsoft_event_id = ms_id
 		event.custom_pulled_from_microsoft = 1
 		event.event_type = "Private"
+		if series_id and _has_event_field("custom_microsoft_series_master_id"):
+			event.custom_microsoft_series_master_id = series_id
 		locally_originated = False
 
 	values = _target_values(doc, ev, locally_originated)
@@ -1263,14 +1283,114 @@ def _give_it_to_its_owner(event_name, user):
 
 
 def _is_ours(series_master_id):
-	"""Did this app push the series behind this occurrence?
+	"""The Frappe Event behind this series, when this app pushed it; else None.
 
 	Matched on the id Graph gave back when the series was created, which is stored on the
 	repeating Event — so this is a lookup, not a guess.
 	"""
-	return bool(
-		frappe.db.exists("Event", {"custom_microsoft_event_id": series_master_id})
+	return frappe.db.get_value(
+		"Event", {"custom_microsoft_event_id": series_master_id, "custom_pulled_from_microsoft": 0}, "name"
 	)
+
+
+# --- series this app pushed -------------------------------------------------------------
+#
+# Graph keeps a recurring event as one series master plus occurrences; calendarView, and so the
+# delta, only ever returns the occurrences. A series this app pushed is a repeating Frappe Event
+# whose custom_microsoft_event_id is that master's id, and custom_microsoft_series_master_id
+# records that Graph has confirmed it is one: set when the create returns a series master, or
+# filled in lazily the first time the pull sees one of its occurrences (series pushed before
+# 1.2.0). Only a confirmed master is ever checked, and so only one can ever be deleted here.
+
+#: How many series one run asks Graph about. Each is a GET; a calendar with more confirmed
+#: series than this checks the rest on later runs that bring removals too.
+SERIES_CHECKS_PER_RUN = 25
+
+
+def _note_series_master(event_name, series_id):
+	"""Record that ``series_id`` is a confirmed series master (see the section comment)."""
+	if not _has_event_field("custom_microsoft_series_master_id"):
+		return
+	if frappe.db.get_value("Event", event_name, "custom_microsoft_series_master_id") != series_id:
+		frappe.db.set_value(
+			"Event", event_name, "custom_microsoft_series_master_id", series_id, update_modified=False
+		)
+
+
+def _note_series_change(doc, series_id, unknown=False):
+	"""Collect, on the calendar doc, which of our series this pull has to ask Graph about."""
+	pending = doc.flags.series_to_check
+	if pending is None:
+		pending = doc.flags.series_to_check = set()
+	if series_id and _is_ours(series_id):
+		pending.add(series_id)
+	elif unknown:
+		doc.flags.unknown_removals = True
+
+
+def _settle_our_series(doc):
+	"""Delete the Frappe series whose master Outlook no longer has. Returns how many.
+
+	Asked only when this pull brought a removal that may have been one of their occurrences. A
+	GET of the master answering 404 means the series was deleted in Outlook; anything else
+	(throttling, an outage) leaves it as it is for another run.
+	"""
+	if not _has_event_field("custom_microsoft_series_master_id"):
+		return 0
+	masters = set(doc.flags.series_to_check or ())
+	if doc.flags.unknown_removals:
+		masters.update(
+			frappe.get_all(
+				"Event",
+				filters={
+					"custom_microsoft_calendar": doc.name,
+					"custom_pulled_from_microsoft": 0,
+					"custom_sync_with_microsoft_calendar": 1,
+					"custom_microsoft_series_master_id": ["is", "set"],
+				},
+				pluck="custom_microsoft_series_master_id",
+				order_by="modified desc",
+				limit=SERIES_CHECKS_PER_RUN,
+			)
+		)
+	doc.flags.series_to_check = None
+	doc.flags.unknown_removals = False
+
+	removed = 0
+	for master in sorted(masters)[:SERIES_CHECKS_PER_RUN]:
+		name = frappe.db.get_value(
+			"Event",
+			{
+				"custom_microsoft_event_id": master,
+				"custom_microsoft_series_master_id": master,
+				"custom_pulled_from_microsoft": 0,
+				"custom_microsoft_calendar": doc.name,
+			},
+			"name",
+		)
+		if not name:
+			continue
+		try:
+			graph.graph_request("GET", f"/me/events/{master}?$select=id", doc.name)
+			continue
+		except MsGraphNotFound:
+			pass
+		except MsGraphError:
+			continue
+
+		frappe.flags.in_microsoft_sync = True
+		try:
+			for exception in frappe.get_all(
+				"Event",
+				filters={"custom_microsoft_series_master_id": master, "custom_pulled_from_microsoft": 1},
+				pluck="name",
+			):
+				frappe.delete_doc("Event", exception, ignore_permissions=True, force=True)
+			frappe.delete_doc("Event", name, ignore_permissions=True, force=True)
+			removed += 1
+		finally:
+			frappe.flags.in_microsoft_sync = False
+	return removed
 
 
 def _apply(doc, values):
@@ -1391,6 +1511,10 @@ def _create_in_graph(calendar_name, event_name, live_doc=None):
 	if not _store_graph_response(event_name, created, calendar_name, live_doc=live_doc):
 		return False
 	_write_sync_state(event_name, _sync_state_of(body), live_doc)
+	if (created or {}).get("type") == "seriesMaster":
+		_note_series_master(event_name, created["id"])
+		if live_doc is not None:
+			live_doc.set("custom_microsoft_series_master_id", created["id"])
 	return True
 
 

@@ -290,6 +290,20 @@ def create_event_custom_fields(only_definitions=False):
 				),
 			},
 			{
+				# The Graph series master this Event belongs to. On a repeating Event this app
+				# pushed it is its own id, once Graph has confirmed it is a series; on a mirrored
+				# occurrence changed on its own in Outlook, the series it was changed from.
+				"fieldname": "custom_microsoft_series_master_id",
+				"fieldtype": "Data",
+				"label": "Microsoft Series ID",
+				"insert_after": "custom_microsoft_sync_state",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+				# Graph ids run to ~150 characters; see custom_microsoft_event_id.
+				"length": 768,
+			},
+			{
 				# What Outlook was last sent, or last showed, for each property the push writes —
 				# fingerprints, plus the attendee addresses. A push sends only what differs from
 				# it, so an attendee or an agenda changed in Outlook is not overwritten by an
