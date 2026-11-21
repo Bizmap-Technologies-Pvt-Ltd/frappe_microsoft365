@@ -734,3 +734,122 @@ class TestOurSeriesFollowsOutlook(GraphTestCase):
 		body = fake.of("PATCH")[0][2]
 		self.assertEqual(sorted(body), ["recurrence"])
 		self.assertIn("thursday", body["recurrence"]["pattern"]["daysOfWeek"])
+
+
+# --- B11: moving an Event to another calendar, and unticking sync ---------------------------
+
+OTHER_CALENDAR = "_Test MS Calendar Second"
+
+
+class TestMovingAndUnticking(GraphTestCase):
+	def setUp(self):
+		super().setUp()
+		if frappe.db.exists("Microsoft Calendar", OTHER_CALENDAR):
+			frappe.delete_doc("Microsoft Calendar", OTHER_CALENDAR, force=True, ignore_permissions=True)
+		frappe.get_doc(
+			{
+				"doctype": "Microsoft Calendar",
+				"account_name": OTHER_CALENDAR,
+				"user": "Administrator",
+				"enabled": 1,
+				"authorized": 1,
+				"pull_from_microsoft_calendar": 0,
+				"push_to_microsoft_calendar": 1,
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(self._drop_other_calendar)
+		self.tokens = {CALENDAR: "token-first", OTHER_CALENDAR: "token-second"}
+		token = patch.object(graph, "get_valid_access_token", side_effect=lambda name: self.tokens[name])
+		token.start()
+		self.addCleanup(token.stop)
+
+	def _drop_other_calendar(self):
+		with patch.object(frappe, "enqueue"):
+			for name in frappe.get_all("Event", filters={"custom_microsoft_calendar": OTHER_CALENDAR}, pluck="name"):
+				frappe.delete_doc("Event", name, force=True, ignore_permissions=True)
+		frappe.delete_doc("Microsoft Calendar", OTHER_CALENDAR, force=True, ignore_permissions=True)
+
+	def _network_by_token(self, fake):
+		"""Like _network, but records which mailbox (token) each request went to."""
+
+		def call(method, url, **kwargs):
+			token = kwargs["headers"]["Authorization"].replace("Bearer ", "")
+			fake.tokens.append((method, token))
+			return fake(method, url, **kwargs)
+
+		fake.tokens = []
+		return patch.object(graph, "_http_request", side_effect=call)
+
+	def _run_jobs(self, enqueued, fake):
+		with self._network_by_token(fake), patch.object(frappe.db, "commit"):
+			for call in enqueued.call_args_list:
+				method = frappe.get_attr(call[0][0])
+				kwargs = {k: v for k, v in call[1].items() if k not in ("queue", "timeout", "job_id", "deduplicate", "enqueue_after_commit")}
+				method(**kwargs)
+
+	def test_changing_the_calendar_recreates_the_event_in_the_new_mailbox(self):
+		"""Regression (#28): the old id was kept, so every patch to the new mailbox was a 404."""
+		event = self._quiet_event("AAMk-in-first", subject="Move me")
+		fake = FakeGraph(
+			{
+				("DELETE", f"{GRAPH}/me/events/AAMk-in-first"): 204,
+				("POST", f"{GRAPH}/me/events"): {"id": "AAMk-in-second"},
+			}
+		)
+
+		event.reload()
+		event.custom_microsoft_calendar = OTHER_CALENDAR
+		with patch.object(frappe, "enqueue") as enqueued, self._network(fake):
+			event.save()
+		self.assertEqual(fake.calls, [], "nothing is sent before the save commits")
+		self.assertFalse(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"))
+
+		self._run_jobs(enqueued, fake)
+
+		self.assertEqual(fake.tokens, [("DELETE", "token-first"), ("POST", "token-second")])
+		self.assertEqual([c[:2] for c in fake.calls], [
+			("DELETE", f"{GRAPH}/me/events/AAMk-in-first"),
+			("POST", f"{GRAPH}/me/events"),
+		])
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-in-second")
+
+	def test_an_ordinary_edit_does_not_move_anything(self):
+		event = self._quiet_event("AAMk-stays", subject="Stay")
+		event.reload()
+		event.subject = "Stay, renamed"
+		with patch.object(frappe, "enqueue") as enqueued:
+			event.save()
+		self.assertEqual(
+			[c[0][0] for c in enqueued.call_args_list],
+			["frappe_microsoft365.microsoft_calendar_sync.patch_event_in_graph"],
+		)
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-stays")
+
+	def test_the_pull_leaves_an_unticked_event_alone(self):
+		"""Regression (#28): the pull ticked Sync with Microsoft Calendar again on every change."""
+		local = self._quiet_event("AAMk-unticked", subject="Do not sync", custom_sync_with_microsoft_calendar=0)
+		self._pull_with([ms_event("AAMk-mirror", subject="Mirror")])
+		frappe.db.set_value("Event", self._event_for("AAMk-mirror").name, "custom_sync_with_microsoft_calendar", 0)
+
+		self._pull_with([
+			ms_event("AAMk-unticked", subject="Renamed in Outlook"),
+			ms_event("AAMk-mirror", subject="Mirror renamed in Outlook"),
+		])
+
+		local.reload()
+		mirror = self._event_for("AAMk-mirror")
+		self.assertEqual((local.custom_sync_with_microsoft_calendar, local.subject), (0, "Do not sync"))
+		self.assertEqual((mirror.custom_sync_with_microsoft_calendar, mirror.subject), (0, "Mirror"))
+
+	def test_an_unticked_mirror_is_not_deleted_by_outlook(self):
+		self._pull_with([ms_event("AAMk-keep")])
+		name = self._event_for("AAMk-keep").name
+		frappe.db.set_value("Event", name, "custom_sync_with_microsoft_calendar", 0)
+
+		self._pull_with([{"id": "AAMk-keep", "@removed": {"reason": "deleted"}}])
+
+		self.assertTrue(frappe.db.exists("Event", name))
+
+	def test_a_new_mirror_is_still_ticked(self):
+		self._pull_with([ms_event("AAMk-new-mirror")])
+		self.assertEqual(self._event_for("AAMk-new-mirror").custom_sync_with_microsoft_calendar, 1)

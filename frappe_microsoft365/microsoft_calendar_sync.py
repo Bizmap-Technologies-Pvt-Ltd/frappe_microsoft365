@@ -960,13 +960,28 @@ def _is_removed(ev):
 	return bool(ev.get("@removed")) or bool(ev.get("isCancelled"))
 
 
+class _EventMap(dict):
+	"""Microsoft event id -> Frappe Event name, plus the names of the Events unticked for sync."""
+
+	def __init__(self):
+		super().__init__()
+		self.unticked = set()
+
+
+def _is_unticked(event_name, existing_map=None):
+	"""True when the Event has Sync with Microsoft Calendar unticked."""
+	if isinstance(existing_map, _EventMap):
+		return event_name in existing_map.unticked
+	return not cint(frappe.db.get_value("Event", event_name, "custom_sync_with_microsoft_calendar"))
+
+
 def _existing_event_map(ms_ids):
 	"""Microsoft event id -> Frappe Event name, for the ids of one delta page.
 
 	Chunked rather than one enormous ``IN``: see PREFETCH_CHUNK. Ids that have no Frappe Event
 	are simply absent from the map, which is the same answer the per-event lookup gave.
 	"""
-	mapping = {}
+	mapping = _EventMap()
 	# dict.fromkeys and not set(): a delta page is normally in a meaningful order, and keeping
 	# it makes the chunk boundaries reproducible when this has to be debugged against a log.
 	ids = [ms_id for ms_id in dict.fromkeys(ms_ids) if ms_id]
@@ -975,7 +990,7 @@ def _existing_event_map(ms_ids):
 		rows = frappe.get_all(
 			"Event",
 			filters={"custom_microsoft_event_id": ["in", ids[start : start + PREFETCH_CHUNK]]},
-			fields=["name", "custom_microsoft_event_id"],
+			fields=["name", "custom_microsoft_event_id", "custom_sync_with_microsoft_calendar"],
 			# Spelled out rather than relying on get_all's default, because a page capped at 20
 			# rows would not fail: the events past the cap would read as new and be created a
 			# second time. This is the one argument here that must not be wrong.
@@ -983,6 +998,8 @@ def _existing_event_map(ms_ids):
 		)
 		for row in rows:
 			mapping[row.custom_microsoft_event_id] = row.name
+			if not cint(row.custom_sync_with_microsoft_calendar):
+				mapping.unticked.add(row.name)
 
 	return mapping
 
@@ -1091,7 +1108,6 @@ def _target_values(doc, ev, locally_originated):
 		"subject": ev.get("subject") or "(No subject)",
 		"all_day": 1 if ev.get("isAllDay") else 0,
 		"custom_microsoft_calendar": doc.name,
-		"custom_sync_with_microsoft_calendar": 1,
 	}
 	starts_on, ends_on = _ms_times(ev)
 	if starts_on:
@@ -1148,6 +1164,11 @@ def _upsert_event(doc, ev, existing_map=None):
 
 	series_id = ev.get("seriesMasterId")
 
+	if existing and _is_unticked(existing, existing_map):
+		# Somebody unticked Sync with Microsoft Calendar on it: it is no longer kept in step in
+		# either direction, so Outlook's changes — a deletion included — are not applied to it.
+		return "skipped"
+
 	if _is_removed(ev):
 		if existing:
 			if not series_id and _has_event_field("custom_microsoft_series_master_id"):
@@ -1197,6 +1218,9 @@ def _upsert_event(doc, ev, existing_map=None):
 		event = frappe.new_doc("Event")
 		event.custom_microsoft_event_id = ms_id
 		event.custom_pulled_from_microsoft = 1
+		# Ticked once, when the mirror is made. After that the tickbox is the person's: the pull
+		# used to tick it again on every change, so unticking an Event never stuck.
+		event.custom_sync_with_microsoft_calendar = 1
 		event.event_type = "Private"
 		if series_id and _has_event_field("custom_microsoft_series_master_id"):
 			event.custom_microsoft_series_master_id = series_id
@@ -2117,6 +2141,7 @@ def event_on_update(doc, method=None):
 		return
 
 	try:
+		_move_out_of_previous_calendar(doc)
 		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
 		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
 			return
@@ -2147,6 +2172,50 @@ def event_on_update(doc, method=None):
 			)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
+
+
+#: What ties an Event to one particular Outlook event. Moving it to another calendar clears all of
+#: it: the new mailbox gets an event — and, when it is a Teams meeting, a meeting — of its own.
+LINK_FIELDS_CLEARED_ON_MOVE = (
+	"custom_microsoft_event_id",
+	"custom_microsoft_web_link",
+	"custom_teams_join_url",
+	"custom_microsoft_online_meeting_id",
+	"custom_microsoft_sync_state",
+	"custom_microsoft_series_master_id",
+)
+
+
+def _move_out_of_previous_calendar(doc):
+	"""When an Event is moved to another Microsoft Calendar, take it out of the old one.
+
+	It kept the old mailbox's event id, so every patch went to the new mailbox with an id that
+	mailbox has never heard of — 404, forever — and the event never appeared there. Now the link
+	is cleared, so the event is created in the new calendar, and the old one is deleted from the
+	old mailbox once the save commits, under the same rules as deleting the Event would.
+	Attendees get a cancellation from the old event and an invitation from the new one.
+	"""
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before:
+		return
+	old_calendar = before.get("custom_microsoft_calendar")
+	old_id = before.get("custom_microsoft_event_id")
+	if not old_calendar or not old_id or old_calendar == doc.custom_microsoft_calendar:
+		return
+
+	meta = frappe.get_meta("Event")
+	cleared = {field: None for field in LINK_FIELDS_CLEARED_ON_MOVE if meta.has_field(field)}
+	frappe.db.set_value("Event", doc.name, cleared, update_modified=False)
+	doc.update(cleared)
+
+	_queue_or_do_it_after_commit(
+		"frappe_microsoft365.microsoft_calendar_sync.delete_event_in_graph",
+		queue="short",
+		job_id=f"m365-event-delete-{old_id}",
+		calendar_name=old_calendar,
+		ms_event_id=old_id,
+		event_owner=_event_owner(doc),
+	)
 
 
 def _remember_state_before_this_edit(doc, cal):
