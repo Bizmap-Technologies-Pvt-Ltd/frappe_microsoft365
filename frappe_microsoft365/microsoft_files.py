@@ -1270,48 +1270,37 @@ class _download_link:
 		self.fh = None
 
 	def __enter__(self):
-		assert_public_url(self.url)
-		import requests
-
-		resp = requests.get(
-			self.url,
-			stream=True,
-			timeout=60,
-			allow_redirects=False,
-			headers={"User-Agent": "frappe_microsoft365"},
-		)
+		url = self.url
+		resp = _pinned_get(url)
 		hops = 0
-		while resp.is_redirect and hops < 5:
+		while resp.status in REDIRECT_STATUSES and hops < 5:
 			location = resp.headers.get("Location") or ""
-			resp.close()
-			nxt = requests.compat.urljoin(self.url, location)
-			assert_public_url(nxt)
-			resp = requests.get(
-				nxt,
-				stream=True,
-				timeout=60,
-				allow_redirects=False,
-				headers={"User-Agent": "frappe_microsoft365"},
-			)
+			resp.release_conn()
+			from urllib.parse import urljoin
+
+			url = urljoin(url, location)
+			# Every hop is checked and pinned again: a public page may redirect anywhere.
+			resp = _pinned_get(url)
 			hops += 1
-		if resp.status_code != 200:
-			resp.close()
-			frappe.throw(_("Could not download {0} ({1}).").format(self.url, resp.status_code), MsGraphError)
+		if resp.status != 200:
+			resp.release_conn()
+			frappe.throw(_("Could not download {0} ({1}).").format(self.url, resp.status), MsGraphError)
 
 		self.fh = tempfile.TemporaryFile()
 		size = 0
-		for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
-			size += len(chunk)
-			if size > MAX_LINK_DOWNLOAD_BYTES:
-				resp.close()
-				frappe.throw(
-					_("{0} is larger than {1} MB; not archived.").format(
-						self.url, MAX_LINK_DOWNLOAD_BYTES // (1024 * 1024)
-					),
-					MsGraphError,
-				)
-			self.fh.write(chunk)
-		resp.close()
+		try:
+			for chunk in resp.stream(DOWNLOAD_CHUNK_BYTES):
+				size += len(chunk)
+				if size > MAX_LINK_DOWNLOAD_BYTES:
+					frappe.throw(
+						_("{0} is larger than {1} MB; not archived.").format(
+							self.url, MAX_LINK_DOWNLOAD_BYTES // (1024 * 1024)
+						),
+						MsGraphError,
+					)
+				self.fh.write(chunk)
+		finally:
+			resp.release_conn()
 		self.fh.seek(0)
 		content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or None
 		return self.fh, size, content_type
@@ -1322,25 +1311,88 @@ class _download_link:
 		return False
 
 
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _pinned_get(url, timeout=60):
+	"""GET a public URL, connecting only to the address assert_public_url checked.
+
+	Resolving the name a second time to connect, as any HTTP library does, would let a name that
+	answers differently the second time (DNS rebinding) send the request to an internal address
+	after the check passed. So the connection is made to the checked IP itself, with the Host
+	header and, for https, the TLS server name and certificate check set to the name in the link.
+	No proxy is used either, for the same reason: the proxy would resolve the name again.
+	Returns a urllib3 response with its body still unread.
+	"""
+	import certifi
+	import urllib3
+	from requests.utils import requote_uri
+
+	url = requote_uri(url)
+	address = assert_public_url(url)
+	parsed = urlparse(url)
+	https = parsed.scheme == "https"
+	host = parsed.hostname
+	host_header = f"[{host}]" if ":" in host else host
+	if parsed.port:
+		host_header += f":{parsed.port}"
+	options = {
+		"host": address,
+		"port": parsed.port or (443 if https else 80),
+		"timeout": urllib3.Timeout(connect=min(timeout, 30), read=timeout),
+		"retries": False,
+		"maxsize": 1,
+	}
+	if https:
+		pool = urllib3.HTTPSConnectionPool(
+			cert_reqs="CERT_REQUIRED",
+			ca_certs=certifi.where(),
+			server_hostname=host,
+			assert_hostname=host,
+			**options,
+		)
+	else:
+		pool = urllib3.HTTPConnectionPool(**options)
+	target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+	try:
+		return pool.urlopen(
+			"GET",
+			target,
+			headers={"Host": host_header, "User-Agent": "frappe_microsoft365", "Accept-Encoding": "identity"},
+			redirect=False,
+			retries=False,
+			preload_content=False,
+		)
+	except urllib3.exceptions.HTTPError as e:
+		frappe.throw(_("Could not download {0}: {1}").format(url, e), MsGraphError)
+
+
 def assert_public_url(url):
-	"""Refuse to fetch anything but a public http(s) address.
+	"""Refuse to fetch anything but a public http(s) address; return the address to connect to.
 
 	A link attachment is typed by a user and fetched by the server, so without this it is a way
 	to make the server read its own metadata endpoint or a neighbour on the private network.
+	Every address the name has must be public, and the caller connects to the one returned
+	(see _pinned_get) rather than resolving the name again.
 	"""
 	parsed = urlparse(url or "")
 	if parsed.scheme not in ("http", "https") or not parsed.hostname:
 		frappe.throw(_("Only http and https links can be archived."), MsGraphError)
 	try:
-		infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
-	except socket.gaierror:
+		infos = socket.getaddrinfo(
+			parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
+		)
+	except (socket.gaierror, ValueError):
+		frappe.throw(_("Could not resolve {0}.").format(parsed.hostname), MsGraphError)
+	if not infos:
 		frappe.throw(_("Could not resolve {0}.").format(parsed.hostname), MsGraphError)
 	for info in infos:
-		address = ipaddress.ip_address(info[4][0])
+		address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
 		if not address.is_global:
 			frappe.throw(
 				_("{0} is not a public address; not archived.").format(parsed.hostname), MsGraphError
 			)
+	return infos[0][4][0]
 
 
 def _remove_local_copy(local_url):
