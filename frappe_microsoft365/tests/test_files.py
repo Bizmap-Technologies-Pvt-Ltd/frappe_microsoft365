@@ -32,7 +32,8 @@ def setUpModule():
 	from frappe_microsoft365.setup import create_file_custom_fields
 
 	create_file_custom_fields()
-	frappe.db.commit()  # nosemgrep: DDL above has committed already; make that explicit
+	# DDL above has committed already; make that explicit.
+	frappe.db.commit()  # nosemgrep
 
 
 STORAGE_OPTIONS = (

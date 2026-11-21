@@ -577,7 +577,8 @@ def ensure_folder(doctype, name):
 		if existing:
 			return existing
 		record = add_folder_row(doctype, name, new_folder_values(row, doctype, name))
-		frappe.db.commit()  # nosemgrep: the folder exists in SharePoint now; see the docstring
+		# The folder exists in SharePoint now; see the docstring.
+		frappe.db.commit()  # nosemgrep
 	return frappe._dict(record.as_dict())
 
 
@@ -1042,7 +1043,8 @@ def _hash_of(path):
 	import hashlib
 
 	digest = hashlib.md5()
-	with open(path, "rb") as fh:  # nosemgrep: callers pass local_path() of a /files URL
+	# Callers pass local_path() of a /files URL.
+	with open(path, "rb") as fh:  # nosemgrep
 		for chunk in iter(lambda: fh.read(DOWNLOAD_CHUNK_BYTES), b""):
 			digest.update(chunk)
 	return digest.hexdigest()
@@ -1153,7 +1155,8 @@ def _repoint_links(file_doc, old_url, new_url):
 				),
 				update_modified=False,
 			)
-		frappe.db.commit()  # nosemgrep: same transaction rule as the move itself
+		# Same transaction rule as the move itself.
+		frappe.db.commit()  # nosemgrep
 	except Exception:
 		frappe.log_error(title=_("Microsoft 365: could not update attachment links"))
 

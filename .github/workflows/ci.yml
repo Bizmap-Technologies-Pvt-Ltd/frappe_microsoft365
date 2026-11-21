@@ -102,6 +102,10 @@ jobs:
           bench set-config -g redis_cache    redis://localhost:6379
           bench set-config -g redis_queue    redis://localhost:6379
           bench set-config -g redis_socketio redis://localhost:6379
+          # The runner's MariaDB client now requires TLS by default and the service container
+          # offers none. An option file covers every client call, including the ones Frappe
+          # makes itself when it creates a site.
+          printf '[client]\nskip-ssl\n' > ~/.my.cnf
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
@@ -263,6 +267,10 @@ jobs:
           bench set-config -g redis_cache    redis://localhost:6379
           bench set-config -g redis_queue    redis://localhost:6379
           bench set-config -g redis_socketio redis://localhost:6379
+          # The runner's MariaDB client now requires TLS by default and the service container
+          # offers none. An option file covers every client call, including the ones Frappe
+          # makes itself when it creates a site.
+          printf '[client]\nskip-ssl\n' > ~/.my.cnf
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
