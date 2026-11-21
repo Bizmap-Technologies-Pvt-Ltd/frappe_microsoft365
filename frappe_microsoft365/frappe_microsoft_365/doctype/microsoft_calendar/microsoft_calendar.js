@@ -28,6 +28,13 @@ frappe.ui.form.on("Microsoft Calendar", {
 			frm.add_custom_button(__("Re-authorize"), () => authorize(frm), __("Microsoft"));
 			frm.add_custom_button(__("Disconnect"), () => disconnect(frm), __("Microsoft"));
 		}
+		if (frm.doc.user && frappe.user.has_role("System Manager")) {
+			frm.add_custom_button(
+				__("Give Linked Events to {0}", [frm.doc.user]),
+				() => give_linked_events(frm),
+				__("Microsoft")
+			);
+		}
 
 		// frappe.realtime.on appends, so binding this inside refresh without dropping the
 		// previous registration would announce one finished sync once per visit to the form.
@@ -222,3 +229,39 @@ function disconnect(frm) {
 		});
 	});
 }
+
+// Events someone else owns are not synced with this calendar (only an Event's owner's own
+// calendar is written to). This hands them to the calendar's user, after saying how many.
+function give_linked_events(frm) {
+	const method =
+		"frappe_microsoft365.microsoft_calendar_sync.give_linked_events_to_calendar_user";
+	frappe.call({
+		method,
+		args: { calendar_name: frm.doc.name },
+		callback: (r) => {
+			const { user, count } = r.message || {};
+			if (!count) {
+				frappe.msgprint(__("Every event linked to this calendar already belongs to {0}.", [user]));
+				return;
+			}
+			frappe.confirm(
+				__(
+					"{0} event(s) linked to this calendar belong to someone else, so they are not synced. Make {1} their owner? {1} will be able to see them, and each gets a comment naming its previous owner.",
+					[count, user]
+				),
+				() =>
+					frappe.call({
+						method,
+						args: { calendar_name: frm.doc.name, apply: 1 },
+						freeze: true,
+						callback: (res) =>
+							frappe.show_alert({
+								message: __("{0} event(s) now belong to {1}.", [res.message.count, user]),
+								indicator: "green",
+							}),
+					})
+			);
+		},
+	});
+}
+

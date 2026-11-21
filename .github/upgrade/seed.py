@@ -349,6 +349,10 @@ def main(site, manifest_path):
 			"events": events,
 			"calendars": {"Alice Calendar": GRAPH_DELTA, "Bob Calendar": FOREIGN_DELTA},
 			"tenant": TENANT,
+			# Patches the previous release already recorded: their effects are not this upgrade's.
+			"patches_before": frappe.get_all(
+				"Patch Log", filters={"patch": ["like", "frappe_microsoft365.%"]}, pluck="patch"
+			),
 			"sharepoint": sharepoint,
 			"counts": {
 				"Event": frappe.db.count("Event", {"subject": ["like", "upgrade-seed %"]}),

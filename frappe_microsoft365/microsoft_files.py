@@ -1382,14 +1382,14 @@ def on_file_trash(doc, method=None):
 	if others:
 		return
 	try:
-		assert_app_item(doc)
+		assert_app_item(doc, for_delete=True)
 		graph.graph_request("DELETE", f"/drives/{doc.custom_microsoft_drive_id}/items/{item_id}", APP)
 	except frappe.PermissionError:
 		_forget_message()
 		frappe.log_error(
 			title=_("Microsoft 365: SharePoint item not removed"),
 			message=_(
-				"File {0} names an item outside every record folder; it was left in SharePoint."
+				"File {0} names an item outside its own record's folder; it was left in SharePoint."
 			).format(doc.name),
 		)
 	except MsGraphNotFound:
@@ -1589,13 +1589,18 @@ def _stream(drive_id, item_id, filename, download=False):
 	return response
 
 
-def assert_app_item(file_doc):
+def assert_app_item(file_doc, for_delete=False):
 	"""Refuse to read or delete a File's SharePoint item unless the app put it in a record folder.
 
 	A File the upload job moved records the folder it went into, and only the app writes that
 	(see on_file_validate), so checking it against the SharePoint Folder rows costs no Graph call.
 	Files moved before that was recorded are checked by asking SharePoint where the item is: one
 	request for a file directly in its folder, one more per level of subfolder.
+
+	An item in another record's folder is an attachment copy (Frappe copies attachments when one
+	document is made from another) or a row that was pointed there before 1.1.1 refused such
+	edits; the two look the same. Either way it is read only by someone who may read the record
+	that folder belongs to, and never deleted through this File.
 
 	Raises PermissionError when the item is anywhere else, and MsGraphNotFound when SharePoint has
 	no such item at all.
@@ -1605,41 +1610,72 @@ def assert_app_item(file_doc):
 	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
 		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
-	known = set(frappe.get_all("SharePoint Folder", filters={"drive_id": drive_id}, pluck="item_id"))
+	folders = {
+		row.item_id: row
+		for row in frappe.get_all(
+			"SharePoint Folder",
+			filters={"drive_id": drive_id},
+			fields=["item_id", "reference_doctype", "reference_name"],
+		)
+	}
 	# A record folder is never a file of its own, whatever a File row says.
-	if item_id not in known:
-		folder_id = file_doc.get("custom_microsoft_folder_id")
-		if folder_id and folder_id in known:
-			return
-		if _inside_known_folder(drive_id, item_id, known):
-			return
-	raise frappe.PermissionError(_("{0} is not in a record's SharePoint folder.").format(file_doc.file_name))
+	holder = None
+	if item_id not in folders:
+		holder = folders.get(file_doc.get("custom_microsoft_folder_id") or "")
+		if not holder:
+			holder = folders.get(_known_folder_holding(drive_id, item_id, folders) or "")
+	if not holder:
+		raise frappe.PermissionError(_("{0} is not in a record's SharePoint folder.").format(file_doc.file_name))
+
+	if (holder.reference_doctype, holder.reference_name) == (
+		file_doc.get("attached_to_doctype"),
+		file_doc.get("attached_to_name"),
+	):
+		return
+	if for_delete or not frappe.has_permission(holder.reference_doctype, "read", holder.reference_name):
+		raise frappe.PermissionError(
+			_("{0} is in the SharePoint folder of {1} {2}.").format(
+				file_doc.file_name, _(holder.reference_doctype), holder.reference_name
+			)
+		)
 
 
-def _inside_known_folder(drive_id, item_id, known):
-	"""Ask SharePoint whether a file sits in one of the ``known`` folders, at any depth."""
+def _known_folder_holding(drive_id, item_id, known):
+	"""Ask SharePoint which of the ``known`` folders holds a file, at any depth; None for none."""
 	item = graph.graph_request(
 		"GET", f"/drives/{drive_id}/items/{item_id}", APP, params={"$select": "id,file,parentReference"}
 	)
 	if "file" not in item:
-		return False
+		return None
 	for _hop in range(MAX_FOLDER_DEPTH):
 		parent = item.get("parentReference") or {}
 		if parent.get("driveId") and parent["driveId"] != drive_id:
-			return False
+			return None
 		current = parent.get("id")
 		if not current:
-			return False
+			return None
 		if current in known:
-			return True
+			return current
 		try:
 			item = graph.graph_request(
 				"GET", f"/drives/{drive_id}/items/{current}", APP, params={"$select": "id,parentReference"}
 			)
 		except MsGraphNotFound:
 			_forget_message()
-			return False
-	return False
+			return None
+	return None
+
+
+def _folder_still_there(folder):
+	"""Ask for the folder itself, by id: True unless SharePoint says it is gone."""
+	try:
+		graph.graph_request(
+			"GET", f"/drives/{folder.drive_id}/items/{folder.item_id}", APP, params={"$select": "id"}
+		)
+	except MsGraphNotFound:
+		_forget_message()
+		return False
+	return True
 
 
 def own_local_copy(file_doc, url):
@@ -1649,7 +1685,8 @@ def own_local_copy(file_doc, url):
 	name to the next upload with the same file name, which may be another record's confidential
 	file. So: when the bytes were hashed before the move, they must still match. Files moved
 	before that was recorded have nothing to compare, and their old path counts as theirs only
-	while no other File claims it.
+	while no other File claims it, as its address or as the kept copy of a file that has itself
+	moved since.
 	"""
 	if not url or ".." in url.split("/") or not url.startswith(("/files/", "/private/files/")):
 		return False
@@ -1659,7 +1696,10 @@ def own_local_copy(file_doc, url):
 	recorded = file_doc.get("custom_microsoft_content_hash")
 	if recorded:
 		return _hash_of(path) == recorded
-	return not frappe.db.exists("File", {"file_url": url, "name": ["!=", file_doc.name]})
+	others = {"name": ["!=", file_doc.name]}
+	if frappe.db.exists("File", {**others, "file_url": url}):
+		return False
+	return not frappe.db.exists("File", {**others, "custom_microsoft_local_url": url})
 
 
 @frappe.whitelist(methods=["GET"])
@@ -1754,6 +1794,13 @@ def list_folder(doctype: str, name: str, subfolder: str | None = None):
 		_forget_message()
 		if subfolder:
 			raise
+		# Forgetting the folder means the next attachment makes a new one beside it ("Name 1"),
+		# splitting the record's files, so one 404 from a listing is not taken at its word.
+		if _folder_still_there(folder):
+			frappe.throw(
+				_("SharePoint did not list this record's folder just now. Try again in a moment."),
+				MsGraphError,
+			)
 		_forget_folder(folder)
 		return {"exists": False, "can_create": can_write, "missing": True}
 
@@ -2203,6 +2250,75 @@ def upgrade_check_shared_folders():
 			)
 		)
 	return out
+
+
+def upgrade_check_files_in_other_records_folders():
+	"""Moved Files whose item is in the folder of a record other than the one they are attached to.
+
+	From 1.1.2 such an item opens only for someone who may read the record that owns the folder.
+	These are attachment copies (one document made from another, the copy pointing at the
+	original's item) or rows pointed at another record's file before 1.1.1 refused that. Read only
+	and without Graph: the recorded folder, or else the file's address, says whose folder it is.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	if not has_file_fields():
+		return []
+	has_folder_id = frappe.get_meta("File").has_field("custom_microsoft_folder_id")
+	fields = [
+		"name",
+		"attached_to_doctype",
+		"attached_to_name",
+		"custom_microsoft_drive_id",
+		"custom_microsoft_web_url",
+	] + (["custom_microsoft_folder_id"] if has_folder_id else [])
+	rows = frappe.get_all(
+		"File", filters={"custom_microsoft_status": ["in", [STORED, ARCHIVED]]}, fields=fields, order_by="name asc"
+	)
+	if not rows:
+		return []
+
+	folders = frappe.get_all(
+		"SharePoint Folder", fields=["drive_id", "item_id", "web_url", "reference_doctype", "reference_name"]
+	)
+	by_id = {(f.drive_id, f.item_id): f for f in folders if f.item_id}
+	by_url = {(f.drive_id, (f.web_url or "").rstrip("/").lower()): f for f in folders if f.web_url}
+
+	def holder(row):
+		found = by_id.get((row.custom_microsoft_drive_id, row.get("custom_microsoft_folder_id")))
+		if found:
+			return found
+		url = (row.custom_microsoft_web_url or "").rstrip("/").lower()
+		while "/" in url:
+			url = url.rsplit("/", 1)[0]
+			found = by_url.get((row.custom_microsoft_drive_id, url))
+			if found:
+				return found
+		return None
+
+	elsewhere = []
+	for row in rows:
+		folder = holder(row)
+		if folder and (folder.reference_doctype, folder.reference_name) != (
+			row.attached_to_doctype,
+			row.attached_to_name,
+		):
+			elsewhere.append(row)
+	if not elsewhere:
+		return []
+	return [
+		finding(
+			"upgrade.sharepoint_files_in_other_folders",
+			WARN,
+			_("{0} File(s) open only for users who can read the record whose folder holds them").format(
+				len(elsewhere)
+			),
+			_names(elsewhere),
+			_(
+				"Each is attached to one record but stored in another record's SharePoint folder: usually an attachment copied when one document was made from another, otherwise a File edited to point at someone else's file before 1.1.1. Someone who cannot read the record that owns the folder can no longer open it. If a copy has to be readable on its own, attach the file to that record again."
+			),
+		)
+	]
 
 
 def upgrade_check_file_items():
