@@ -1787,8 +1787,11 @@ class TestEventsOnlyGoToTheirOwnersCalendar(SyncTestCase):
 
 		with patch.object(graph, "graph_request", return_value={"id": "ms-own"}) as mocked, patch.object(
 			frappe, "enqueue"
-		):
+		) as enqueued:
 			event = self._local_event()
+			# An ordinary event is created once its save has committed (#27): run that job.
+			(job,) = [c for c in enqueued.call_args_list if "create_event_in_graph" in str(c)]
+			sync.create_event_in_graph(job[1]["event_name"])
 
 		self.assertEqual(mocked.call_args[0][0], "POST")
 		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "ms-own")
@@ -1867,6 +1870,7 @@ class TestEventsOnlyGoToTheirOwnersCalendar(SyncTestCase):
 		frappe.set_user(self.colleague)
 		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request", return_value={"id": "ms-mine"}):
 			event = self._local_event()
+			sync.create_event_in_graph(event.name)
 
 		with patch.object(frappe, "enqueue") as enqueued:
 			frappe.delete_doc("Event", event.name, force=True, ignore_permissions=True)

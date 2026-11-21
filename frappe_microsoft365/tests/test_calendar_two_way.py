@@ -376,3 +376,127 @@ class TestMirrorsMissingFromOutlook(GraphTestCase):
 		hooks = frappe.get_hooks("microsoft365_upgrade_checks")
 		paths = [p for paths in (hooks.get("1.2.0") or []) for p in ([paths] if isinstance(paths, str) else paths)]
 		self.assertIn("frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events", paths)
+
+
+# --- B8: transaction boundaries of a sync --------------------------------------------------
+
+
+class TestASyncDoesNotHoldItsLocks(GraphTestCase):
+	def test_pull_results_are_committed_before_the_push_begins(self):
+		timeline = []
+		fake = FakeGraph(
+			{
+				("GET", f"{GRAPH}/me/calendarView/delta"): lambda url, body: {
+					"value": [ms_event("ms-b8-pulled")],
+					"@odata.deltaLink": f"{GRAPH}/me/calendarView/delta?$deltatoken=2",
+				},
+				("POST", f"{GRAPH}/me/events"): lambda url, body: {"id": f"AAMk-b8-{len(fake.of('POST'))}"},
+			}
+		)
+
+		def network(method, url, **kwargs):
+			timeline.append(method)
+			return fake(method, url, **kwargs)
+
+		for n in range(2):
+			self._quiet_event(subject=f"Pending {n}")
+		with patch.object(graph, "_http_request", side_effect=network), patch.object(
+			frappe.db, "commit", side_effect=lambda *a, **k: timeline.append("COMMIT")
+		):
+			result = sync._sync_locked(self.calendar)
+
+		self.assertTrue(result["ok"], result)
+		first_post = timeline.index("POST")
+		self.assertIn("COMMIT", timeline[:first_post], timeline)
+		# And one commit behind every pushed event, so none of them waits on the next one.
+		self.assertEqual(timeline[first_post:], ["POST", "COMMIT", "POST", "COMMIT", "COMMIT"])
+
+
+# --- B10: one Frappe Event, exactly one Outlook event --------------------------------------
+
+
+class TestOneEventOneMeeting(GraphTestCase):
+	def test_a_second_create_for_an_event_that_already_has_an_id_is_skipped(self):
+		event = self._quiet_event(subject="Board meeting")
+		# Another worker created it a moment ago; this one still holds the old copy.
+		frappe.db.set_value("Event", event.name, "custom_microsoft_event_id", "AAMk-first", update_modified=False)
+		fake = FakeGraph({("POST", f"{GRAPH}/me/events"): {"id": "AAMk-second"}})
+
+		with self._network(fake):
+			self.assertFalse(sync._create_in_graph(CALENDAR, event.name, live_doc=event))
+
+		self.assertEqual(fake.calls, [])
+		self.assertEqual(event.custom_microsoft_event_id, "AAMk-first")
+
+	def test_a_form_opened_before_the_create_cannot_unlink_the_event(self):
+		event = self._quiet_event(subject="Quarterly review")
+		stale = frappe.get_doc("Event", event.name)
+		fake = FakeGraph({("POST", f"{GRAPH}/me/events"): {"id": "AAMk-only"}})
+		with self._network(fake), patch.object(frappe.db, "commit"):
+			sync._push(self.calendar)
+
+		stale.subject = "Quarterly review (edited)"
+		with patch.object(frappe, "enqueue") as enqueued:
+			stale.save()
+
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-only")
+		methods = [c[0][0] for c in enqueued.call_args_list]
+		self.assertEqual(methods, ["frappe_microsoft365.microsoft_calendar_sync.patch_event_in_graph"])
+		self.assertEqual(len(fake.of("POST")), 1)
+
+	def test_an_ordinary_new_event_is_created_after_its_save_commits(self):
+		fake = FakeGraph({("POST", f"{GRAPH}/me/events"): {"id": "AAMk-later"}})
+		with self._network(fake), patch.object(frappe, "enqueue") as enqueued:
+			event = self._local_event(subject="Plain")
+
+		self.assertEqual(fake.calls, [], "nothing reaches Outlook before the save commits")
+		(call,) = enqueued.call_args_list
+		self.assertEqual(call[0][0], "frappe_microsoft365.microsoft_calendar_sync.create_event_in_graph")
+		self.assertTrue(call[1]["enqueue_after_commit"])
+
+		with self._network(fake), patch.object(frappe.db, "commit"):
+			sync.create_event_in_graph(call[1]["event_name"])
+		(method, url, body), = fake.calls
+		self.assertEqual((method, url, body["subject"]), ("POST", f"{GRAPH}/me/events", "Plain"))
+		self.assertEqual(frappe.db.get_value("Event", event.name, "custom_microsoft_event_id"), "AAMk-later")
+
+	def _teams_fake(self):
+		return FakeGraph(
+			{
+				("POST", f"{GRAPH}/me/events"): {
+					"id": "AAMk-teams",
+					"onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/x"},
+				},
+				("DELETE", f"{GRAPH}/me/events/AAMk-teams"): 204,
+			}
+		)
+
+	def test_a_teams_meeting_is_deleted_again_when_its_save_rolls_back(self):
+		fake = self._teams_fake()
+		with self._network(fake):
+			event = self._local_event(subject="Teams", custom_add_teams_meeting=1)
+			self.assertEqual(event.custom_teams_join_url, "https://teams.microsoft.com/l/meetup-join/x")
+			frappe.db.rollback()
+
+		self.assertEqual([c[:2] for c in fake.calls], [
+			("POST", f"{GRAPH}/me/events"),
+			("DELETE", f"{GRAPH}/me/events/AAMk-teams"),
+		])
+
+	def test_a_rollback_to_a_savepoint_is_caught_at_the_commit(self):
+		fake = self._teams_fake()
+		with self._network(fake):
+			frappe.db.savepoint("teams_save")
+			self._local_event(subject="Teams", custom_add_teams_meeting=1)
+			frappe.db.rollback(save_point="teams_save")
+			frappe.db.commit()
+
+		self.assertEqual([c[0] for c in fake.calls], ["POST", "DELETE"])
+
+	def test_a_teams_meeting_that_is_kept_is_not_deleted(self):
+		fake = self._teams_fake()
+		with self._network(fake):
+			self._local_event(subject="Teams", custom_add_teams_meeting=1)
+			frappe.db.commit()
+
+		self.assertEqual([c[0] for c in fake.calls], ["POST"])

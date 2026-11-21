@@ -524,6 +524,10 @@ def _sync_locked(doc):
 			frappe.log_error(title=f"MS Calendar pull failed: {calendar_name}")
 		if doc.flags.pull_warning:
 			messages.append(doc.flags.pull_warning)
+		# The pull's writes are committed before the push starts. Left open, they held their row
+		# locks through every Graph call the push makes — minutes, on a busy calendar — and
+		# anybody saving one of those Events waited on the sync, or timed out.
+		frappe.db.commit()  # nosemgrep
 
 	if doc.push_to_microsoft_calendar:
 		try:
@@ -1268,57 +1272,98 @@ def _push_filters(doc):
 
 
 def _push(doc):
-	"""Create new Frappe events in Microsoft and patch ones edited while offline."""
+	"""Create new Frappe events in Microsoft and patch ones edited while offline.
+
+	Committed one event at a time. Each Graph call can take a second or more, and a transaction
+	left open across all of them held every row the push had touched until the last one was
+	done; worse, an id Graph had handed back sat uncommitted the whole time, so a worker killed
+	part-way lost it and the next run created the meeting a second time.
+	"""
 	if not doc.user:
 		# A connection with no user has no owner whose Events it could send.
 		return 0
 	base_filters = _push_filters(doc)
 
 	count = 0
-	new_events = frappe.get_all(
-		"Event",
-		filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
-		pluck="name",
-	)
-	for name in new_events:
-		try:
-			event = frappe.get_doc("Event", name)
-			created = _create_graph_event(doc.name, event)
-			if _store_graph_response(name, created, doc.name):
-				count += 1
-		except Exception:
-			frappe.log_error(title=f"MS event push failed: {name}")
-
-	# Edits made while the connection was down never reached doc_events; catch them up.
-	if doc.last_sync:
-		edited = frappe.get_all(
+	# Nothing this push writes is a person's edit, so none of it may bounce back as another push.
+	previous = frappe.flags.in_microsoft_sync
+	frappe.flags.in_microsoft_sync = True
+	try:
+		new_events = frappe.get_all(
 			"Event",
-			filters={
-				**base_filters,
-				# NOT IN with NULL never matches in SQL; "is set" is the NULL-safe form.
-				"custom_microsoft_event_id": ["is", "set"],
-				"modified": [">", doc.last_sync],
-			},
+			filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
 			pluck="name",
 		)
-		for name in edited:
+		for name in new_events:
 			try:
-				event = frappe.get_doc("Event", name)
-				patched = graph.graph_request(
-					"PATCH",
-					f"/me/events/{event.custom_microsoft_event_id}",
-					doc.name,
-					json=_event_to_graph_body(event),
-				)
-				_store_graph_response(name, patched or {}, doc.name)
-				count += 1
+				if _create_in_graph(doc.name, name):
+					count += 1
 			except Exception:
-				frappe.log_error(title=f"MS event patch failed: {name}")
+				frappe.log_error(title=f"MS event push failed: {name}")
+			frappe.db.commit()  # nosemgrep
 
-	# The ids of events already created in Graph must survive a later failure in this job;
-	# losing them would create duplicates in Outlook on the next run.
-	frappe.db.commit()  # nosemgrep
+		# Edits made while the connection was down never reached doc_events; catch them up.
+		if doc.last_sync:
+			edited = frappe.get_all(
+				"Event",
+				filters={
+					**base_filters,
+					# NOT IN with NULL never matches in SQL; "is set" is the NULL-safe form.
+					"custom_microsoft_event_id": ["is", "set"],
+					"modified": [">", doc.last_sync],
+				},
+				pluck="name",
+			)
+			for name in edited:
+				if name in new_events:
+					# Created a moment ago from exactly what it holds now.
+					continue
+				try:
+					if _patch_in_graph(doc.name, frappe.get_doc("Event", name)):
+						count += 1
+				except Exception:
+					frappe.log_error(title=f"MS event patch failed: {name}")
+				frappe.db.commit()  # nosemgrep
+	finally:
+		frappe.flags.in_microsoft_sync = previous
+
 	return count
+
+
+def _create_in_graph(calendar_name, event_name, live_doc=None):
+	"""Create one Frappe Event in Microsoft, unless it has been created there already.
+
+	The row is locked and its id read afresh before the POST. The scheduled push and a person
+	saving the same Event both decide "this has no id yet, create it", and without the lock both
+	did: two meetings in Outlook, two invitations to every attendee, and only one of them linked.
+	With it, the second one waits for the first to commit and then finds the id. Returns True
+	when an event was created and linked.
+	"""
+	row = frappe.db.get_value(
+		"Event", event_name, ["name", "custom_microsoft_event_id"], as_dict=True, for_update=True
+	)
+	if not row:
+		return False
+	if row.custom_microsoft_event_id:
+		if live_doc is not None:
+			live_doc.custom_microsoft_event_id = row.custom_microsoft_event_id
+		return False
+
+	event = live_doc if live_doc is not None else frappe.get_doc("Event", event_name)
+	created = _create_graph_event(calendar_name, event)
+	return _store_graph_response(event_name, created, calendar_name, live_doc=live_doc)
+
+
+def _patch_in_graph(calendar_name, event):
+	"""Send a Frappe Event that already exists in Microsoft to Graph. Returns True when sent."""
+	patched = graph.graph_request(
+		"PATCH",
+		f"/me/events/{event.custom_microsoft_event_id}",
+		calendar_name,
+		json=_event_to_graph_body(event),
+	)
+	_store_graph_response(event.name, patched or {}, calendar_name)
+	return True
 
 
 def _email_fields(doctype):
@@ -1669,6 +1714,7 @@ def event_validate(doc, method=None):
 	# This is a guard on what a person types into Frappe, nothing else.
 	if frappe.flags.in_microsoft_sync:
 		return
+	_keep_server_managed_fields(doc)
 	if not getattr(doc, "custom_sync_with_microsoft_calendar", 0):
 		return
 
@@ -1684,6 +1730,40 @@ def event_validate(doc, method=None):
 			),
 			title=_("Check the times"),
 		)
+
+
+#: Event fields only the sync writes. The form shows them read-only, but Frappe does not enforce
+#: read_only on a save, and a form opened before the sync filled them in sends them back empty.
+EVENT_SERVER_MANAGED_FIELDS = (
+	"custom_microsoft_event_id",
+	"custom_pulled_from_microsoft",
+	"custom_teams_join_url",
+	"custom_microsoft_web_link",
+	"custom_microsoft_sync_state",
+	"custom_microsoft_series_master_id",
+	"custom_microsoft_seen_in_round",
+	"custom_microsoft_orphaned",
+)
+
+
+def _keep_server_managed_fields(doc):
+	"""Put the link to Microsoft back to what is stored, whatever the save carried.
+
+	Creating an event in Outlook mostly happens just after the save that asked for it, so the
+	form that made the save does not have the id yet. Its next save sent the id back empty; the
+	link was gone, and the following push created the meeting in Outlook a second time. Restored
+	rather than refused, as with the calendar's own sync state: a stale form is no reason to fail
+	a save. A new Event keeps what it was created with.
+	"""
+	if doc.is_new():
+		return
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before:
+		return
+	meta = frappe.get_meta("Event")
+	for fieldname in EVENT_SERVER_MANAGED_FIELDS:
+		if meta.has_field(fieldname):
+			doc.set(fieldname, before.get(fieldname))
 
 
 def _validate_calendar_owner(doc):
@@ -1713,14 +1793,17 @@ def _validate_calendar_owner(doc):
 
 
 def event_on_update(doc, method=None):
-	"""Create in Graph inside the save; queue the patch for an event that already exists.
+	"""Send a saved Event to its owner's Microsoft calendar, mostly after the save commits.
 
-	A creation is the one Graph call somebody is genuinely waiting for: the id and the Teams
-	join link come back in its response and are written onto the document the browser is about
-	to be handed, so doing it later would mean saving a Teams meeting whose link is not there
-	yet. A patch answers with nothing anyone can see, and paying 300-900 milliseconds of Graph
-	latency for it on every save — up to ten seconds when Microsoft throttles and the retry
-	sleeps — is a cost with no buyer.
+	Only a new Teams meeting is created inside the save: its join link comes back in Graph's
+	response and is written onto the very document the browser is about to be handed, and a link
+	that turns up after a reload is not one anybody can paste into the invitation they are
+	writing. If that save then rolls back, the meeting is deleted again (_undo_if_rolled_back).
+
+	Everything else — creating an ordinary event, patching one that exists, deleting one — is
+	done once the save has committed, because nothing on screen waits for it. Doing it inside the
+	save cost 300-900 milliseconds of Graph latency per save, and when the save rolled back
+	afterwards the meeting stayed in Outlook with its invitations already sent.
 	"""
 	if frappe.flags.in_microsoft_sync:
 		return
@@ -1753,10 +1836,83 @@ def event_on_update(doc, method=None):
 				# find it at all — and would then patch Outlook back to the old text.
 				event_name=doc.name,
 			)
+		elif _wants_new_teams_meeting(doc):
+			if _create_in_graph(cal.name, doc.name, live_doc=doc):
+				_undo_if_rolled_back(cal.name, doc.custom_microsoft_event_id, doc.name)
 		else:
-			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name, live_doc=doc)
+			_queue_or_do_it_after_commit(
+				"frappe_microsoft365.microsoft_calendar_sync.create_event_in_graph",
+				queue="short",
+				job_id=f"m365-event-create-{doc.name}",
+				event_name=doc.name,
+			)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
+
+
+def _wants_new_teams_meeting(doc):
+	"""True when this save asks Microsoft for a Teams meeting that does not exist yet."""
+	return bool(getattr(doc, "custom_add_teams_meeting", 0)) and not getattr(doc, "custom_teams_join_url", None)
+
+
+def _undo_if_rolled_back(calendar_name, ms_id, event_name):
+	"""Delete the Outlook event this save created if the save itself does not survive.
+
+	Graph cannot take part in the transaction, so the next best thing: when the transaction
+	rolls back, the event is deleted again; and since a rollback to a savepoint runs no callbacks
+	at all, the commit checks as well that the Event it was created for still carries its id.
+	"""
+	if not ms_id:
+		return
+
+	def undo():
+		try:
+			graph.graph_request("DELETE", f"/me/events/{ms_id}", calendar_name)
+		except Exception:
+			frappe.log_error(
+				title=f"MS event left in Outlook after its save was rolled back: {event_name}",
+				message=f"Created in Microsoft as {ms_id}; delete it in Outlook by hand.",
+			)
+
+	def undo_unless_kept():
+		if not frappe.db.exists("Event", {"custom_microsoft_event_id": ms_id}):
+			undo()
+
+	frappe.db.after_rollback.add(undo)
+	frappe.db.after_commit.add(undo_unless_kept)
+
+
+def create_event_in_graph(event_name):
+	"""Create a Frappe Event in its owner's Microsoft calendar. Runs once its save has committed.
+
+	Everything is read here rather than carried in the job's arguments, for the same reasons as
+	``patch_event_in_graph``. The id is committed straight away: it is the only link between the
+	two sides, and a job that died after the POST without it would leave the next push to create
+	the meeting again.
+	"""
+	if not frappe.db.exists("Event", event_name):
+		return
+
+	doc = frappe.get_doc("Event", event_name)
+	if not doc.custom_sync_with_microsoft_calendar or not doc.custom_microsoft_calendar:
+		return
+	if doc.custom_pulled_from_microsoft or doc.custom_microsoft_event_id:
+		return
+	if not _is_owners_calendar(doc.owner, doc.custom_microsoft_calendar):
+		return
+
+	previous = frappe.flags.in_microsoft_sync
+	frappe.flags.in_microsoft_sync = True
+	try:
+		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
+		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
+			return
+		_create_in_graph(cal.name, event_name)
+		frappe.db.commit()  # nosemgrep
+	except Exception:
+		frappe.log_error(title=f"MS Event create failed: {event_name}")
+	finally:
+		frappe.flags.in_microsoft_sync = previous
 
 
 def patch_event_in_graph(event_name):
@@ -1790,13 +1946,7 @@ def patch_event_in_graph(event_name):
 		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
 		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
 			return
-		patched = graph.graph_request(
-			"PATCH",
-			f"/me/events/{doc.custom_microsoft_event_id}",
-			cal.name,
-			json=_event_to_graph_body(doc),
-		)
-		_store_graph_response(doc.name, patched or {}, cal.name)
+		_patch_in_graph(cal.name, doc)
 	except Exception:
 		frappe.log_error(title=f"MS Event patch failed: {event_name}")
 	finally:
