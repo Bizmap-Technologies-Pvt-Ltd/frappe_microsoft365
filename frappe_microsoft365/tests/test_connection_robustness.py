@@ -6,6 +6,8 @@ real, against real Microsoft Calendar rows that the test transaction rolls back.
 """
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -14,7 +16,7 @@ from frappe.utils.password import get_decrypted_password
 
 from frappe_microsoft365 import microsoft_calendar_sync as sync
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphAuthorizationLost, MsGraphError
+from frappe_microsoft365.microsoft_graph import MsGraphAuthorizationLost, MsGraphError, MsGraphThrottled
 from frappe_microsoft365.tests.base import BaseTestCase
 
 SETTINGS = frappe._dict(
@@ -25,6 +27,8 @@ SETTINGS = frappe._dict(
 	use_calendar=1,
 	redirect_uri="https://site.example.com/cb",
 )
+
+HEALTHY_QUEUE = {"ok": True, "reasons": [], "fixes": [], "message": "Background jobs are running."}
 
 
 def _response(status=200, payload=None, headers=None):
@@ -275,3 +279,164 @@ class TestDeadGrant(ConnectionTestCase):
 
 		self.assertEqual(frappe.db.get_value("Microsoft Calendar", cal, "authorized"), 1)
 		self.assertEqual(self._notifications(cal), [])
+
+
+# --- B9: throttling ----------------------------------------------------------------------
+
+
+class TestThrottling(ConnectionTestCase):
+	def setUp(self):
+		super().setUp()
+		patcher = patch.object(graph, "get_valid_access_token", return_value="token")
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_a_503_is_retried(self):
+		responses = [_response(503), _response(200, {"value": []})]
+		with (
+			patch.object(graph, "_http_request", side_effect=responses) as http,
+			patch.object(graph.time, "sleep") as slept,
+		):
+			self.assertEqual(graph.graph_request("GET", "/me/events", "cal"), {"value": []})
+
+		self.assertEqual(
+			[(c.args[0], c.args[1]) for c in http.call_args_list],
+			[("GET", "https://graph.microsoft.com/v1.0/me/events")] * 2,
+		)
+		slept.assert_called_once_with(graph.DEFAULT_RETRY_AFTER_SECONDS)
+
+	def test_backoff_doubles_without_a_retry_after(self):
+		responses = [_response(503), _response(503), _response(503), _response(200, {})]
+		with (
+			patch.object(graph, "_http_request", side_effect=responses),
+			patch.object(graph.time, "sleep") as slept,
+		):
+			graph.graph_request("GET", "/me/events", "cal")
+		self.assertEqual([c.args[0] for c in slept.call_args_list], [2, 4, 8])
+
+	def test_retry_after_as_an_http_date_is_honoured(self):
+		when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=40), usegmt=True)
+		responses = [_response(429, headers={"Retry-After": when}), _response(200, {})]
+		with (
+			patch.object(graph, "_http_request", side_effect=responses),
+			patch.object(graph.time, "sleep") as slept,
+		):
+			graph.graph_request("GET", "/me/events", "cal")
+		self.assertIn(slept.call_args.args[0], (39, 40, 41))
+
+	def test_retry_after_parsing(self):
+		past = format_datetime(datetime.now(timezone.utc) - timedelta(seconds=30), usegmt=True)
+		cases = {"7": 7, "0": 1, past: 1, "not a date": graph.DEFAULT_RETRY_AFTER_SECONDS}
+		for raw, expected in cases.items():
+			self.assertEqual(
+				graph._retry_after_seconds(_response(429, headers={"Retry-After": raw})), expected, raw
+			)
+
+	def test_a_long_retry_after_stops_further_calls_for_that_calendar_this_run(self):
+		with (
+			patch.object(
+				graph, "_http_request", return_value=_response(429, headers={"Retry-After": "120"})
+			) as http,
+			patch.object(graph.time, "sleep") as slept,
+		):
+			with self.assertRaises(MsGraphThrottled) as ctx:
+				graph.graph_request("POST", "/me/events", "cal", json={"subject": "x"})
+			with self.assertRaises(MsGraphThrottled):
+				graph.graph_request("POST", "/me/events", "cal", json={"subject": "y"})
+
+		self.assertEqual(ctx.exception.retry_after, 120)
+		self.assertEqual(http.call_count, 1)
+		self.assertEqual(http.call_args.args[:2], ("POST", "https://graph.microsoft.com/v1.0/me/events"))
+		self.assertEqual(http.call_args.kwargs["json"], {"subject": "x"})
+		slept.assert_not_called()
+		self.assertTrue(graph.is_throttled("cal"))
+		self.assertFalse(graph.is_throttled("another calendar"))
+
+		# Another connection is a different mailbox and still gets called.
+		with patch.object(graph, "_http_request", return_value=_response(200, {"ok": True})) as http:
+			self.assertEqual(graph.graph_request("GET", "/me", "another calendar"), {"ok": True})
+
+	def test_a_person_waiting_is_not_held_for_long_waits(self):
+		frappe.local.request = MagicMock()
+		self.addCleanup(lambda: setattr(frappe.local, "request", None))
+		with (
+			patch.object(
+				graph, "_http_request", return_value=_response(429, headers={"Retry-After": "40"})
+			) as http,
+			patch.object(graph.time, "sleep") as slept,
+		):
+			with self.assertRaises(MsGraphThrottled):
+				graph.graph_request("GET", "/me/events", "cal")
+		slept.assert_not_called()
+		self.assertEqual(http.call_count, 1)
+
+	def test_a_504_is_retried_for_a_get_but_never_for_a_post(self):
+		with (
+			patch.object(graph, "_http_request", side_effect=[_response(504), _response(200, {})]) as http,
+			patch.object(graph.time, "sleep"),
+		):
+			graph.graph_request("GET", "/me/events", "cal")
+		self.assertEqual(http.call_count, 2)
+
+		with (
+			patch.object(graph, "_http_request", return_value=_response(504)) as http,
+			patch.object(graph.time, "sleep"),
+		):
+			with self.assertRaises(MsGraphError) as ctx:
+				graph.graph_request("POST", "/me/events", "cal", json={"subject": "x"})
+		# A POST that timed out may have created the meeting; sending it again would duplicate it.
+		self.assertEqual(http.call_count, 1)
+		self.assertNotIsInstance(ctx.exception, MsGraphThrottled)
+		self.assertFalse(graph.is_throttled("cal"))
+
+	def test_a_refusal_that_outlasts_the_retries_pauses_the_connection(self):
+		with (
+			patch.object(graph, "_http_request", return_value=_response(503)) as http,
+			patch.object(graph.time, "sleep"),
+		):
+			with self.assertRaises(MsGraphThrottled):
+				graph.graph_request("GET", "/me/events", "cal")
+		self.assertEqual(http.call_count, graph.MAX_THROTTLE_RETRIES + 1)
+		self.assertTrue(graph.is_throttled("cal"))
+
+
+class TestPushStopsWhenThrottled(ConnectionTestCase):
+	def test_the_push_stops_calling_a_throttled_mailbox(self):
+		cal = self._calendar(pull_from_microsoft_calendar=0)
+		with (
+			patch.object(sync.background, "health", return_value=HEALTHY_QUEUE),
+			patch.object(frappe, "enqueue"),
+		):
+			frappe.flags.in_microsoft_sync = True
+			try:
+				for i in range(3):
+					frappe.get_doc(
+						{
+							"doctype": "Event",
+							"subject": f"pending {i}",
+							"event_type": "Private",
+							"starts_on": "2026-12-01 10:00:00",
+							"ends_on": "2026-12-01 10:30:00",
+							"custom_sync_with_microsoft_calendar": 1,
+							"custom_microsoft_calendar": cal,
+						}
+					).insert(ignore_permissions=True)
+			finally:
+				frappe.flags.in_microsoft_sync = False
+			frappe.db.sql(
+				"update `tabEvent` set owner=%s where custom_microsoft_calendar=%s", (self.user, cal)
+			)
+			doc = frappe.get_doc("Microsoft Calendar", cal)
+			with (
+				patch.object(
+					graph, "_http_request", return_value=_response(429, headers={"Retry-After": "120"})
+				) as http,
+				patch.object(frappe, "log_error") as logged,
+			):
+				pushed = sync._push(doc)
+
+		self.assertEqual(pushed, 0)
+		self.assertEqual(http.call_count, 1)
+		self.assertEqual(http.call_args.args[:2], ("POST", "https://graph.microsoft.com/v1.0/me/events"))
+		logged.assert_not_called()
+		self.assertIn("throttling", doc.flags.push_warning)

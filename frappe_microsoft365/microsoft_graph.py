@@ -7,8 +7,10 @@ authenticated Graph v1.0 calls. Secrets/tokens are never logged or returned to c
 See docs/graph-api-reference.md for the verified endpoint/permission contract.
 """
 
+import math
 import time
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from http import cookiejar
 from urllib.parse import urlsplit
 
@@ -62,10 +64,33 @@ CALLBACK_METHOD = (
 	"frappe_microsoft365.frappe_microsoft_365.doctype.microsoft_calendar.microsoft_calendar.callback"
 )
 
-#: Graph asks us to back off with a Retry-After header. Wait inline only for short waits;
-#: anything longer is left to the next scheduled run.
+#: Graph asks us to back off with a Retry-After header. How long a call may wait inline depends
+#: on who is waiting: a person behind a web request gets a short wait, a background job (the
+#: scheduled sync) can afford to sit out what Microsoft asks for. Anything longer than the cap
+#: is left to the next run, and the connection is left alone until then (MsGraphThrottled).
 MAX_RETRY_AFTER_SECONDS = 10
+MAX_BACKGROUND_RETRY_AFTER_SECONDS = 60
+#: The first wait when Microsoft sends no Retry-After; doubled on every further attempt.
 DEFAULT_RETRY_AFTER_SECONDS = 2
+
+#: How many times one call is retried after a throttling or availability answer. Three, as in
+#: Microsoft's own Graph SDK retry handler.
+MAX_THROTTLE_RETRIES = 3
+
+#: 429 Too Many Requests and 503 Service Unavailable are both how Graph throttles: the request
+#: was not processed, Retry-After says when to come back, and a connection that is still refused
+#: after the retries is left alone for the rest of the run.
+THROTTLE_STATUSES = (429, 503)
+
+#: 504 Gateway Timeout is retried too, but only for a method that is safe to repeat: a POST that
+#: timed out at the gateway may still have created its meeting, and sending it again would invite
+#: everybody twice.
+GATEWAY_TIMEOUT_STATUS = 504
+IDEMPOTENT_METHODS = ("GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+#: How long a connection is left alone when Microsoft kept refusing it without saying for how
+#: long.
+DEFAULT_THROTTLE_PAUSE_SECONDS = 60
 
 #: OAuth errors on a refresh that mean the grant itself is gone (password reset, account
 #: disabled, consent revoked, a sign-in policy that now needs the person present). Retrying can
@@ -106,6 +131,19 @@ class MsGraphNotFound(MsGraphError):
 
 class MsGraphConflict(MsGraphError):
 	"""Graph answered 409 — typically "an item with that name already exists"."""
+
+
+class MsGraphThrottled(MsGraphError):
+	"""Microsoft asked this connection to slow down for longer than this run will wait.
+
+	Raised for the refused call and, without touching the network, for every further call made
+	for the same connection until Microsoft's wait is over. A loop working through one
+	connection's items should stop on this rather than log the same refusal once per item.
+	"""
+
+	def __init__(self, message=None, retry_after=None):
+		super().__init__(message)
+		self.retry_after = retry_after
 
 
 class MsGraphAuthorizationLost(MsGraphError):
@@ -361,11 +399,72 @@ def clear_token_cache(calendar_name=None):
 	The 401 path depends on it: back-dating token_expiry only forces a refresh if the cached
 	copy goes with it, otherwise the retry re-sends the token Graph has just refused and 401s
 	again, for as many times as it is allowed to.
+
+	Called with no name it forgets everything this request remembers about connections, which
+	includes the throttling pauses (see _throttled_until): it is how a fresh run starts clean.
 	"""
 	if calendar_name is None:
 		_token_cache().clear()
+		_throttled_until().clear()
 	else:
 		_token_cache().pop(calendar_name, None)
+
+
+# --- throttling ------------------------------------------------------------------------
+
+def _throttled_until():
+	"""The request-local ``{connection: monotonic deadline}`` of connections Microsoft paused.
+
+	Request-local like the token cache, and for the same reason: one worker serves every site,
+	and a calendar name on site A says nothing about the same name on site B. A scheduled sync
+	runs as its own job, so "the rest of the run" is exactly the life of this dict.
+	"""
+	paused = getattr(frappe.local, "microsoft365_throttled_until", None)
+	if paused is None:
+		paused = {}
+		frappe.local.microsoft365_throttled_until = paused
+	return paused
+
+
+def _throttle_key(name):
+	return "app" if name is APP else name
+
+
+def _pause(name, seconds):
+	"""Leave this connection alone for ``seconds``, as Microsoft asked."""
+	_throttled_until()[_throttle_key(name)] = time.monotonic() + max(seconds, 1)
+
+
+def _raise_if_paused(name):
+	"""Refuse a call to a connection Microsoft has asked to wait, without calling Microsoft."""
+	deadline = _throttled_until().get(_throttle_key(name))
+	if deadline is None:
+		return
+	remaining = deadline - time.monotonic()
+	if remaining <= 0:
+		_throttled_until().pop(_throttle_key(name), None)
+		return
+	frappe.throw(
+		_(
+			"Microsoft is throttling this connection and asked us to wait {0} more seconds. "
+			"The next scheduled sync carries on."
+		).format(math.ceil(remaining)),
+		MsGraphThrottled,
+	)
+
+
+def is_throttled(auth):
+	"""True while Microsoft's requested pause for this connection (doc, name or APP) lasts."""
+	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
+	deadline = _throttled_until().get(_throttle_key(name))
+	return bool(deadline and deadline > time.monotonic())
+
+
+def _max_inline_wait():
+	"""How long one call may sleep for Microsoft: short with a person waiting, longer in a job."""
+	if getattr(frappe.local, "request", None):
+		return MAX_RETRY_AFTER_SECONDS
+	return MAX_BACKGROUND_RETRY_AFTER_SECONDS
 
 
 def _store_tokens(calendar_name, result, commit=True):
@@ -692,7 +791,7 @@ def _graph_session():
 	graph.microsoft.com that is ~44 ms per call versus ~11 ms on a socket that is already open —
 	three quarters of the transport time — and a 50-page delta run pays it once per page.
 
-	No urllib3 Retry is mounted, deliberately: graph_request owns the 401/429 policy including
+	No urllib3 Retry is mounted, deliberately: graph_request owns the 401 and throttling policy including
 	Retry-After, and an adapter retrying underneath it would multiply every attempt invisibly.
 	"""
 	global _session
@@ -787,7 +886,7 @@ def _release(resp):
 
 def graph_request(
 	method, path, auth, json=None, params=None, headers=None, raw=False, stream=False,
-	data=None, timeout=30, _retried=False,
+	data=None, timeout=30, _retried=False, _attempt=0,
 ):
 	"""Authenticated Graph v1.0 call. Refreshes the token once on 401 and retries.
 
@@ -802,10 +901,17 @@ def graph_request(
 	runs to gigabytes, and buffering one to hand back a .content is how a worker gets killed.
 
 	`data` sends a raw body (bytes or a file-like object) instead of JSON — a file upload.
+
+	Throttling (429, 503) is retried up to MAX_THROTTLE_RETRIES times, waiting what Retry-After
+	asks (seconds or an HTTP date) or, without one, an exponential backoff. A wait longer than
+	this call may hold, or a refusal that outlasts the retries, raises MsGraphThrottled, and
+	every later call for the same connection in this run is refused without reaching Microsoft
+	until the wait is over. A 504 is retried the same way for methods that are safe to repeat.
 	"""
 	name = auth if (auth is APP or isinstance(auth, str)) else auth.name
 	# Checked before the token is resolved: a refused URL should not even cost a refresh.
 	url = graph_url(path)
+	_raise_if_paused(name)
 	token = _token_for(name)
 	req_headers = {"Authorization": f"Bearer {token}"}
 	if headers:
@@ -816,34 +922,46 @@ def graph_request(
 	else:
 		kwargs["json"] = json
 	resp = _http_request(method, url, **kwargs)
+	# A body that was a stream has already been consumed, so that one can never be replayed.
+	replayable = not hasattr(data, "read")
 
-	if resp.status_code == 401 and not _retried and not hasattr(data, "read"):
+	if resp.status_code == 401 and not _retried and replayable:
 		# Force refresh then retry once. Dropping the cached token is half of the force: without
-		# it the retry would resolve to the very token Graph has just rejected. A body that was a
-		# stream has already been consumed, so that one cannot be replayed and falls through.
+		# it the retry would resolve to the very token Graph has just rejected.
 		_force_refresh(name)
 		_release(resp)
 		return graph_request(
 			method, path, name, json=json, params=params, headers=headers,
-			raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
+			raw=raw, stream=stream, data=data, timeout=timeout, _retried=True, _attempt=_attempt,
 		)
 
-	if resp.status_code == 429 and not _retried and not hasattr(data, "read"):
-		# Honour Retry-After for short waits; longer backoffs are left to the next run.
-		wait = _retry_after_seconds(resp)
-		if wait is not None:
+	retry_gateway = resp.status_code == GATEWAY_TIMEOUT_STATUS and method.upper() in IDEMPOTENT_METHODS
+	if resp.status_code in THROTTLE_STATUSES or retry_gateway:
+		wait = _retry_after_seconds(resp, _attempt)
+		if replayable and _attempt < MAX_THROTTLE_RETRIES and wait <= _max_inline_wait():
 			time.sleep(wait)
 			_release(resp)
 			return graph_request(
 				method, path, name, json=json, params=params, headers=headers,
-				raw=raw, stream=stream, data=data, timeout=timeout, _retried=True,
+				raw=raw, stream=stream, data=data, timeout=timeout, _retried=_retried,
+				_attempt=_attempt + 1,
 			)
 
-	if resp.status_code == 429:
+	if resp.status_code in THROTTLE_STATUSES:
+		wait = _retry_after_seconds(resp, _attempt, default=DEFAULT_THROTTLE_PAUSE_SECONDS)
 		_release(resp)
-		frappe.throw(
-			_("Microsoft Graph rate limit hit (429). The next scheduled sync will retry."), MsGraphError
-		)
+		_pause(name, wait)
+		try:
+			frappe.throw(
+				_(
+					"Microsoft Graph is throttling this connection ({0}) and asked us to wait {1} "
+					"seconds. The next scheduled sync carries on."
+				).format(resp.status_code, wait),
+				MsGraphThrottled,
+			)
+		except MsGraphThrottled as e:
+			e.retry_after = wait
+			raise
 
 	if resp.status_code == 410:
 		# Delta token expired/invalid — the caller has to restart with a full sync.
@@ -894,16 +1012,38 @@ def _safe_error(resp):
 		return resp.reason
 
 
-def _retry_after_seconds(resp):
-	"""Seconds to wait per the Retry-After header, or None when the wait is too long to hold."""
-	raw = (resp.headers or {}).get("Retry-After")
+def _retry_after_seconds(resp, attempt=0, default=None):
+	"""Seconds to wait before trying again, per Retry-After, as a whole number of at least 1.
+
+	Retry-After comes in two forms (RFC 9110): a number of seconds, or an HTTP date to wait
+	until. Without a usable header the wait is ``default`` when given, otherwise an exponential
+	backoff from DEFAULT_RETRY_AFTER_SECONDS that doubles with each attempt.
+	"""
+	raw = ((resp.headers or {}).get("Retry-After") or "").strip()
+	wait = _parse_retry_after(raw) if raw else None
+	if wait is None:
+		wait = default if default is not None else DEFAULT_RETRY_AFTER_SECONDS * (2 ** attempt)
+	return max(math.ceil(wait), 1)
+
+
+def _parse_retry_after(raw):
+	"""Seconds from a Retry-After value, or None when it is neither form."""
 	try:
-		wait = int(float(raw)) if raw else DEFAULT_RETRY_AFTER_SECONDS
+		return max(float(raw), 0)
 	except (TypeError, ValueError):
-		wait = DEFAULT_RETRY_AFTER_SECONDS
-	if wait > MAX_RETRY_AFTER_SECONDS:
+		pass
+	try:
+		when = parsedate_to_datetime(raw)
+	except (TypeError, ValueError, IndexError):
 		return None
-	return max(wait, 1)
+	if when is None:
+		return None
+	from datetime import datetime, timezone
+
+	if when.tzinfo is None:
+		# HTTP dates are always GMT; a date without a zone is read as one.
+		when = when.replace(tzinfo=timezone.utc)
+	return max((when - datetime.now(timezone.utc)).total_seconds(), 0)
 
 
 def graph_paged(path, auth, headers=None, max_pages=MAX_PAGES):

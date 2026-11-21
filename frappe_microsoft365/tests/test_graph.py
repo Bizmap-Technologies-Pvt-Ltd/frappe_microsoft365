@@ -85,6 +85,9 @@ class TestGraphPaging(BaseTestCase):
 class TestGraphRequestBehaviour(BaseTestCase):
 	def setUp(self):
 		super().setUp()
+		# A throttled answer pauses the connection for the rest of the request; start clean.
+		graph.clear_token_cache()
+		self.addCleanup(graph.clear_token_cache)
 		self.token_patcher = patch.object(graph, "get_valid_access_token", return_value="token")
 		self.token_patcher.start()
 		self.addCleanup(self.token_patcher.stop)
@@ -275,6 +278,9 @@ class TestTokenCache(BaseTestCase):
 class TestStreamedRequests(BaseTestCase):
 	def setUp(self):
 		super().setUp()
+		# A throttled answer pauses the connection for the rest of the request; start clean.
+		graph.clear_token_cache()
+		self.addCleanup(graph.clear_token_cache)
 		self.token_patcher = patch.object(graph, "get_valid_access_token", return_value="token")
 		self.token_patcher.start()
 		self.addCleanup(self.token_patcher.stop)
