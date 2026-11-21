@@ -31,6 +31,9 @@ microsoft365_upgrade_checks = {
 		"frappe_microsoft365.microsoft_files.upgrade_check_file_items",
 		"frappe_microsoft365.microsoft_files.upgrade_check_shared_folders",
 	],
+	"1.1.2": [
+		"frappe_microsoft365.microsoft_files.upgrade_check_files_in_other_records_folders",
+	],
 }
 
 doc_events = {

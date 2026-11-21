@@ -1929,3 +1929,126 @@ class TestFileItemsCheck(FilesTestCase):
 
 	def test_the_check_is_registered_for_the_upgrade_report(self):
 		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_file_items", upgrade_checks())
+
+
+class TestItemsOfAnotherRecord(FilesTestCase):
+	"""1.1.2: an item in another record's folder is read only by someone who may read that record.
+
+	Rows like these come from attachment copies (one document made from another) and from rows
+	pointed at another record's file before 1.1.1 refused such edits; the data cannot tell the two
+	apart, so the record that owns the folder decides.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		files.upload_file(self.attach().name)  # gives self.todo its folder, FOLDER
+		self.graph.items.update({"THEIRS": {"id": "THEIRS", "parent": "FOLDER"}})
+		self.user = "m365-other-record@example.com"
+		if not frappe.db.exists("User", self.user):
+			frappe.get_doc(
+				{"doctype": "User", "email": self.user, "first_name": "Other", "send_welcome_email": 0}
+			).insert(ignore_permissions=True).add_roles("Desk User")
+		self.mine = frappe.get_doc({"doctype": "ToDo", "description": "mine"}).insert()
+		frappe.db.set_value("ToDo", self.mine.name, "owner", self.user)
+
+	def pointed_at_their_item(self):
+		"""A File on the user's own record whose ids name a file in self.todo's folder."""
+		f = self.attach(attached_to_name=self.mine.name)
+		frappe.db.set_value(
+			"File",
+			f.name,
+			{
+				"owner": self.user,
+				"file_url": files.stored_url(f.file_name),
+				"custom_microsoft_status": files.STORED,
+				"custom_microsoft_drive_id": "DRIVE",
+				"custom_microsoft_item_id": "THEIRS",
+				"custom_microsoft_folder_id": None,
+			},
+		)
+		return frappe.get_doc("File", f.name)
+
+	def test_someone_who_cannot_read_the_folders_record_is_refused(self):
+		f = self.pointed_at_their_item()
+		frappe.set_user(self.user)
+		try:
+			with patch.object(files, "_stream") as stream, self.assertRaises(frappe.PermissionError):
+				files.open_file(f.file_name)
+			stream.assert_not_called()
+			with patch.object(files, "fetch_content") as fetch, self.assertRaises(frappe.PermissionError):
+				f.get_content()
+			fetch.assert_not_called()
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_a_copy_opens_for_someone_who_can_read_the_original(self):
+		f = self.pointed_at_their_item()
+		with patch.object(files, "_stream", return_value="STREAM"):
+			self.assertEqual(files.open_file(f.file_name), "STREAM")
+
+	def test_it_is_never_deleted_through_a_file_on_another_record(self):
+		configure(self, files_delete_remote=1)
+		f = self.pointed_at_their_item()
+		frappe.delete_doc("File", f.name, force=True)
+		self.assertEqual([p for m, p in self.graph.calls if m == "DELETE"], [])
+
+
+class TestOldPathsClaimedByAKeptCopy(TestOwnBytesOnly):
+	"""1.1.2: a file moved before 1.1.1 has no hash, so another File's kept copy also claims the path."""
+
+	def test_fallback_refuses_a_path_kept_by_another_moved_file(self):
+		a, b = self.moved_then_taken(keep_hash=False)
+		old = b.file_url
+		# B has since moved too, keeping its local copy: it no longer has the URL, it keeps the path.
+		frappe.db.set_value(
+			"File", b.name, {"file_url": files.stored_url(b.file_name), "custom_microsoft_local_url": old}
+		)
+		self.assertFalse(files.own_local_copy(frappe.get_doc("File", a.name), old))
+
+
+class TestPanelConfirmsAMissingFolder(FilesTestCase):
+	"""1.1.2: one 404 from a listing no longer drops the folder record (which split files in two)."""
+
+	def setUp(self):
+		super().setUp()
+		files.upload_file(self.attach().name)
+		self.folder = files.get_folder("ToDo", self.todo.name)
+
+	def answer(self, folder_exists):
+		real = self.graph
+
+		def side_effect(method, path, *args, **kwargs):
+			if method == "GET" and "/children?" in path:
+				raise MsGraphNotFound("404")
+			if method == "GET" and path == f"/drives/DRIVE/items/{self.folder.item_id}":
+				if not folder_exists:
+					raise MsGraphNotFound("404")
+				return {"id": self.folder.item_id}
+			return real(method, path, *args, **kwargs)
+
+		return patch.object(graph, "graph_request", side_effect=side_effect)
+
+	def test_a_listing_404_with_the_folder_still_there_keeps_the_record(self):
+		with self.answer(folder_exists=True), self.assertRaises(MsGraphError):
+			files.list_folder("ToDo", self.todo.name)
+		self.assertTrue(files.get_folder("ToDo", self.todo.name))
+
+	def test_a_folder_that_is_really_gone_is_forgotten(self):
+		with self.answer(folder_exists=False):
+			self.assertTrue(files.list_folder("ToDo", self.todo.name)["missing"])
+		self.assertFalse(files.get_folder("ToDo", self.todo.name))
+
+
+class TestFilesInOtherRecordsFoldersCheck(TestItemsOfAnotherRecord):
+	def test_lists_a_file_stored_in_another_records_folder(self):
+		f = self.pointed_at_their_item()
+		frappe.db.set_value("File", f.name, "custom_microsoft_folder_id", "FOLDER")
+		out = files.upgrade_check_files_in_other_records_folders()
+		self.assertEqual([x["check"] for x in out], ["upgrade.sharepoint_files_in_other_folders"])
+		self.assertIn(f.name, out[0]["detail"])
+
+	def test_says_nothing_about_files_in_their_own_folder(self):
+		f = self.attach()
+		files.upload_file(f.name)
+		listed = " ".join(x["detail"] for x in files.upgrade_check_files_in_other_records_folders())
+		self.assertNotIn(f.name, listed)
