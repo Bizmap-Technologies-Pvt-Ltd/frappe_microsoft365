@@ -66,11 +66,25 @@ DEAD_QUEUE = {
 
 
 class ArtifactsTestCase(BaseTestCase):
+	#: Most tests here are about what happens to a transcript, not when it was made, and their
+	#: fixtures carry fixed Graph dates against meetings timed relative to now. The occurrence
+	#: filter would rightly drop those, so it is off unless a test class is about it.
+	filter_by_occurrence = False
+
 	def setUp(self):
 		super().setUp()
 		queue = patch.object(artifacts.background, "health", return_value=HEALTHY_QUEUE)
 		queue.start()
 		self.addCleanup(queue.stop)
+		# The catch-up job commits after every Event. Inside a test that would make each fixture
+		# permanent and leak it into every later test, so commits are counted, not made.
+		commit = patch.object(frappe.db, "commit")
+		self.commits = commit.start()
+		self.addCleanup(commit.stop)
+		if not self.filter_by_occurrence:
+			unbounded = patch.object(artifacts, "_occurrence_window", return_value=(None, None))
+			unbounded.start()
+			self.addCleanup(unbounded.stop)
 		if not frappe.db.exists("Microsoft Calendar", CALENDAR):
 			frappe.get_doc(
 				{
@@ -450,7 +464,10 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 
 		self.assertIn(event.name, artifacts._due_events([CALENDAR]))
 
-	def test_a_meeting_with_both_artifacts_is_never_asked_about_again(self):
+	def test_a_meeting_with_both_artifacts_is_still_asked_about_for_later_parts(self):
+		"""A meeting past four hours comes back as several recordings, and the later parts
+		appear later; stopping at the first one lost them. It waits behind meetings still
+		missing something, though."""
 		event = self._finished_meeting()
 		event.db_set(
 			{
@@ -459,8 +476,13 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 			},
 			update_modified=False,
 		)
+		waiting = self._finished_meeting()
+		waiting.db_set("ends_on", add_to_date(now_datetime(), minutes=-20), update_modified=False)
 
-		self.assertNotIn(event.name, artifacts._due_events([CALENDAR]))
+		due = artifacts._due_events([CALENDAR])
+
+		self.assertIn(event.name, due)
+		self.assertLess(due.index(waiting.name), due.index(event.name))
 
 	def test_the_job_gives_up_after_the_last_step(self):
 		event = self._finished_meeting(ended_hours_ago=48)

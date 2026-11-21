@@ -46,6 +46,8 @@ resolving that from a join URL needs OnlineMeetings.Read (ReadWrite on sites tha
 """
 
 import json
+import re
+from datetime import datetime, timedelta
 
 import frappe
 from frappe import _
@@ -112,6 +114,29 @@ def _teams_tab_note():
 	)
 
 
+class MeetingUnavailable(frappe.ValidationError):
+	"""There is nothing to fetch for this Event, and asking again will not change that.
+
+	No Teams meeting on it, or a join link Microsoft matches to nothing in this tenant (another
+	organisation's meeting, or one that has aged out). These end the catch-up job's schedule for
+	the Event; every other failure is retried on the normal backoff.
+	"""
+
+
+#: Graph answers that say "not now" rather than "no": throttling, and Microsoft's own outages.
+_TEMPORARY_STATUS = re.compile(r"\((429|500|502|503|504)\)|rate limit", re.IGNORECASE)
+
+
+def _is_temporary(error):
+	"""A Graph error that says nothing about the meeting: throttling or an outage."""
+	return bool(_TEMPORARY_STATUS.search(str(error)))
+
+
+def _status_of(error):
+	match = re.search(r"\((\d{3})\)", str(error))
+	return match.group(1) if match else "429"
+
+
 def _event_for_artifacts(event_name, resolve=True):
 	"""The Event, its calendar and its online meeting id, with every precondition checked."""
 	doc = frappe.get_doc("Event", event_name)
@@ -120,7 +145,7 @@ def _event_for_artifacts(event_name, resolve=True):
 	calendar_name = doc.get("custom_microsoft_calendar")
 	join_url = doc.get("custom_teams_join_url")
 	if not calendar_name or not join_url:
-		frappe.throw(_("This event has no Teams meeting."))
+		frappe.throw(_("This event has no Teams meeting."), MeetingUnavailable)
 
 	calendar = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(calendar)
@@ -162,6 +187,16 @@ def _event_for_artifacts(event_name, resolve=True):
 			# include — so it is the one that fails for people who granted transcript consent and
 			# stopped. Left to fall through, the dialog showed a raw Graph 403 against a path
 			# nobody recognises.
+			if _is_temporary(e):
+				# Said as what it is. The raw text quotes the whole $filter, join link and all, and
+				# reads like the link is wrong when Microsoft simply did not answer this time.
+				frappe.throw(
+					_(
+						"Microsoft did not answer the meeting lookup this time ({0}). That is "
+						"temporary: try again in a few minutes."
+					).format(_status_of(e)),
+					type(e),
+				)
 			ms._wrap_join_url_403(e)
 		if not meeting_id:
 			# Matched nothing rather than refused. An external organiser's meeting lives in their
@@ -170,13 +205,205 @@ def _event_for_artifacts(event_name, resolve=True):
 				_(
 					"Microsoft could not match this join link to a meeting — either another "
 					"organisation hosted it, or it has aged out. {0}"
-				).format(_expiry_note())
+				).format(_expiry_note()),
+				MeetingUnavailable,
 			)
 		frappe.db.set_value(
 			"Event", doc.name, "custom_microsoft_online_meeting_id", meeting_id, update_modified=False
 		)
 
 	return doc, calendar_name, meeting_id
+
+
+# --- occurrences ---------------------------------------------------------------------
+#
+# Every occurrence of a recurring Teams meeting shares one join link and one online meeting, so
+# Graph lists the transcripts and recordings of the whole series under it. Which ones belong to
+# this Event has to be decided here, by time: an item belongs to the occurrence it was created
+# during. A one-off meeting is simply a series of one.
+
+#: How long before its booked start an occurrence's items may begin. People open the meeting a
+#: little early, and transcription started then is still that meeting's.
+OCCURRENCE_LEAD = timedelta(hours=1)
+
+#: How long after its booked end. Meetings overrun, and a recording that restarts at the four-hour
+#: split is created well after the slot of a short booking. Kept far below a day, so a daily
+#: series' next occurrence is never in reach.
+OCCURRENCE_TAIL = timedelta(hours=6)
+
+#: Frappe's repeat_on values that step by months, and by how many.
+_MONTH_STEPS = {"Monthly": 1, "Quarterly": 3, "Half Yearly": 6, "Yearly": 12}
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+#: The date a transcript File is named for: teams-transcript-2026-09-04[-part-2][hash].vtt
+_STAMP = re.compile(r"^teams-transcript-(\d{4}-\d{2}-\d{2})")
+
+
+def _occurrence(doc, now=None):
+	"""(start, end) of the occurrence of this Event that artifacts are being asked about.
+
+	For a one-off Event, the Event itself. A repeating Frappe Event is one record for the whole
+	series — exactly as Graph keeps one series master — so the occurrence is the latest one that
+	has started by ``now``: the one whose transcript can exist. It used to be the first one
+	forever, so the catch-up job never looked at a repeating Event again after its first week.
+	"""
+	starts_on = get_datetime(doc.get("starts_on")) if doc.get("starts_on") else None
+	ends_on = get_datetime(doc.get("ends_on")) if doc.get("ends_on") else None
+	if not doc.get("repeat_this_event") or not starts_on:
+		return starts_on, ends_on
+
+	start = _latest_repeat_start(doc, starts_on, now or now_datetime())
+	return start, (start + (ends_on - starts_on)) if ends_on else None
+
+
+def _latest_repeat_start(doc, first, now):
+	"""The start of the last occurrence of a repeating Event at or before ``now``.
+
+	Follows the series as it was sent to Outlook (microsoft_calendar_sync._recurrence): a weekly
+	series always includes its own start day, and repeat_till is the last day it can fall on.
+	"""
+	limit = now
+	if doc.get("repeat_till"):
+		limit = min(limit, datetime.combine(get_datetime(doc.repeat_till).date(), first.time()))
+	if limit <= first:
+		return first
+
+	kind = doc.get("repeat_on")
+	if kind in ("Daily", "Weekly"):
+		days = set(range(7))
+		if kind == "Weekly":
+			days = {i for i, day in enumerate(_WEEKDAYS) if doc.get(day)} | {first.weekday()}
+		day = limit.date()
+		# A week back always finds one: the start day itself is in every weekly series.
+		for _offset in range(8):
+			candidate = datetime.combine(day, first.time())
+			if candidate <= limit and candidate.weekday() in days:
+				return max(candidate, first)
+			day -= timedelta(days=1)
+		return first
+
+	step = _MONTH_STEPS.get(kind)
+	if not step:
+		return first
+	months = ((limit.year - first.year) * 12 + limit.month - first.month) // step * step
+	while months > 0:
+		candidate = get_datetime(add_to_date(first, months=months))
+		if candidate <= limit:
+			return candidate
+		months -= step
+	return first
+
+
+def _occurrence_window(start, end):
+	"""The span an occurrence's transcripts and recordings are created in, in system time.
+
+	(None, None) means unbounded on that side — an Event with no start cannot be placed at all.
+	"""
+	if not start:
+		return None, None
+	return start - OCCURRENCE_LEAD, (end or start) + OCCURRENCE_TAIL
+
+
+def _graph_instant(value):
+	"""A Graph timestamp (UTC, e.g. 2026-09-04T10:20:00.1234567Z) as naive system time, or None."""
+	if not value:
+		return None
+	from zoneinfo import ZoneInfo
+
+	from dateutil import parser
+	from frappe.utils import get_system_timezone
+
+	try:
+		parsed = parser.isoparse(value)
+	except (ValueError, TypeError, OverflowError):
+		return None
+	if parsed.tzinfo is None:
+		parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+	return parsed.astimezone(ZoneInfo(get_system_timezone())).replace(tzinfo=None)
+
+
+def _in_window(item, window):
+	"""Was this transcript or recording created during the occurrence?
+
+	One Graph does not date cannot be placed in any occurrence, so it is kept rather than lost:
+	Graph always dates them, and dropping a transcript on a technicality is the worse mistake.
+	"""
+	lo, hi = window
+	created = _graph_instant(item.get("created_date_time"))
+	if created is None:
+		return True
+	return (lo is None or created >= lo) and (hi is None or created <= hi)
+
+
+def _utc_day(moment):
+	"""The UTC calendar date of a naive system-time datetime: the date transcripts are named by."""
+	from zoneinfo import ZoneInfo
+
+	from frappe.utils import get_system_timezone
+
+	aware = moment.replace(tzinfo=ZoneInfo(get_system_timezone()))
+	return aware.astimezone(ZoneInfo("UTC")).date()
+
+
+def _stamp_day(file_name):
+	match = _STAMP.match(file_name or "")
+	if not match:
+		return None
+	try:
+		return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+	except ValueError:
+		return None
+
+
+def _day_in_window(day, window):
+	"""Could a transcript named for UTC date ``day`` have been created inside ``window``?
+
+	The file name keeps only the date, so this asks whether the two overlap at all — generous by
+	up to a day, which is never enough to reach the next week's occurrence.
+	"""
+	lo, hi = window
+	return (lo is None or day >= _utc_day(lo)) and (hi is None or day <= _utc_day(hi))
+
+
+def _day_in_some_occurrence(doc, day):
+	"""Does a transcript named for UTC ``day`` fall in any occurrence of this Event?"""
+	from zoneinfo import ZoneInfo
+
+	from frappe.utils import get_system_timezone
+
+	# The last moment of that UTC day, in system time, plus the lead: the latest occurrence that
+	# can have started by then is the only one this day can belong to.
+	end_of_day = datetime.combine(day, datetime.max.time()).replace(tzinfo=ZoneInfo("UTC"))
+	moment = end_of_day.astimezone(ZoneInfo(get_system_timezone())).replace(tzinfo=None)
+	return _day_in_window(day, _occurrence_window(*_occurrence(doc, now=moment + OCCURRENCE_LEAD)))
+
+
+def _is_new_occurrence(doc, occurrence_start):
+	"""Has a repeating Event moved on to an occurrence nobody has checked yet?"""
+	if not doc.get("repeat_this_event") or not occurrence_start:
+		return False
+	checked_on = doc.get("custom_microsoft_artifacts_checked_on")
+	return not checked_on or get_datetime(checked_on) < occurrence_start
+
+
+def _counters(doc, occurrence_start):
+	"""(attempts, has_transcript, recordings) for the occurrence being asked about.
+
+	A repeating Event keeps one set of fields for the whole series. What they say belongs to the
+	occurrence that was last checked; once a later one has started, they describe the past, and
+	that occurrence starts from nothing — otherwise week two would inherit week one's spent
+	attempts and "transcript attached" and never be asked about at all.
+	"""
+	attempts = cint(doc.get("custom_microsoft_artifacts_attempts"))
+	fetched_on = doc.get("custom_microsoft_transcript_fetched_on")
+	recordings = _stored_recordings(doc)
+	if not doc.get("repeat_this_event") or not occurrence_start:
+		return attempts, bool(fetched_on), recordings
+
+	if _is_new_occurrence(doc, occurrence_start):
+		return 0, False, []
+	return attempts, bool(fetched_on and get_datetime(fetched_on) >= occurrence_start), recordings
 
 
 # --- state ---------------------------------------------------------------------------
@@ -196,12 +423,10 @@ def artifact_state(event: str):
 
 
 def _state(doc):
-	starts_on = get_datetime(doc.starts_on) if doc.starts_on else None
-	ends_on = get_datetime(doc.ends_on) if doc.ends_on else None
 	now = now_datetime()
-	attempts = cint(doc.get("custom_microsoft_artifacts_attempts"))
-	has_transcript = bool(doc.get("custom_microsoft_transcript_fetched_on"))
-	recordings = _stored_recordings(doc)
+	# The occurrence, not the Event: for a repeating Event the two differ from the second week on.
+	starts_on, ends_on = _occurrence(doc, now)
+	attempts, has_transcript, recordings = _counters(doc, starts_on)
 
 	state = {
 		"has_transcript": has_transcript,
@@ -414,33 +639,57 @@ def fetch_meeting_artifacts(event: str):
 	}
 
 
-def _fetch_into(doc, calendar_name, meeting_id):
+def _fetch_into(doc, calendar_name, meeting_id, scheduled=False, attempt=None):
 	"""Ask Graph, write what came back, record the attempt. Never raises for 'not ready yet'.
 
 	A transcript error and a recording error are kept apart: recordings are consented
 	separately, and a tenant that refuses them must not cost you the transcript — nor answer
 	the refusal with advice about transcripts.
+
+	Only what was created during this Event's own occurrence is taken. A recurring Teams meeting
+	lists every occurrence's transcripts under the one meeting, and each occurrence's Event used
+	to receive all of them, labelled part 1, part 2 …
+
+	``scheduled`` is the catch-up job: it commits as it goes, so a worker killed mid-run keeps
+	the transcripts it already saved, and it does not download transcripts it already has.
+	``attempt`` is the number it already claimed for this visit; otherwise this is the next one.
 	"""
 	from frappe_microsoft365 import microsoft_transcripts as ms
 
-	attached, recordings, error = [], [], None
+	occurrence_start, occurrence_end = _occurrence(doc)
+	window = _occurrence_window(occurrence_start, occurrence_end)
+	attempts, has_transcript, _recordings = _counters(doc, occurrence_start)
+	new_occurrence = _is_new_occurrence(doc, occurrence_start)
+	attempt = attempt if attempt is not None else attempts + 1
+	attached, recordings, error, gone = [], [], None, False
 
 	try:
-		transcripts = ms.list_transcripts(calendar_name, meeting_id)
+		transcripts = [t for t in ms.list_transcripts(calendar_name, meeting_id) if _in_window(t, window)]
 	except MsGraphError as e:
 		transcripts, error = [], str(e)
+		# Graph no longer knows the meeting id at all; no later attempt will find it either.
+		gone = isinstance(e, graph.MsGraphNotFound)
 	else:
-		if transcripts:
+		if transcripts and not (scheduled and has_transcript and _already_attached(doc, window, transcripts)):
 			try:
-				attached = _attach_transcripts(doc, calendar_name, meeting_id, transcripts)
+				attached = _attach_transcripts(doc, calendar_name, meeting_id, transcripts, window)
 			except MsGraphError as e:
 				# Raised only when every part was refused; anything partial has already been
 				# saved. Routed through the same field as the others so one refusal is reported
 				# once, with its own hint, rather than escaping as a bare traceback.
 				error = str(e)
+			if attached and scheduled:
+				# The files are on disk the moment they are saved; their rows must not be the
+				# part a timeout rolls back.
+				frappe.db.set_value(
+					"Event", doc.name, "custom_microsoft_transcript_fetched_on", now_datetime(),
+					update_modified=False,
+				)
+				frappe.db.commit()  # nosemgrep: frappe-manual-commit -- per-event progress in a scheduled job
+				frappe.db.savepoint(EVENT_SAVEPOINT)
 
 	try:
-		recordings = ms.list_recordings(calendar_name, meeting_id)
+		recordings = [r for r in ms.list_recordings(calendar_name, meeting_id) if _in_window(r, window)]
 	except MsGraphError as e:
 		# Surfaced only if the transcript side did not already fail — one error is a diagnosis,
 		# two stacked together is noise.
@@ -449,9 +698,15 @@ def _fetch_into(doc, calendar_name, meeting_id):
 			error = str(e)
 
 	values = {
-		"custom_microsoft_artifacts_attempts": cint(doc.get("custom_microsoft_artifacts_attempts")) + 1,
+		# Spent in one go when the meeting is gone: asking a day long would be fourteen 404s.
+		"custom_microsoft_artifacts_attempts": len(RETRY_MINUTES) if gone else attempt,
 		"custom_microsoft_artifacts_checked_on": now_datetime(),
 	}
+	if new_occurrence and not recordings:
+		# Last week's recordings are not this week's: an empty answer for a new occurrence of a
+		# repeating Event must not leave them offered as though they were.
+		values["custom_microsoft_recordings"] = None
+		values["custom_microsoft_recordings_data"] = None
 	if attached:
 		values["custom_microsoft_transcript_fetched_on"] = now_datetime()
 	if recordings:
@@ -499,8 +754,8 @@ def _describe_recordings(recordings):
 	return "\n".join(lines)
 
 
-def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
-	"""Save every transcript as a File on the Event, replacing earlier copies of this meeting.
+def _attach_transcripts(doc, calendar_name, meeting_id, transcripts, window=(None, None)):
+	"""Save every transcript as a File on the Event, replacing earlier copies of this occurrence.
 
 	Every one, not only the latest: transcription can be stopped and restarted mid-meeting, and
 	keeping just the last part would quietly lose the first hour of a long meeting.
@@ -531,7 +786,7 @@ def _attach_transcripts(doc, calendar_name, meeting_id, transcripts):
 			raise refusal
 		return []
 
-	_delete_previous_transcripts(doc)
+	_delete_previous_transcripts(doc, window)
 
 	saved = []
 	total = len(contents)
@@ -581,22 +836,63 @@ def _save_transcript(filename, content, event_name):
 		)
 
 
-def _delete_previous_transcripts(doc):
-	# Matched by prefix, not by exact name: Frappe appends a content hash when a file of that
-	# name already exists, so re-fetching would otherwise pile up near-identical copies.
-	for existing in frappe.get_all(
+def _transcript_files(doc):
+	return frappe.get_all(
 		"File",
 		filters={
 			"attached_to_doctype": "Event",
 			"attached_to_name": doc.name,
 			"file_name": ["like", f"{TRANSCRIPT_PREFIX}%"],
 		},
-		pluck="name",
-	):
-		frappe.delete_doc("File", existing, force=True, ignore_permissions=True)
+		fields=["name", "file_name"],
+	)
+
+
+def _delete_previous_transcripts(doc, window=(None, None)):
+	"""Remove this occurrence's earlier copies before the new ones are saved.
+
+	Matched by prefix, not by exact name: Frappe appends a content hash when a file of that name
+	already exists, so re-fetching would otherwise pile up near-identical copies. And only the
+	files named for a date inside this occurrence: a repeating Event keeps every earlier week's
+	transcript, and files another occurrence's transcripts were wrongly attached under before
+	1.2.0 are for a person to remove (remove_misplaced_transcripts), never for a fetch.
+	"""
+	for existing in _transcript_files(doc):
+		day = _stamp_day(existing.file_name)
+		if day is None or _day_in_window(day, window):
+			frappe.delete_doc("File", existing.name, force=True, ignore_permissions=True)
+
+
+def _already_attached(doc, window, transcripts):
+	"""Does the Event already hold one file per transcript Microsoft lists for this occurrence?
+
+	The catch-up job keeps asking until the schedule ends, for recording parts that come later;
+	downloading and rewriting the same transcripts on each of those visits would be fourteen
+	copies of the same work.
+	"""
+	held = 0
+	for existing in _transcript_files(doc):
+		day = _stamp_day(existing.file_name)
+		if day and _day_in_window(day, window):
+			held += 1
+	return held == len(transcripts)
 
 
 # --- the catch-up job ----------------------------------------------------------------
+
+
+#: Most Events one run of the catch-up job asks about. Runs are a quarter of an hour apart, and
+#: each Event is a handful of Graph calls, so this bounds a run well inside a worker's timeout.
+MAX_EVENTS_PER_RUN = 100
+
+#: Undone to on a failure, so only that Event's half-written changes go — never the claim
+#: already committed, nor anything a caller had open.
+EVENT_SAVEPOINT = "ms_meeting_artifacts_event"
+
+#: How far back an Event that was never checked at all is still picked up — one stopped by an
+#: earlier version and reopened on upgrade, or one on a calendar whose tickbox was turned on
+#: since. Comfortably inside Microsoft's 60-day expiry.
+CATCH_UP_DAYS = 7
 
 
 def fetch_pending():
@@ -604,6 +900,10 @@ def fetch_pending():
 
 	Opt-in per connection, because this writes files onto Events by itself. Only meetings on a
 	calendar with the tickbox on are ever asked about.
+
+	Each Event is committed on its own. A run that times out, or a worker that is killed, loses
+	at most the Event it was on — before, the whole run's attempt counters went with it and the
+	same meetings were asked about again and again while transcript files piled up on disk.
 	"""
 	try:
 		settings = frappe.get_cached_doc("Microsoft Settings")
@@ -622,57 +922,199 @@ def fetch_pending():
 
 	done = []
 	for name in _due_events(calendars):
+		frappe.db.savepoint(EVENT_SAVEPOINT)
 		try:
-			doc, calendar_name, meeting_id = _event_for_artifacts(name)
+			result = _check_one(name)
 		except Exception:
-			# An event that cannot even be addressed must not be retried every quarter of an
-			# hour for a day; spend its budget in one go.
-			frappe.db.set_value(
-				"Event",
-				name,
-				"custom_microsoft_artifacts_attempts",
-				len(RETRY_MINUTES),
-				update_modified=False,
-			)
-			continue
-
-		try:
-			done.append({name: _fetch_into(doc, calendar_name, meeting_id)})
-		except Exception:
+			# Nothing is allowed out of a scheduled job, and one Event must never stop the rest.
+			frappe.db.rollback(save_point=EVENT_SAVEPOINT)
 			frappe.log_error(title=f"MS meeting artifacts failed: {name}")
+			continue
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit -- per-event progress in a scheduled job
+		if result is not None:
+			done.append({name: result})
 	return done
 
 
-def _due_events(calendars):
-	"""Events whose next backoff step has come round. Cheap filter first, per-event maths after."""
-	now = now_datetime()
+def _check_one(name):
+	"""One Event's turn in the catch-up job. Every way it ends leaves a status saying why."""
+	try:
+		doc = frappe.get_doc("Event", name)
+	except frappe.DoesNotExistError:
+		return None
+
+	start, end = _occurrence(doc)
+	attempt = _counters(doc, start)[0] + 1
+	if _is_new_occurrence(doc, start):
+		# Cleared before the claim below makes this occurrence look already checked.
+		frappe.db.set_value(
+			"Event",
+			name,
+			{"custom_microsoft_recordings": None, "custom_microsoft_recordings_data": None},
+			update_modified=False,
+		)
+	# Claimed before Microsoft is asked, and committed: a worker killed halfway through still
+	# spends this attempt, so one meeting that kills workers is not retried every quarter of an
+	# hour for a day — and the status says what was going on when it stopped.
+	_record(
+		name,
+		attempt,
+		_(
+			"Checking with Microsoft (attempt {0} of {1}). If this stays here, that check was "
+			"interrupted."
+		).format(attempt, len(RETRY_MINUTES)),
+	)
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit -- see above
+	frappe.db.savepoint(EVENT_SAVEPOINT)
+
+	try:
+		doc, calendar_name, meeting_id = _event_for_artifacts(name)
+		return _fetch_into(doc, calendar_name, meeting_id, scheduled=True, attempt=attempt)
+	except MeetingUnavailable as e:
+		_stop(name, e, attempt, permanent=True)
+	except graph.MsGraphNotFound as e:
+		_stop(name, e, attempt, permanent=True)
+	except Exception as e:
+		# Everything else is temporary until proven otherwise: a 503 or a 429 while resolving the
+		# join link, a token refresh that failed for a moment, a file hook that was down. Each
+		# used to spend the whole day's budget at once, so one blip after a meeting meant its
+		# transcript was never fetched.
+		frappe.db.rollback(save_point=EVENT_SAVEPOINT)
+		if not isinstance(e, MsGraphError):
+			frappe.log_error(title=f"MS meeting artifacts failed: {name}")
+		_stop(name, e, attempt, permanent=False, end=end)
+	return None
+
+
+def _record(name, attempts, status):
+	frappe.db.set_value(
+		"Event",
+		name,
+		{
+			"custom_microsoft_artifacts_attempts": attempts,
+			"custom_microsoft_artifacts_checked_on": now_datetime(),
+			"custom_microsoft_artifacts_status": status,
+		},
+		update_modified=False,
+	)
+
+
+def _stop(name, error, attempt, permanent, end=None):
+	"""Record a failed attempt, and say in the status whether and when it will be tried again."""
+	reason = frappe.utils.strip_html(str(error)).strip() or type(error).__name__
+	if permanent:
+		_record(name, len(RETRY_MINUTES), _("Stopped checking: {0}").format(reason))
+		return
+	next_check = _next_check_at(end, attempt)
+	if next_check:
+		status = _("{0} Trying again around {1}.").format(reason, frappe.utils.format_datetime(next_check))
+	else:
+		status = _("Stopped checking after {0} attempts. The last one failed: {1}").format(
+			len(RETRY_MINUTES), reason
+		)
+	_record(name, attempt, status)
+
+
+def _due_events(calendars, now=None):
+	"""Events whose next backoff step has come round, the ones still missing something first.
+
+	The whole "is it due" question is asked in SQL. It used to fetch any 100 candidates and
+	then skip, in Python, the ones already complete or not yet due — so on a busy site the
+	100 could be all skips and a meeting that was due was never reached.
+
+	Events that already have a transcript and a recording are still asked about until their
+	schedule ends: a meeting past four hours comes back as several recordings, and the later
+	parts appear later. They sort last, behind every Event still waiting for its first file.
+	"""
+	from frappe.query_builder import Case, Criterion
+	from frappe.query_builder.functions import Coalesce
+
+	now = now or now_datetime()
+	event = frappe.qb.DocType("Event")
+	attempts = Coalesce(event.custom_microsoft_artifacts_attempts, 0)
+	complete = (
+		Case()
+		.when(
+			event.custom_microsoft_transcript_fetched_on.isnotnull()
+			& (Coalesce(event.custom_microsoft_recordings_data, "") != ""),
+			1,
+		)
+		.else_(0)
+	)
+	# ends_on + RETRY_MINUTES[attempts] <= now, as one comparison per step so it is plain SQL on
+	# every database Frappe runs on.
+	due = Criterion.any(
+		[
+			(attempts == step) & (event.ends_on <= add_to_date(now, minutes=-minutes))
+			for step, minutes in enumerate(RETRY_MINUTES)
+		]
+	)
+	recent = event.ends_on >= add_to_date(now, minutes=-RETRY_MINUTES[-1] - 60)
+	never_checked = event.custom_microsoft_artifacts_checked_on.isnull() & (
+		event.ends_on >= add_to_date(now, days=-CATCH_UP_DAYS)
+	)
+	rows = (
+		frappe.qb.from_(event)
+		.select(event.name, event.ends_on, complete.as_("complete"))
+		.where(event.custom_microsoft_calendar.isin(calendars))
+		.where(Coalesce(event.custom_teams_join_url, "") != "")
+		.where(Coalesce(event.repeat_this_event, 0) == 0)
+		.where(attempts < len(RETRY_MINUTES))
+		.where(recent | never_checked)
+		.where(due)
+		.orderby(complete)
+		.orderby(event.ends_on)
+		.limit(MAX_EVENTS_PER_RUN)
+		.run(as_dict=True)
+	)
+	rows = [(cint(r.complete), get_datetime(r.ends_on), r.name) for r in rows]
+	rows += _due_repeating_events(calendars, now)
+	rows.sort()
+	return [name for _complete, _ends, name in rows[:MAX_EVENTS_PER_RUN]]
+
+
+def _due_repeating_events(calendars, now):
+	"""Repeating Events whose current occurrence is due, as (complete, ends, name) rows.
+
+	Worked out in Python, because the occurrence is: the Event's own starts_on/ends_on are the
+	first occurrence's, and the SQL above would never see a repeating Event again after it.
+	There are few of these, and each is one cheap calculation.
+	"""
 	candidates = frappe.get_all(
 		"Event",
 		filters={
 			"custom_microsoft_calendar": ["in", calendars],
 			"custom_teams_join_url": ["is", "set"],
-			"ends_on": ["between", [add_to_date(now, minutes=-RETRY_MINUTES[-1] - 60), now]],
-			"custom_microsoft_artifacts_attempts": ["<", len(RETRY_MINUTES)],
+			"repeat_this_event": 1,
+			"starts_on": ["<=", now],
 		},
+		or_filters=[
+			["repeat_till", "is", "not set"],
+			["repeat_till", ">=", add_to_date(now, days=-2).date()],
+		],
 		fields=[
 			"name",
+			"starts_on",
 			"ends_on",
+			"repeat_this_event",
+			"repeat_on",
+			"repeat_till",
+			*_WEEKDAYS,
 			"custom_microsoft_artifacts_attempts",
+			"custom_microsoft_artifacts_checked_on",
 			"custom_microsoft_transcript_fetched_on",
 			"custom_microsoft_recordings_data",
 		],
-		limit=100,
 	)
-
 	due = []
 	for row in candidates:
-		if row.custom_microsoft_transcript_fetched_on and row.custom_microsoft_recordings_data:
-			continue  # both sides landed; nothing left to ask for
-		next_check = _next_check_at(
-			get_datetime(row.ends_on), cint(row.custom_microsoft_artifacts_attempts)
-		)
+		start, end = _occurrence(row, now)
+		if not end or end > now or end < add_to_date(now, minutes=-RETRY_MINUTES[-1] - 60):
+			continue
+		attempts, has_transcript, recordings = _counters(row, start)
+		next_check = _next_check_at(end, attempts)
 		if next_check and next_check <= now:
-			due.append(row.name)
+			due.append((int(bool(has_transcript and recordings)), end, row.name))
 	return due
 
 

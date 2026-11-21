@@ -160,7 +160,15 @@ frappe_microsoft365.add_artifact_buttons = function (frm) {
 	const recordings = frappe_microsoft365.stored_recordings(frm);
 	const has_transcript = !!frm.doc.custom_microsoft_transcript_fetched_on;
 
-	if (!has_transcript || !recordings.length) {
+	// A repeating Event is the whole series, and the fields above describe whichever occurrence
+	// was checked last — so this week's meeting is always worth asking about.
+	if (frm.doc.repeat_this_event) {
+		frm.add_custom_button(
+			__("Get Transcript & Recording"),
+			() => frappe_microsoft365.fetch_artifacts(frm),
+			group
+		);
+	} else if (!has_transcript || !recordings.length) {
 		// Named for what is still missing: "Get Transcript" on an event whose transcript is
 		// already attached reads like the first fetch failed.
 		const label = has_transcript
