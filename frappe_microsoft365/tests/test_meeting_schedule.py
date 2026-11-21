@@ -473,7 +473,14 @@ class TestTheJobDoesNotStarve(ScheduleTestCase):
 		def kill(*args):
 			raise Killed()
 
-		with fake_graph(kill), self.assertRaises(Killed):
+		# Only this test's calendar: a site upgraded from an earlier release has other calendars'
+		# meetings due as well, and the job may reach one of those first.
+		due = artifacts._due_events
+		with (
+			patch.object(artifacts, "_due_events", side_effect=lambda calendars: due([CALENDAR])),
+			fake_graph(kill),
+			self.assertRaises(Killed),
+		):
 			artifacts.fetch_pending()
 
 		state = self._fields(event)

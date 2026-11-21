@@ -159,10 +159,13 @@ class TestSecretDrift(BaseTestCase):
 				{"doctype": "User", "email": user, "first_name": "Drift", "send_welcome_email": 0}
 			).insert(ignore_permissions=True)
 		frappe.set_user(user)
+		# Frappe 15's only_for lets everyone through while tests run; real requests are checked.
+		in_test, frappe.flags.in_test = frappe.flags.in_test, False
 		try:
 			with self.assertRaises(frappe.PermissionError):
 				provisioning.sync_client_secret()
 		finally:
+			frappe.flags.in_test = in_test
 			frappe.set_user("Administrator")
 		self.assertEqual(get_decrypted_password("Connected App", self.app, "client_secret"), OLD)
 

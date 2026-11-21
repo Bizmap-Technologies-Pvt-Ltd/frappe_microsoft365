@@ -240,7 +240,8 @@ def remember_login_state(context):
 		state = (parse_qs(urlsplit(login.get("auth_url") or "").query).get("state") or [None])[0]
 		token = _state_token(state)
 		if token:
-			frappe.cache.set(_state_key(token), "1", ex=STATE_TTL)
+			# _state_key is site-scoped (make_key); raw set and delete give the atomic consume below.
+			frappe.cache.set(_state_key(token), "1", ex=STATE_TTL)  # nosemgrep
 
 
 def consume_login_state(state):
@@ -252,10 +253,13 @@ def consume_login_state(state):
 	token = _state_token(state)
 	if not token:
 		return False
-	return bool(frappe.cache.delete(_state_key(token)))
+	# Site-scoped key (see _state_key).
+	return bool(frappe.cache.delete(_state_key(token)))  # nosemgrep
 
 
-@frappe.whitelist(allow_guest=True)
+# Guest by necessity: it is the sign-in callback, called before anyone is signed in, exactly like
+# the Frappe method it overrides.
+@frappe.whitelist(allow_guest=True)  # nosemgrep
 def login_via_office365(code: str, state: str):
 	"""Frappe's Microsoft sign-in callback, with this app's checks in front of Frappe's login.
 

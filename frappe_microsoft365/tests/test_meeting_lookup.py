@@ -143,9 +143,11 @@ class TestTheLookupPermission(ArtifactsTestCase):
 	"""Transcripts ask for OnlineMeetings.Read, except where ReadWrite was already granted."""
 
 	def _granted(self, value):
-		previous = frappe.db.get_single_value("Microsoft Settings", "authorized_scopes")
-		frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", value)
-		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "authorized_scopes", previous)
+		# What this site's connections hold, as the test says, whatever else the site has: on a
+		# site upgraded from 1.1.x every connection already holds OnlineMeetings.ReadWrite.
+		patcher = patch.object(graph, "granted_scopes", return_value=graph.parse_scopes(value))
+		patcher.start()
+		self.addCleanup(patcher.stop)
 
 	def test_a_new_setup_with_transcripts_alone_asks_for_read(self):
 		self.assertEqual(
@@ -203,7 +205,10 @@ class TestTheLookupPermission(ArtifactsTestCase):
 
 	def test_granted_scopes_also_reads_per_connection_storage(self):
 		"""Whichever of the two places holds them, the answer is the same."""
-		self._granted("")
+		# The real helper, so the site-wide value is set here rather than faked by _granted.
+		previous = frappe.db.get_single_value("Microsoft Settings", "authorized_scopes")
+		frappe.db.set_single_value("Microsoft Settings", "authorized_scopes", "")
+		self.addCleanup(frappe.db.set_single_value, "Microsoft Settings", "authorized_scopes", previous)
 		with (
 			patch.object(frappe.db, "has_column", return_value=True),
 			patch.object(frappe, "get_all", return_value=["User.Read OnlineMeetings.ReadWrite", None]),

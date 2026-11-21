@@ -1738,7 +1738,10 @@ def _pinned_get(url, timeout=60):
 			preload_content=False,
 		)
 	except urllib3.exceptions.HTTPError as e:
-		frappe.throw(_("Could not download {0}: {1}").format(url, e), MsGraphError)
+		frappe.throw(
+			_("Could not download {0}: {1}").format(frappe.utils.escape_html(url), frappe.utils.escape_html(str(e))),
+			MsGraphError,
+		)
 
 
 def assert_public_url(url):
@@ -2474,7 +2477,9 @@ def own_local_copy(file_doc, url):
 	return not frappe.db.exists("File", {**others, "custom_microsoft_local_url": url})
 
 
-@frappe.whitelist(methods=["GET"], allow_guest=True)
+# Guest for public Files only (is_private=0), which were readable by anyone at /files before
+# they moved; a private one still needs a signed-in user who may read it (see below).
+@frappe.whitelist(methods=["GET"], allow_guest=True)  # nosemgrep
 def open_file(file: str, download: int = 0):
 	"""Open a File that was moved to SharePoint. The file_url of every moved File points here.
 

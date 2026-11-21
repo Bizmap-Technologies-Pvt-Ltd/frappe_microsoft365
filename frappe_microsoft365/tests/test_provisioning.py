@@ -7,6 +7,7 @@ for) and it is never destructive (an existing record is reported, never rewritte
 """
 
 import json
+from unittest.mock import patch
 
 import frappe
 
@@ -255,6 +256,13 @@ class TestScopeOverride(BaseTestCase):
 
 class TestCapabilityAzurePermissions(BaseTestCase):
 	"""The Set Up dialog renders capability["azure"], so it has to be what is really requested."""
+
+	def setUp(self):
+		super().setUp()
+		# A new setup: nothing granted yet, whatever this site's own connections hold.
+		patcher = patch.object(graph, "granted_scopes", return_value=[])
+		patcher.start()
+		self.addCleanup(patcher.stop)
 
 	def _capability(self, capability_id):
 		return next(c for c in provisioning.capabilities() if c["id"] == capability_id)
