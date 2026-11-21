@@ -1243,7 +1243,10 @@ def _uploaded_by_this_app(item):
 	app_id = (created.get("application") or {}).get("id")
 	if app_id:
 		settings = graph.get_settings()
-		return app_id in {(settings.get("app_client_id") or "").strip(), (settings.get("client_id") or "").strip()} - {""}
+		return app_id in {
+			(settings.get("app_client_id") or "").strip(),
+			(settings.get("client_id") or "").strip(),
+		} - {""}
 	return not (created.get("user") or {}).get("id")
 
 
@@ -1475,7 +1478,10 @@ def chunk_ranges(size, chunk=UPLOAD_CHUNK_BYTES):
 def _session_key(drive_id, parent_id, name, size):
 	import hashlib
 
-	return UPLOAD_SESSION_CACHE_PREFIX + hashlib.sha256(f"{drive_id}\0{parent_id}\0{name}\0{size}".encode()).hexdigest()
+	return (
+		UPLOAD_SESSION_CACHE_PREFIX
+		+ hashlib.sha256(f"{drive_id}\0{parent_id}\0{name}\0{size}".encode()).hexdigest()
+	)
 
 
 def _remember_session(key, upload_url, expires=None):
@@ -1594,9 +1600,9 @@ def _send_ranges(upload_url, fh, size, start=0):
 			graph._release(resp)
 		if wait is None or tries > UPLOAD_RETRIES_PER_RANGE:
 			raise UploadInterrupted(
-				_("The upload to SharePoint stopped at byte {0} of {1} ({2}); the next attempt carries on from there.").format(
-					offset, size, reason
-				)
+				_(
+					"The upload to SharePoint stopped at byte {0} of {1} ({2}); the next attempt carries on from there."
+				).format(offset, size, reason)
 			)
 		if status in RETRYABLE_UPLOAD_STATUSES:
 			# Refused outright: the same range goes again, once SharePoint is ready for it.
@@ -1608,9 +1614,9 @@ def _send_ranges(upload_url, fh, size, start=0):
 		resumed = _next_expected(upload_url)
 		if resumed is None or resumed >= size:
 			raise UploadInterrupted(
-				_("SharePoint lost track of the upload at byte {0} of {1}; the next attempt starts again.").format(
-					offset, size
-				)
+				_(
+					"SharePoint lost track of the upload at byte {0} of {1}; the next attempt starts again."
+				).format(offset, size)
 			)
 		if resumed != offset:
 			fh.seek(resumed)
@@ -1946,9 +1952,9 @@ def follow_attachment(file_name, old_doctype, old_name, in_job=False):
 	if (holder.reference_doctype, holder.reference_name) != (old_doctype, old_name):
 		frappe.log_error(
 			title=_("Microsoft 365: re-attached file not moved"),
-			message=_("File {0} names an item in the folder of {1} {2}, not of the record it was attached to.").format(
-				file_name, holder.reference_doctype, holder.reference_name
-			),
+			message=_(
+				"File {0} names an item in the folder of {1} {2}, not of the record it was attached to."
+			).format(file_name, holder.reference_doctype, holder.reference_name),
 		)
 		return
 
@@ -1976,7 +1982,10 @@ def follow_attachment(file_name, old_doctype, old_name, in_job=False):
 	else:
 		# An archived link: the link itself never moved, so only the copy has to leave.
 		frappe.db.set_value(
-			"File", file_name, {"custom_microsoft_status": None, "custom_microsoft_item_id": None}, update_modified=False
+			"File",
+			file_name,
+			{"custom_microsoft_status": None, "custom_microsoft_item_id": None},
+			update_modified=False,
 		)
 	if not shared:
 		try:
@@ -2058,7 +2067,12 @@ def _copy_into(file_doc, folder):
 		fh.seek(0)
 		name = upload_name(file_doc, folder)
 		item = upload_stream(
-			folder.drive_id, folder.item_id, name, fh, size, mimetypes.guess_type(name)[0] or "application/octet-stream"
+			folder.drive_id,
+			folder.item_id,
+			name,
+			fh,
+			size,
+			mimetypes.guess_type(name)[0] or "application/octet-stream",
 		)
 	_record_location(file_doc.name, item, folder)
 

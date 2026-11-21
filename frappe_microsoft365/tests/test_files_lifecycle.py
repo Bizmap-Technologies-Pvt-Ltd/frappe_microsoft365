@@ -95,6 +95,12 @@ def network(test, answer):
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 
+def remove(path):
+	"""Delete a file a test left on disk; rolling the database back does not."""
+	if os.path.exists(path):
+		os.remove(path)
+
+
 # --- S9: link archiving connects only to the address it checked ------------------------------
 
 
@@ -158,7 +164,13 @@ class TestLinkDownloadIsPinned(BaseTestCase):
 				socket,
 				"getaddrinfo",
 				side_effect=lambda host, port, *a, **k: [
-					(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host if host[0].isdigit() else self.PUBLIC, port))
+					(
+						socket.AF_INET,
+						socket.SOCK_STREAM,
+						6,
+						"",
+						(host if host[0].isdigit() else self.PUBLIC, port),
+					)
 				],
 			),
 			patch("urllib3.HTTPConnectionPool") as pool_class,
@@ -187,12 +199,14 @@ class KeptCopyTestCase(FilesTestCase):
 		local = f.file_url
 		self.assertTrue(local.startswith("/files/"))
 		if shared_with:
-			other = frappe.get_doc({"doctype": "File", "file_name": name, "content": content, "is_private": 0}).insert()
+			other = frappe.get_doc(
+				{"doctype": "File", "file_name": name, "content": content, "is_private": 0}
+			).insert()
 			self.assertEqual(other.file_url, local)
 		files.upload_file(f.name)
 		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.STORED)
 		for url in (local, "/private" + local):
-			self.addCleanup(lambda p=files.local_path(url): os.path.exists(p) and os.remove(p))
+			self.addCleanup(remove, files.local_path(url))
 		return f, local
 
 	def kept(self, f):
@@ -372,7 +386,7 @@ class TestOldLinks(FilesTestCase):
 		f = self.attach()
 		old = f.file_url
 		files.upload_file(f.name)
-		self.addCleanup(lambda p=files.local_path(old): os.path.exists(p) and os.remove(p))
+		self.addCleanup(remove, files.local_path(old))
 		self.assertTrue(os.path.exists(files.local_path(old)))  # the kept copy
 		self.assertEqual(self.follow(old), f.name)
 
@@ -483,7 +497,8 @@ class TestRecreatedLibrary(FilesTestCase):
 		)
 		self.assertEqual(fake.calls[-1][2]["json"]["@microsoft.graph.conflictBehavior"], "rename")
 		self.assertEqual(
-			frappe.db.get_value("SharePoint Mapping", MAPPED, ["site_id", "drive_id"]), ("NEW-SITE", "NEW-DRIVE")
+			frappe.db.get_value("SharePoint Mapping", MAPPED, ["site_id", "drive_id"]),
+			("NEW-SITE", "NEW-DRIVE"),
 		)
 
 	def test_a_404_inside_a_library_that_still_exists_is_not_retried(self):
@@ -548,14 +563,20 @@ class TestPathLimits(FilesTestCase):
 		self.assertEqual(used, files.MAX_PATH_LENGTH - files.MIN_ROOM_FOR_FILE_NAME)
 
 	def test_a_file_name_is_shortened_to_fit_keeping_its_extension(self):
-		folder = frappe._dict(web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 300)
+		folder = frappe._dict(
+			web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 300
+		)
 		f = frappe._dict(file_name="quotation " * 20 + ".pdf", file_url="/private/files/q.pdf")
 		name = files.upload_name(f, folder)
 		self.assertTrue(name.endswith(".pdf"))
-		self.assertEqual(len("sites/Sales/Shared Documents/" + "F" * 300) + 1 + len(name), files.MAX_PATH_LENGTH)
+		self.assertEqual(
+			len("sites/Sales/Shared Documents/" + "F" * 300) + 1 + len(name), files.MAX_PATH_LENGTH
+		)
 
 	def test_a_folder_with_no_room_left_gives_a_clear_error(self):
-		folder = frappe._dict(web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 395)
+		folder = frappe._dict(
+			web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 395
+		)
 		with self.assertRaises(MsGraphError) as caught:
 			files.upload_name(frappe._dict(file_name="spec.pdf"), folder)
 		self.assertIn("SharePoint allows 400", str(caught.exception))
@@ -590,7 +611,13 @@ class TestRetryAfterALostCommit(FilesTestCase):
 		files.add_folder_row(
 			MAPPED,
 			self.todo.name,
-			{"drive_id": "DRIVE", "item_id": "FOLDER", "folder_name": "F", "folder_path": "Projects/F", "web_url": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/Projects/F"},
+			{
+				"drive_id": "DRIVE",
+				"item_id": "FOLDER",
+				"folder_name": "F",
+				"folder_path": "Projects/F",
+				"web_url": "https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/Projects/F",
+			},
 		)
 		self.file = self.attach(name="report.csv")
 		self.size = os.path.getsize(self.file.get_full_path())
@@ -615,7 +642,12 @@ class TestRetryAfterALostCommit(FilesTestCase):
 				)
 			if method == "PUT" and url == f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:/content":
 				return HttpResponse(
-					201, {"id": "NEW", "name": "report (1).csv", "parentReference": {"driveId": "DRIVE", "id": "FOLDER"}}
+					201,
+					{
+						"id": "NEW",
+						"name": "report (1).csv",
+						"parentReference": {"driveId": "DRIVE", "id": "FOLDER"},
+					},
 				)
 			raise AssertionError(f"unexpected {method} {url}")
 
@@ -625,9 +657,13 @@ class TestRetryAfterALostCommit(FilesTestCase):
 		client_id = frappe.get_single("Microsoft Settings").client_id
 		fake = self.left_behind({"application": {"id": client_id, "displayName": "ERP"}})
 		files.upload_file(self.file.name)
-		self.assertEqual([(m, u) for m, u, _k in fake.calls], [("GET", f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:")])
+		self.assertEqual(
+			[(m, u) for m, u, _k in fake.calls], [("GET", f"{GRAPH}/drives/DRIVE/items/FOLDER:/report.csv:")]
+		)
 		self.assertIn("size", fake.calls[0][2]["params"]["$select"])
-		row = frappe.db.get_value("File", self.file.name, ["custom_microsoft_status", "custom_microsoft_item_id"], as_dict=True)
+		row = frappe.db.get_value(
+			"File", self.file.name, ["custom_microsoft_status", "custom_microsoft_item_id"], as_dict=True
+		)
 		self.assertEqual((row.custom_microsoft_status, row.custom_microsoft_item_id), (files.STORED, "LEFT"))
 
 	def test_a_file_a_person_put_there_is_not_taken(self):
@@ -675,12 +711,18 @@ class TestReattachedFileMoves(FilesTestCase):
 		if (method, path) == ("PATCH", f"/drives/DRIVE/items/{self.item}"):
 			return HttpResponse(
 				200,
-				{"id": self.item, "webUrl": "https://x/S/m.csv", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}},
+				{
+					"id": self.item,
+					"webUrl": "https://x/S/m.csv",
+					"parentReference": {"driveId": "DRIVE", "id": "FOLDER2"},
+				},
 			)
 		if (method, path) == ("GET", f"/drives/DRIVE/items/{self.item}/content"):
 			return HttpResponse(200, body=b"the bytes")
 		if (method, path) == ("PUT", f"/drives/DRIVE/items/FOLDER2:/{self.name}:/content"):
-			return HttpResponse(201, {"id": "OWN-COPY", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}})
+			return HttpResponse(
+				201, {"id": "OWN-COPY", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}}
+			)
 		if (method, path) == ("DELETE", f"/drives/DRIVE/items/{self.item}"):
 			return HttpResponse(204)
 		raise AssertionError(f"unexpected {method} {url}")
@@ -693,10 +735,14 @@ class TestReattachedFileMoves(FilesTestCase):
 	def test_re_attaching_moves_the_item_to_the_new_records_folder(self):
 		fake = network(self, self.answer)
 		self.reattach()
-		self.assertEqual([(m, u) for m, u, _k in fake.calls], [("PATCH", f"{GRAPH}/drives/DRIVE/items/{self.item}")])
+		self.assertEqual(
+			[(m, u) for m, u, _k in fake.calls], [("PATCH", f"{GRAPH}/drives/DRIVE/items/{self.item}")]
+		)
 		self.assertEqual(fake.calls[0][2]["json"], {"parentReference": {"id": "FOLDER2"}})
 		self.assertEqual(fake.calls[0][2]["params"], {"@microsoft.graph.conflictBehavior": "rename"})
-		self.assertEqual(self.location(), {"custom_microsoft_item_id": self.item, "custom_microsoft_folder_id": "FOLDER2"})
+		self.assertEqual(
+			self.location(), {"custom_microsoft_item_id": self.item, "custom_microsoft_folder_id": "FOLDER2"}
+		)
 		# Readers of the first record no longer find it through that record; readers of the second do.
 		files.assert_app_item(frappe.get_doc("File", self.file.name))
 
@@ -711,16 +757,20 @@ class TestReattachedFileMoves(FilesTestCase):
 		self.assertEqual(
 			[m for m, _u, _k in fake.calls], ["GET", "PUT"]
 		)  # its own copy; the original stays for the copies
-		self.assertEqual(self.location(), {"custom_microsoft_item_id": "OWN-COPY", "custom_microsoft_folder_id": "FOLDER2"})
+		self.assertEqual(
+			self.location(), {"custom_microsoft_item_id": "OWN-COPY", "custom_microsoft_folder_id": "FOLDER2"}
+		)
 
 	def test_re_attached_to_an_unmapped_record_it_comes_back_to_this_server(self):
 		fake = network(self, self.answer)
 		self.reattach("Note", "unmapped")
 		files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
-		row = frappe.db.get_value("File", self.file.name, ["file_url", "custom_microsoft_status"], as_dict=True)
+		row = frappe.db.get_value(
+			"File", self.file.name, ["file_url", "custom_microsoft_status"], as_dict=True
+		)
 		self.assertFalse(row.custom_microsoft_status)
 		self.assertTrue(row.file_url.startswith("/private/files/"))
-		self.addCleanup(lambda p=files.local_path(row.file_url): os.path.exists(p) and os.remove(p))
+		self.addCleanup(remove, files.local_path(row.file_url))
 		self.assertEqual([m for m, _u, _k in fake.calls], ["GET", "DELETE"])
 
 	def test_an_item_that_was_not_in_the_old_records_folder_is_not_moved(self):
@@ -794,7 +844,9 @@ class TestBigFilesAreNotReadWhole(FilesTestCase):
 
 	def test_streaming_callers_get_every_piece(self):
 		self.serve(b"y" * (files.DOWNLOAD_CHUNK_BYTES + 3))
-		self.assertEqual(sum(len(p) for p in files.iter_content("DRIVE", "ITEM-clip.txt")), files.DOWNLOAD_CHUNK_BYTES + 3)
+		self.assertEqual(
+			sum(len(p) for p in files.iter_content("DRIVE", "ITEM-clip.txt")), files.DOWNLOAD_CHUNK_BYTES + 3
+		)
 
 
 # --- F5: large uploads resume instead of restarting --------------------------------------------
@@ -821,7 +873,9 @@ class TestResumableUploads(BaseTestCase):
 	def answer(self, method, url, kwargs):
 		if method == "POST" and url == f"{GRAPH}/drives/DRIVE/items/FOLDER:/big.bin:/createUploadSession":
 			self.sessions += 1
-			return HttpResponse(200, {"uploadUrl": self.UPLOAD_URL, "expirationDateTime": "2099-01-01T00:00:00Z"})
+			return HttpResponse(
+				200, {"uploadUrl": self.UPLOAD_URL, "expirationDateTime": "2099-01-01T00:00:00Z"}
+			)
 		self.assertEqual(url, self.UPLOAD_URL)
 		self.assertNotIn("Authorization", kwargs.get("headers") or {})
 		if method == "GET":
@@ -851,7 +905,9 @@ class TestResumableUploads(BaseTestCase):
 
 	def test_a_throttled_range_waits_as_asked_and_is_sent_again(self):
 		fake = self.go()
-		self.script[(self.CHUNK, 1)] = HttpResponse(503, {"error": {"code": "serviceNotAvailable"}}, {"Retry-After": "5"})
+		self.script[(self.CHUNK, 1)] = HttpResponse(
+			503, {"error": {"code": "serviceNotAvailable"}}, {"Retry-After": "5"}
+		)
 		self.assertEqual(self.upload(), {"id": "BIG", "name": "big.bin"})
 		self.sleeps.assert_called_once_with(5)
 		self.assertEqual(self.sessions, 1)
@@ -870,7 +926,9 @@ class TestResumableUploads(BaseTestCase):
 
 	def test_a_long_wait_keeps_the_session_and_the_next_attempt_resumes_it(self):
 		fake = self.go()
-		self.script[(2 * self.CHUNK, 1)] = HttpResponse(429, {"error": {"code": "tooManyRequests"}}, {"Retry-After": "600"})
+		self.script[(2 * self.CHUNK, 1)] = HttpResponse(
+			429, {"error": {"code": "tooManyRequests"}}, {"Retry-After": "600"}
+		)
 		with self.assertRaises(files.UploadInterrupted):
 			self.upload()
 		self.sleeps.assert_not_called()
