@@ -12,6 +12,7 @@
   "column_break_1",
   "microsoft_user_email",
   "authorized",
+  "authorization_error",
   "auth_section",
   "oauth_state",
   "oauth_state_expiry",
@@ -76,6 +77,14 @@
    "label": "Authorized",
    "read_only": 1,
    "in_list_view": 1
+  },
+  {
+   "depends_on": "authorization_error",
+   "fieldname": "authorization_error",
+   "fieldtype": "Small Text",
+   "label": "Authorization Lost",
+   "read_only": 1,
+   "description": "Why Microsoft stopped accepting this connection's sign-in. Click Authorize to sign in again."
   },
   {
    "fieldname": "auth_section",
@@ -224,7 +233,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-21 00:00:00",
+ "modified": "2026-11-21 14:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Calendar",
  "naming_rule": "By fieldname",

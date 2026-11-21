@@ -12,7 +12,9 @@ import frappe
 from frappe.utils import add_to_date, now_datetime
 from frappe.utils.password import get_decrypted_password
 
+from frappe_microsoft365 import microsoft_calendar_sync as sync
 from frappe_microsoft365 import microsoft_graph as graph
+from frappe_microsoft365.microsoft_graph import MsGraphAuthorizationLost, MsGraphError
 from frappe_microsoft365.tests.base import BaseTestCase
 
 SETTINGS = frappe._dict(
@@ -200,3 +202,76 @@ class TestTokenStorage(ConnectionTestCase):
 			with graph._refresh_lock(cal):
 				ran.append(True)
 		self.assertEqual(ran, [True])
+
+
+# --- B7: a dead grant is detected once and not retried -----------------------------------
+
+
+DEAD_GRANT = {
+	"error": "invalid_grant",
+	"error_description": "AADSTS50173: The provided grant has expired due to it being revoked.",
+}
+
+
+class TestDeadGrant(ConnectionTestCase):
+	def test_invalid_grant_marks_the_connection_unauthorised_and_stops_further_attempts(self):
+		cal = self._calendar(expired=True)
+		with self._msal(refresh_result=DEAD_GRANT) as msal, patch.object(graph, "_http_request") as http:
+			with self.assertRaises(MsGraphAuthorizationLost):
+				graph.graph_request("GET", "/me/events", cal)
+			# Later calls in this run, and the next runs, never ask Microsoft again.
+			for _attempt in range(3):
+				with self.assertRaises(MsGraphError):
+					graph.graph_request("GET", "/me/events", cal)
+
+		self.assertEqual(msal.refresh_calls, 1)
+		http.assert_not_called()
+		row = frappe.db.get_value(
+			"Microsoft Calendar", cal, ["authorized", "authorization_error"], as_dict=True
+		)
+		self.assertEqual(row.authorized, 0)
+		self.assertIn("AADSTS50173", row.authorization_error)
+		self.assertEqual(len(self._notifications(cal)), 1)
+
+	def test_the_scheduler_and_the_sync_leave_a_dead_connection_alone(self):
+		cal = self._calendar(expired=True)
+		with (
+			self._msal(refresh_result=DEAD_GRANT) as msal,
+			patch.object(graph, "_http_request") as http,
+			patch.object(frappe, "log_error"),
+		):
+			first = sync.sync_calendar(cal)
+			second = sync.sync_calendar(cal)
+			queued = sync.sync_all()
+
+		self.assertEqual(msal.refresh_calls, 1)
+		http.assert_not_called()
+		self.assertFalse(first["ok"])
+		self.assertIn("not authorized", second["message"])
+		self.assertNotIn(cal, (queued or {}).get("queued", []))
+		self.assertEqual(len(self._notifications(cal)), 1)
+
+	def test_interaction_required_is_a_dead_grant_too(self):
+		cal = self._calendar(expired=True)
+		result = {"error": "interaction_required", "error_description": "AADSTS50076: MFA is required."}
+		with self._msal(refresh_result=result), patch.object(graph, "_http_request"):
+			with self.assertRaises(MsGraphAuthorizationLost):
+				graph.get_valid_access_token(cal)
+
+		self.assertEqual(frappe.db.get_value("Microsoft Calendar", cal, "authorized"), 0)
+
+	def test_a_transient_failure_never_marks_a_live_connection_dead(self):
+		cal = self._calendar(expired=True)
+		transient = [
+			{"error": "temporarily_unavailable", "error_description": "AADSTS90033: try later"},
+			{"error": "server_error"},
+			ConnectionError("login.microsoftonline.com timed out"),
+		]
+		for failure in transient:
+			with self._msal(refresh_result=failure), patch.object(graph, "_http_request"):
+				with self.assertRaises(Exception) as ctx:
+					graph.get_valid_access_token(cal)
+			self.assertNotIsInstance(ctx.exception, MsGraphAuthorizationLost)
+
+		self.assertEqual(frappe.db.get_value("Microsoft Calendar", cal, "authorized"), 1)
+		self.assertEqual(self._notifications(cal), [])

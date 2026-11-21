@@ -67,6 +67,12 @@ CALLBACK_METHOD = (
 MAX_RETRY_AFTER_SECONDS = 10
 DEFAULT_RETRY_AFTER_SECONDS = 2
 
+#: OAuth errors on a refresh that mean the grant itself is gone (password reset, account
+#: disabled, consent revoked, a sign-in policy that now needs the person present). Retrying can
+#: never succeed; only signing in again can. Nothing else marks a connection dead: a timeout or a
+#: 5xx from the login service says nothing about the grant.
+DEAD_GRANT_ERRORS = ("invalid_grant", "interaction_required")
+
 #: How long a worker waits for another worker's refresh of the same connection to finish.
 TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS = 30
 
@@ -100,6 +106,18 @@ class MsGraphNotFound(MsGraphError):
 
 class MsGraphConflict(MsGraphError):
 	"""Graph answered 409 — typically "an item with that name already exists"."""
+
+
+class MsGraphAuthorizationLost(MsGraphError):
+	"""The refresh token is no longer accepted (invalid_grant / interaction_required).
+
+	The connection has been marked as not authorised and its user told; only signing in again
+	brings it back.
+	"""
+
+	def __init__(self, message=None, reason=None):
+		super().__init__(message)
+		self.reason = reason or message
 
 
 class _App:
@@ -311,7 +329,10 @@ def _raise_on_token_error(result):
 	if not result or "access_token" not in result:
 		err = (result or {}).get("error_description") or (result or {}).get("error") or "unknown error"
 		# never include tokens; error_description from MS is safe (no secrets)
-		frappe.throw(f"Microsoft sign-in failed: {err}", MsGraphError)
+		message = f"Microsoft sign-in failed: {err}"
+		if (result or {}).get("error") in DEAD_GRANT_ERRORS:
+			frappe.throw(message, MsGraphAuthorizationLost)
+		frappe.throw(message, MsGraphError)
 
 
 # --- per-calendar token management ---------------------------------------------------
@@ -393,12 +414,31 @@ def _store_tokens(calendar_name, result, commit=True):
 
 def _stored_token(name):
 	"""``(access_token, expiry, row)`` as stored now. Raises when the connection cannot be used."""
-	row = frappe.db.get_value("Microsoft Calendar", name, ["authorized", "token_expiry"], as_dict=True)
+	row = frappe.db.get_value(
+		"Microsoft Calendar", name, ["authorized", "token_expiry", *_optional_fields("authorization_error")],
+		as_dict=True,
+	)
 	if not row:
 		frappe.throw(_("Microsoft Calendar {0} does not exist.").format(name), MsGraphError)
+	if not row.authorized:
+		# A connection that is not authorised is never called, whatever is left in storage: that
+		# is what stops a dead grant being retried every fifteen minutes, and what makes
+		# Disconnect final.
+		if row.get("authorization_error"):
+			frappe.throw(
+				_("Microsoft Calendar '{0}' must be authorised again: {1}").format(name, row.authorization_error),
+				MsGraphError,
+			)
+		frappe.throw(_("Microsoft Calendar '{0}' is not authorized. Click Authorize.").format(name), MsGraphError)
 	token = get_decrypted_password("Microsoft Calendar", name, "access_token", raise_exception=False)
 	expiry = get_datetime(row.token_expiry) if row.token_expiry else None
 	return token, expiry, row
+
+
+def _optional_fields(*fieldnames):
+	"""The fields that exist on this site: the code can run before the migration adds them."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	return [f for f in fieldnames if meta.has_field(f)]
 
 
 def get_valid_access_token(calendar):
@@ -446,7 +486,11 @@ def _refresh_access_token(name):
 		refresh = get_decrypted_password("Microsoft Calendar", name, "refresh_token", raise_exception=False)
 		if not refresh:
 			frappe.throw(_("Microsoft Calendar '{0}' is not authorized. Click Authorize.").format(name), MsGraphError)
-		result = refresh_tokens(refresh)
+		try:
+			result = refresh_tokens(refresh)
+		except MsGraphAuthorizationLost as e:
+			mark_authorization_lost(name, str(e))
+			raise
 		_store_tokens(name, result)
 		return result.get("access_token")
 
@@ -481,6 +525,56 @@ def _refresh_lock(name):
 			except Exception:
 				# Expired under us (a refresh slower than the lock timeout); nothing to release.
 				pass
+
+
+def mark_authorization_lost(calendar_name, reason):
+	"""Mark a connection whose grant Microsoft no longer accepts, keep why, and tell its user.
+
+	Only reached on invalid_grant / interaction_required (DEAD_GRANT_ERRORS) — never on a
+	timeout or a server error, so a live connection is not switched off by a bad minute at
+	Microsoft. Once ``authorized`` is 0 the scheduler stops queueing the calendar, Event saves
+	stop pushing to it and no further refresh is attempted, so the person is told once.
+
+	The tokens are left where they are: nothing will use them, and the next sign-in replaces
+	them.
+	"""
+	reason = (reason or "").strip() or _("Microsoft no longer accepts this connection's sign-in.")
+	updates = {"authorized": 0}
+	if _optional_fields("authorization_error"):
+		updates["authorization_error"] = reason[:1000]
+	frappe.db.set_value("Microsoft Calendar", calendar_name, updates, update_modified=False)
+	frappe.clear_document_cache("Microsoft Calendar", calendar_name)
+	clear_token_cache(calendar_name)
+	_notify_authorization_lost(calendar_name, reason)
+	# Committed on its own: whatever called Graph is about to fail, and a rollback of its work
+	# must not take the mark (and the notification) with it, or the next run finds the connection
+	# still "authorised", refreshes again and notifies again.
+	frappe.db.commit()  # nosemgrep
+
+
+def _notify_authorization_lost(calendar_name, reason):
+	"""One Notification Log to the connection's user. Best effort: the mark matters more."""
+	user = frappe.db.get_value("Microsoft Calendar", calendar_name, "user")
+	if not user or not frappe.db.get_value("User", user, "enabled"):
+		return
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "Notification Log",
+				"for_user": user,
+				"type": "Alert",
+				"document_type": "Microsoft Calendar",
+				"document_name": calendar_name,
+				"subject": _("Your Microsoft 365 connection {0} needs you to sign in again").format(calendar_name),
+				"email_content": _(
+					"Microsoft no longer accepts this connection's sign-in, so calendar sync, Teams "
+					"meetings and transcripts have stopped for it. Microsoft said: {0}. Open the "
+					"connection and click Authorize Microsoft Access to sign in again."
+				).format(frappe.utils.escape_html(reason)),
+			}
+		).insert(ignore_permissions=True)
+	except Exception:
+		frappe.log_error(title=f"MS Calendar re-authorisation notice failed: {calendar_name}")
 
 
 # --- application (client credentials) tokens -------------------------------------------

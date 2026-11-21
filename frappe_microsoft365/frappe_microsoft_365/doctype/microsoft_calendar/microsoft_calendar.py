@@ -23,6 +23,8 @@ SERVER_MANAGED_FIELDS = (
 	"delta_window_end",
 	"delta_next_link",
 	"delta_next_window_end",
+	# Written when Microsoft stops accepting the connection's sign-in, cleared by the next one.
+	"authorization_error",
 )
 
 
@@ -124,7 +126,11 @@ def callback(
 		result = graph.exchange_code(code)
 		graph._store_tokens(name, result)  # stores access/refresh/expiry + email from claims
 		frappe.db.set_value(
-			"Microsoft Calendar", name, {"authorized": 1, "oauth_state": "", "oauth_state_expiry": None}
+			"Microsoft Calendar",
+			name,
+			_only_existing(
+				{"authorized": 1, "oauth_state": "", "oauth_state_expiry": None, "authorization_error": ""}
+			),
 		)
 		# OAuth callback is a GET; without this the tokens we just stored would be discarded.
 		frappe.db.commit()  # nosemgrep
@@ -179,6 +185,17 @@ def _render_auth_failure(calendar_name, exception):
 	)
 
 
+def _existing_fields(*fieldnames):
+	"""The given fields that this site's Microsoft Calendar has (code can run before migrate)."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	return [f for f in fieldnames if meta.has_field(f)]
+
+
+def _only_existing(values):
+	existing = set(_existing_fields(*values))
+	return {k: v for k, v in values.items() if k in existing}
+
+
 def _fill_account_details(calendar_name):
 	me = graph.whoami(calendar_name)
 	updates = {}
@@ -218,6 +235,7 @@ def disconnect(calendar_name: str):
 		"oauth_state": "", "oauth_state_expiry": None,
 		"delta_link": "", "delta_window_end": None, "last_error": "",
 		**_resume_point_cleared(),
+		**_only_existing({"authorization_error": ""}),
 	})
 	# Tokens are also held in a request-local cache to keep a paging run from re-reading and
 	# re-decrypting them on every call. Wiping the row without wiping that cache would leave a
