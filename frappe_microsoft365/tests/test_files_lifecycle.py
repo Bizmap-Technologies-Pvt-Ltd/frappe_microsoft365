@@ -795,3 +795,126 @@ class TestBigFilesAreNotReadWhole(FilesTestCase):
 	def test_streaming_callers_get_every_piece(self):
 		self.serve(b"y" * (files.DOWNLOAD_CHUNK_BYTES + 3))
 		self.assertEqual(sum(len(p) for p in files.iter_content("DRIVE", "ITEM-clip.txt")), files.DOWNLOAD_CHUNK_BYTES + 3)
+
+
+# --- F5: large uploads resume instead of restarting --------------------------------------------
+
+
+class TestResumableUploads(BaseTestCase):
+	"""Network-level: graph_request creates the session for real; only the transport is faked."""
+
+	UPLOAD_URL = "https://contoso.sharepoint.com/_api/v2.0/drives/DRIVE/items/upload?tempauth=SECRET"
+	CHUNK = files.UPLOAD_CHUNK_BYTES
+	SIZE = 3 * files.UPLOAD_CHUNK_BYTES + 5  # four ranges
+
+	def setUp(self):
+		super().setUp()
+		self.key = files._session_key("DRIVE", "FOLDER", "big.bin", self.SIZE)
+		files._forget_session(self.key)
+		self.addCleanup(files._forget_session, self.key)
+		self.sleeps = patch.object(files.time, "sleep").start()
+		self.addCleanup(patch.stopall)
+		self.sessions = 0
+		self.received = 0  # what SharePoint has, for the status query
+		self.script = {}  # (start of range, how many times seen) -> response to give
+
+	def answer(self, method, url, kwargs):
+		if method == "POST" and url == f"{GRAPH}/drives/DRIVE/items/FOLDER:/big.bin:/createUploadSession":
+			self.sessions += 1
+			return HttpResponse(200, {"uploadUrl": self.UPLOAD_URL, "expirationDateTime": "2099-01-01T00:00:00Z"})
+		self.assertEqual(url, self.UPLOAD_URL)
+		self.assertNotIn("Authorization", kwargs.get("headers") or {})
+		if method == "GET":
+			return HttpResponse(200, {"nextExpectedRanges": [f"{self.received}-"]})
+		if method == "DELETE":
+			return HttpResponse(204)
+		start, end = map(int, kwargs["headers"]["Content-Range"].split(" ", 1)[1].split("/")[0].split("-"))
+		seen = self.seen.get(start, 0) + 1
+		self.seen[start] = seen
+		scripted = self.script.get((start, seen))
+		if scripted:
+			return scripted() if callable(scripted) else scripted
+		self.received = end + 1
+		if end == self.SIZE - 1:
+			return HttpResponse(201, {"id": "BIG", "name": "big.bin"})
+		return HttpResponse(202, {"nextExpectedRanges": [f"{end + 1}-"]})
+
+	def upload(self):
+		return files.upload_stream("DRIVE", "FOLDER", "big.bin", io.BytesIO(bytes(self.SIZE)), self.SIZE)
+
+	def ranges(self, fake):
+		return [(m, (k.get("headers") or {}).get("Content-Range")) for m, _u, k in fake.calls[1:]]
+
+	def go(self):
+		self.seen = {}
+		return network(self, self.answer)
+
+	def test_a_throttled_range_waits_as_asked_and_is_sent_again(self):
+		fake = self.go()
+		self.script[(self.CHUNK, 1)] = HttpResponse(503, {"error": {"code": "serviceNotAvailable"}}, {"Retry-After": "5"})
+		self.assertEqual(self.upload(), {"id": "BIG", "name": "big.bin"})
+		self.sleeps.assert_called_once_with(5)
+		self.assertEqual(self.sessions, 1)
+		self.assertEqual(
+			[r for _m, r in self.ranges(fake)],
+			[
+				f"bytes 0-{self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {self.CHUNK}-{2 * self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {self.CHUNK}-{2 * self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {2 * self.CHUNK}-{3 * self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {3 * self.CHUNK}-{self.SIZE - 1}/{self.SIZE}",
+			],
+		)
+		self.assertNotIn("DELETE", [m for m, _r in self.ranges(fake)])
+		self.assertIsNone(frappe.cache().get_value(self.key, expires=True))
+
+	def test_a_long_wait_keeps_the_session_and_the_next_attempt_resumes_it(self):
+		fake = self.go()
+		self.script[(2 * self.CHUNK, 1)] = HttpResponse(429, {"error": {"code": "tooManyRequests"}}, {"Retry-After": "600"})
+		with self.assertRaises(files.UploadInterrupted):
+			self.upload()
+		self.sleeps.assert_not_called()
+		self.assertNotIn("DELETE", [m for m, _r in self.ranges(fake)])
+		self.assertTrue(frappe.cache().get_value(self.key, expires=True))  # kept, encrypted
+		self.assertNotIn("SECRET", str(frappe.cache().get_value(self.key, expires=True)))
+
+		calls = len(fake.calls)
+		self.assertEqual(self.upload()["id"], "BIG")
+		self.assertEqual(self.sessions, 1)  # the same session, not a new one
+		self.assertEqual(
+			[(m, (k.get("headers") or {}).get("Content-Range")) for m, _u, k in fake.calls[calls:]],
+			[
+				("GET", None),  # where did we stop?
+				("PUT", f"bytes {2 * self.CHUNK}-{3 * self.CHUNK - 1}/{self.SIZE}"),
+				("PUT", f"bytes {3 * self.CHUNK}-{self.SIZE - 1}/{self.SIZE}"),
+			],
+		)
+
+	def test_a_dropped_connection_asks_the_session_where_to_carry_on(self):
+		import requests
+
+		def dropped_after_arriving():
+			self.received = 2 * self.CHUNK  # the range got there; the answer did not
+			raise requests.ConnectionError("connection reset")
+
+		fake = self.go()
+		self.script[(self.CHUNK, 1)] = dropped_after_arriving
+		self.assertEqual(self.upload()["id"], "BIG")
+		self.assertEqual(
+			[r for _m, r in self.ranges(fake)],
+			[
+				f"bytes 0-{self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {self.CHUNK}-{2 * self.CHUNK - 1}/{self.SIZE}",
+				None,  # GET the session's status
+				f"bytes {2 * self.CHUNK}-{3 * self.CHUNK - 1}/{self.SIZE}",
+				f"bytes {3 * self.CHUNK}-{self.SIZE - 1}/{self.SIZE}",
+			],
+		)
+
+	def test_a_refusal_that_will_not_pass_drops_the_session(self):
+		fake = self.go()
+		self.script[(0, 1)] = HttpResponse(400, {"error": {"code": "invalidRange"}})
+		with self.assertRaises(MsGraphError):
+			self.upload()
+		self.assertEqual(fake.calls[-1][0], "DELETE")
+		self.assertIsNone(frappe.cache().get_value(self.key, expires=True))

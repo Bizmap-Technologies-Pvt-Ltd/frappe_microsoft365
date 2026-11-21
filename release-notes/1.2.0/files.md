@@ -14,6 +14,8 @@
 - A moved File re-attached to another record now takes its SharePoint file with it into that record's folder, so readers of the first record no longer find it there. A File that shares its SharePoint file with attachment copies gets a copy of its own (the copies keep theirs); one re-attached to a record with no SharePoint folder comes back to this server, and its SharePoint copy goes to the site recycle bin. Applies to re-attachments from now on; the upgrade report's existing `upgrade.sharepoint_files_in_other_folders` check still lists Files left in another record's folder. (#43)
 - `File.get_content()` on a moved file no longer reads a file of any size into memory: it streams, and refuses a file over the limit (see Upgrade notes). `microsoft_files.iter_content()` gives server-side code that can stream a file's bytes in pieces. (#47)
 
+- Large uploads resume instead of starting again: a throttled or failed range is sent again after the wait SharePoint asks for (`Retry-After`), a dropped connection carries on from where SharePoint says it stopped (`nextExpectedRanges`), and when the wait is too long for a job the upload session is kept (encrypted, until it expires) so the next attempt resumes it. One throttled range on a busy tenant used to throw the session away and restart from byte 0 an hour later. (#60)
+
 ### Changed
 
 - A record's SharePoint folder is never renamed by the app. Renaming a record keeps its folder linked under the new name; the folder keeps the name it was created with. (In practice the rename never ran: Frappe had already moved the folder link to the new name before the app looked for it.) The user guide and the setup guide said a folder is renamed to match; they no longer do. (#38)

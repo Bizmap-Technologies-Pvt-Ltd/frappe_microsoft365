@@ -38,6 +38,7 @@ import re
 import shutil
 import socket
 import tempfile
+import time
 from urllib.parse import quote, urlparse
 
 import frappe
@@ -1400,6 +1401,11 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 
 	An existing file of the same name is never overwritten: Microsoft renames the new one
 	(``Spec (1).pdf``), which is what a person dropping a file into Teams would get too.
+
+	A large file goes through an upload session, which survives interruptions: a throttled or
+	failed range is sent again after the wait SharePoint asks for, and when the wait is longer
+	than a job should sit idle (or the ranges keep failing) the session is kept, so the next
+	attempt carries on from where SharePoint says it stopped instead of starting again.
 	"""
 	target = f"/drives/{drive_id}/items/{parent_id}:/{quote(name, safe='')}:"
 	if size <= SIMPLE_UPLOAD_MAX_BYTES:
@@ -1413,24 +1419,52 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 			timeout=120,
 		)
 
-	session = graph.graph_request(
-		"POST",
-		f"{target}/createUploadSession",
-		APP,
-		json={
-			"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
-		},
-	)
-	upload_url = session["uploadUrl"]
+	key = _session_key(drive_id, parent_id, name, size)
+	upload_url, start = _resume_session(key)
+	if not upload_url:
+		session = graph.graph_request(
+			"POST",
+			f"{target}/createUploadSession",
+			APP,
+			json={
+				"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
+			},
+		)
+		upload_url, start = session["uploadUrl"], 0
+		_remember_session(key, upload_url, session.get("expirationDateTime"))
 	try:
-		return _send_ranges(upload_url, fh, size)
+		item = _send_ranges(upload_url, fh, size, start)
+	except UploadInterrupted:
+		# Kept: the next attempt resumes this session (see _resume_session).
+		raise
 	except Exception:
+		_forget_session(key)
 		# An abandoned session holds its partial bytes on Microsoft's side until it expires.
 		try:
 			graph._release(graph._http_request("DELETE", upload_url, timeout=30))
 		except Exception:
 			pass
 		raise
+	_forget_session(key)
+	return item
+
+
+class UploadInterrupted(MsGraphError):
+	"""An upload session stopped part way for a reason that passes (throttling, a dropped
+	connection). The session is kept, and the next attempt resumes it."""
+
+
+#: Statuses after which a range is sent again rather than the upload given up.
+RETRYABLE_UPLOAD_STATUSES = (429, 500, 502, 503, 504)
+
+#: How many times one range is sent again, waiting as SharePoint asks in between, before the
+#: rest of the upload is left to the next attempt.
+UPLOAD_RETRIES_PER_RANGE = 3
+
+UPLOAD_SESSION_CACHE_PREFIX = "frappe_microsoft365:upload_session:"
+
+#: How long a session is remembered when SharePoint gives no expiry with it.
+UPLOAD_SESSION_TTL_SECONDS = 6 * 3600
 
 
 def chunk_ranges(size, chunk=UPLOAD_CHUNK_BYTES):
@@ -1438,34 +1472,149 @@ def chunk_ranges(size, chunk=UPLOAD_CHUNK_BYTES):
 	return [(start, min(start + chunk, size) - 1) for start in range(0, size, chunk)]
 
 
-def _send_ranges(upload_url, fh, size):
-	"""PUT each range to the pre-authenticated upload URL.
+def _session_key(drive_id, parent_id, name, size):
+	import hashlib
+
+	return UPLOAD_SESSION_CACHE_PREFIX + hashlib.sha256(f"{drive_id}\0{parent_id}\0{name}\0{size}".encode()).hexdigest()
+
+
+def _remember_session(key, upload_url, expires=None):
+	"""Keep an upload session's URL for the next attempt, encrypted: it is a credential of its own."""
+	from datetime import datetime, timezone
+
+	from dateutil import parser
+	from frappe.utils.password import encrypt
+
+	ttl = UPLOAD_SESSION_TTL_SECONDS
+	try:
+		if expires:
+			# SharePoint gives the expiry in UTC, e.g. 2026-11-21T10:00:00.000Z.
+			left = (parser.isoparse(expires) - datetime.now(timezone.utc)).total_seconds()
+			ttl = int(min(ttl, left))
+	except (ValueError, TypeError):
+		pass
+	if ttl > 60:
+		frappe.cache().set_value(key, encrypt(upload_url), expires_in_sec=ttl)
+
+
+def _forget_session(key):
+	frappe.cache().delete_value(key)
+
+
+def _resume_session(key):
+	"""``(upload_url, next byte)`` of a session an earlier attempt left, or ``(None, 0)``."""
+	from frappe.utils.password import decrypt
+
+	cached = frappe.cache().get_value(key, expires=True)
+	if not cached:
+		return None, 0
+	try:
+		upload_url = decrypt(cached)
+		start = _next_expected(upload_url)
+	except Exception:
+		_forget_session(key)
+		return None, 0
+	if start is None:
+		_forget_session(key)
+		return None, 0
+	return upload_url, start
+
+
+def _next_expected(upload_url):
+	"""Ask an upload session where it wants the next bytes from: an offset, or None if it is
+	gone or wants nothing more."""
+	resp = graph._http_request("GET", upload_url, timeout=30)
+	try:
+		if resp.status_code != 200:
+			return None
+		ranges = (resp.json() or {}).get("nextExpectedRanges") or []
+	finally:
+		graph._release(resp)
+	if not ranges:
+		return None
+	return int(str(ranges[0]).split("-", 1)[0])
+
+
+def _send_ranges(upload_url, fh, size, start=0):
+	"""PUT the ranges from ``start`` on to the pre-authenticated upload URL.
 
 	No Authorization header: the URL carries its own credential, and Microsoft documents that
 	sending a bearer token to it can make the request fail.
+
+	A range refused with 429 or a 5xx is sent again after its Retry-After (a short one; see
+	microsoft_graph._retry_after_seconds). A dropped connection leaves it unknown what arrived,
+	so the session is asked (nextExpectedRanges) and the upload carries on from there. When the
+	wait would be long, or a range keeps failing, UploadInterrupted leaves the rest to the next
+	attempt, which resumes the same session.
 	"""
-	for start, end in chunk_ranges(size):
-		body = fh.read(end - start + 1)
-		resp = graph._http_request(
-			"PUT",
-			upload_url,
-			data=body,
-			timeout=300,
-			headers={
-				"Content-Length": str(len(body)),
-				"Content-Range": f"bytes {start}-{end}/{size}",
-			},
-		)
-		if resp.status_code in (200, 201):
-			return resp.json()
-		if resp.status_code != 202:
-			detail = graph._safe_error(resp)
-			graph._release(resp)
-			frappe.throw(
-				_("SharePoint refused part of the upload ({0}): {1}").format(resp.status_code, detail),
-				MsGraphError,
+	import requests
+
+	offset = start
+	if start:
+		fh.seek(start)
+	tries = 0
+	body = None
+	while offset < size:
+		end = min(offset + UPLOAD_CHUNK_BYTES, size) - 1
+		if body is None:
+			body = fh.read(end - offset + 1)
+		try:
+			resp = graph._http_request(
+				"PUT",
+				upload_url,
+				data=body,
+				timeout=300,
+				headers={
+					"Content-Length": str(len(body)),
+					"Content-Range": f"bytes {offset}-{end}/{size}",
+				},
 			)
-		graph._release(resp)
+		except requests.RequestException as e:
+			resp, reason = None, str(e)
+		else:
+			reason = str(resp.status_code)
+			if resp.status_code in (200, 201):
+				return resp.json()
+			if resp.status_code == 202:
+				graph._release(resp)
+				offset, body, tries = end + 1, None, 0
+				continue
+			if resp.status_code not in (*RETRYABLE_UPLOAD_STATUSES, 416):
+				detail = graph._safe_error(resp)
+				graph._release(resp)
+				frappe.throw(
+					_("SharePoint refused part of the upload ({0}): {1}").format(resp.status_code, detail),
+					MsGraphError,
+				)
+
+		tries += 1
+		wait = graph._retry_after_seconds(resp) if resp is not None else graph.DEFAULT_RETRY_AFTER_SECONDS
+		status = resp.status_code if resp is not None else None
+		if resp is not None:
+			graph._release(resp)
+		if wait is None or tries > UPLOAD_RETRIES_PER_RANGE:
+			raise UploadInterrupted(
+				_("The upload to SharePoint stopped at byte {0} of {1} ({2}); the next attempt carries on from there.").format(
+					offset, size, reason
+				)
+			)
+		if status in RETRYABLE_UPLOAD_STATUSES:
+			# Refused outright: the same range goes again, once SharePoint is ready for it.
+			time.sleep(wait)
+			continue
+		# A dropped connection, or 416 (that range has arrived already): SharePoint knows best.
+		if status is None:
+			time.sleep(wait)
+		resumed = _next_expected(upload_url)
+		if resumed is None or resumed >= size:
+			raise UploadInterrupted(
+				_("SharePoint lost track of the upload at byte {0} of {1}; the next attempt starts again.").format(
+					offset, size
+				)
+			)
+		if resumed != offset:
+			fh.seek(resumed)
+			offset, body = resumed, None
 	frappe.throw(_("SharePoint did not confirm the upload after the last part."), MsGraphError)
 
 
