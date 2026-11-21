@@ -68,6 +68,17 @@ class NetworkFake:
 		return self.answer(method, url, kwargs)
 
 
+#: The real graph_request, before any test replaces it with a FakeGraph.
+GRAPH_REQUEST = graph.graph_request
+
+
+def real_graph(test):
+	"""Put the real graph_request back under a FilesTestCase, for a network-level test."""
+	p = patch.object(graph, "graph_request", GRAPH_REQUEST)
+	p.start()
+	test.addCleanup(p.stop)
+
+
 def network(test, answer):
 	"""Patch only the transport and the app token; returns the NetworkFake."""
 	fake = NetworkFake(answer)
@@ -422,3 +433,68 @@ class TestRenamingARecord(FilesTestCase):
 		files.on_doc_rename(other, old=self.todo.name, new=other.name, merge=True)
 		self.assertIsNone(files.get_folder(MAPPED, self.todo.name))
 		self.assertEqual(files.get_folder(MAPPED, other.name).item_id, target.item_id)
+
+
+# --- B23: a recreated library or site is looked up again --------------------------------------
+
+
+class TestRecreatedLibrary(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		frappe.db.set_value("SharePoint Mapping", MAPPED, {"site_id": "OLD-SITE", "drive_id": "OLD-DRIVE"})
+		files.clear_mapping_cache()
+
+	def answer(self, method, url, kwargs):
+		"""Graph as it answers once the library was deleted and created again (network-level)."""
+		path = url[len(GRAPH) :]
+		if path.startswith("/drives/OLD-DRIVE"):
+			return HttpResponse(404, {"error": {"code": "itemNotFound", "message": "drive not found"}})
+		if (method, path) == ("GET", "/sites/contoso.sharepoint.com:/sites/Sales"):
+			return HttpResponse(200, {"id": "NEW-SITE"})
+		if (method, path) == ("GET", "/sites/NEW-SITE/drives?$select=id,name,webUrl"):
+			return HttpResponse(200, {"value": [{"id": "NEW-DRIVE", "name": "Documents"}]})
+		if (method, path) == ("GET", "/drives/NEW-DRIVE/root:/Projects:"):
+			return HttpResponse(200, {"id": "NEW-BASE", "folder": {}})
+		if (method, path) == ("POST", "/drives/NEW-DRIVE/items/NEW-BASE/children"):
+			body = kwargs["json"]
+			return HttpResponse(
+				201, {"id": "NEW-FOLDER", "name": body["name"], "folder": {}, "webUrl": "https://x/f"}
+			)
+		raise AssertionError(f"unexpected {method} {url}")
+
+	def test_a_stale_drive_id_is_looked_up_again_once(self):
+		real_graph(self)
+		fake = network(self, self.answer)
+		row = files.mapping_for(MAPPED)
+		values = files.new_folder_values(row, MAPPED, self.todo.name)
+		self.assertEqual((values["drive_id"], values["item_id"]), ("NEW-DRIVE", "NEW-FOLDER"))
+		self.assertEqual(
+			[(m, u[len(GRAPH) :]) for m, u, _k in fake.calls],
+			[
+				("GET", "/drives/OLD-DRIVE/root:/Projects:"),  # the whole path, then level by level
+				("GET", "/drives/OLD-DRIVE/root:/Projects:"),
+				("POST", "/drives/OLD-DRIVE/root/children"),
+				("GET", "/drives/OLD-DRIVE"),  # is the library itself gone? yes
+				("GET", "/sites/contoso.sharepoint.com:/sites/Sales"),
+				("GET", "/sites/NEW-SITE/drives?$select=id,name,webUrl"),
+				("GET", "/drives/NEW-DRIVE/root:/Projects:"),
+				("POST", "/drives/NEW-DRIVE/items/NEW-BASE/children"),
+			],
+		)
+		self.assertEqual(fake.calls[-1][2]["json"]["@microsoft.graph.conflictBehavior"], "rename")
+		self.assertEqual(
+			frappe.db.get_value("SharePoint Mapping", MAPPED, ["site_id", "drive_id"]), ("NEW-SITE", "NEW-DRIVE")
+		)
+
+	def test_a_404_inside_a_library_that_still_exists_is_not_retried(self):
+		def answer(method, url, kwargs):
+			path = url[len(GRAPH) :]
+			if (method, path) == ("GET", "/drives/OLD-DRIVE"):
+				return HttpResponse(200, {"id": "OLD-DRIVE"})
+			return HttpResponse(404, {"error": {"code": "itemNotFound"}})
+
+		real_graph(self)
+		fake = network(self, answer)
+		with self.assertRaises(graph.MsGraphNotFound):
+			files.new_folder_values(files.mapping_for(MAPPED), MAPPED, self.todo.name)
+		self.assertNotIn("/sites/", " ".join(u for _m, u, _k in fake.calls))

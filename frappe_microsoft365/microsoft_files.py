@@ -460,6 +460,39 @@ def resolve_drive(row):
 	return site_id, drive_id
 
 
+def _drive_gone(drive_id):
+	"""Ask for the library itself, by id: True when SharePoint says there is no such drive."""
+	try:
+		graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "id"})
+	except MsGraphNotFound:
+		_forget_message()
+		return True
+	return False
+
+
+def with_current_drive(row, work):
+	"""``work(drive_id)`` against the mapping's library, looking the library up again once if the
+	cached id has stopped existing.
+
+	The site and drive ids are cached on the mapping (resolve_drive). A library or site that was
+	deleted and created again under the same address gets new ids, and the cached drive id then
+	answers 404 for everything, so every new folder fails until someone re-saves the mapping.
+	On a 404 the drive itself is asked for; only if it is gone are the ids looked up again from
+	the URL, and the work is tried once more against the new drive.
+	"""
+	cached = bool(row.get("site_id") and row.get("drive_id"))
+	_site_id, drive_id = resolve_drive(row)
+	try:
+		return work(drive_id)
+	except MsGraphNotFound:
+		if not cached or not _drive_gone(drive_id):
+			raise
+		_forget_message()
+	row.site_id = row.drive_id = None
+	_site_id, fresh = resolve_drive(row)
+	return work(fresh)
+
+
 def _find_drive(site_id, library):
 	library = (library or "").strip()
 	drives = graph.graph_paged(f"/sites/{site_id}/drives?$select=id,name,webUrl", APP)
@@ -659,12 +692,15 @@ def new_folder_values(row, doctype, name):
 	1``) rather than hand that folder over. Using a folder that already exists is something an
 	administrator does on purpose, with Existing Folder on the mapping's Folders table.
 	"""
-	_site_id, drive_id = resolve_drive(row)
 	doc = frappe.get_doc(doctype, name)
 	folder_name = render_pattern(row.folder_pattern, doc)
 	base = base_segments(row)
-	parent_id = ensure_path(drive_id, base)["id"] if base else None
-	item = _create_folder(drive_id, parent_id, folder_name, conflict="rename")
+
+	def create(drive_id):
+		parent_id = ensure_path(drive_id, base)["id"] if base else None
+		return drive_id, _create_folder(drive_id, parent_id, folder_name, conflict="rename")
+
+	drive_id, item = with_current_drive(row, create)
 	if "folder" not in item:
 		frappe.throw(_("SharePoint did not create the folder {0}.").format(folder_name), MsGraphError)
 	folder_name = item.get("name") or folder_name
@@ -688,33 +724,44 @@ def existing_folder_values(row, location):
 	import base64
 	from urllib.parse import parse_qs, unquote
 
-	_site_id, drive_id = resolve_drive(row)
 	value = (location or "").strip()
-	item = None
-	if value.lower().startswith(("http://", "https://")):
-		parsed = urlparse(value)
-		ids = parse_qs(parsed.query).get("id")
-		path = unquote(ids[0] if ids else parsed.path).rstrip("/")
-		drive = graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "webUrl"})
-		root = unquote(urlparse(drive.get("webUrl") or "").path).rstrip("/")
-		if root and path.lower().startswith(root.lower() + "/"):
-			item = _get_by_path(drive_id, [p for p in path[len(root) + 1 :].split("/") if p])
-		else:
-			# A sharing link (…/:f:/s/…) names no path; Graph resolves those through /shares.
-			token = "u!" + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
-			try:
-				item = graph.graph_request(
-					"GET",
-					f"/shares/{token}/driveItem",
-					APP,
-					params={"$select": "id,name,folder,webUrl,parentReference"},
-				)
-			except MsGraphError:
-				_forget_message()
-				item = None
-	else:
-		item = _get_by_path(drive_id, [p for p in value.replace("\\", "/").split("/") if p.strip()])
 
+	def find(drive_id):
+		item = None
+		if value.lower().startswith(("http://", "https://")):
+			parsed = urlparse(value)
+			ids = parse_qs(parsed.query).get("id")
+			path = unquote(ids[0] if ids else parsed.path).rstrip("/")
+			drive = graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "webUrl"})
+			root = unquote(urlparse(drive.get("webUrl") or "").path).rstrip("/")
+			if root and path.lower().startswith(root.lower() + "/"):
+				item = _get_by_path(drive_id, [p for p in path[len(root) + 1 :].split("/") if p])
+			else:
+				# A sharing link (…/:f:/s/…) names no path; Graph resolves those through /shares.
+				token = "u!" + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+				try:
+					item = graph.graph_request(
+						"GET",
+						f"/shares/{token}/driveItem",
+						APP,
+						params={"$select": "id,name,folder,webUrl,parentReference"},
+					)
+				except MsGraphError:
+					_forget_message()
+					item = None
+		else:
+			item = _get_by_path(drive_id, [p for p in value.replace("\\", "/").split("/") if p.strip()])
+
+		if not item:
+			# Raised bare, not thrown: nothing for the desk to show unless the retry fails too.
+			raise MsGraphNotFound("folder not found")
+		return drive_id, item
+
+	try:
+		drive_id, item = with_current_drive(row, find)
+	except MsGraphNotFound:
+		_forget_message()
+		item = None
 	if not item:
 		frappe.throw(
 			_(
