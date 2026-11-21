@@ -242,4 +242,5 @@ All Graph v1.0, application permission `Sites.Selected`:
 | Upload > 4 MB | `POST …:/{name}:/createUploadSession`, then `PUT {uploadUrl}` in 320 KiB-multiple ranges, without a bearer token |
 | Download | `GET /drives/{drive-id}/items/{item-id}/content` (302 to a pre-authenticated URL) |
 | List | `GET /drives/{drive-id}/items/{item-id}/children` |
+| Move (attachment re-attached to another record) | `PATCH /drives/{drive-id}/items/{item-id}` with `parentReference` (`conflictBehavior=rename`); between libraries, a download and an upload |
 | Remove (opt-in) | `DELETE /drives/{drive-id}/items/{item-id}`, which goes to the site recycle bin |

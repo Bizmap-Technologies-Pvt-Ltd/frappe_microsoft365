@@ -26,6 +26,7 @@ Graph contract used (all v1.0, see docs/graph-api-reference.md):
 * ``POST .../{filename}:/createUploadSession`` then ``PUT {uploadUrl}`` in ranges — large upload
 * ``GET /drives/{drive-id}/items/{item-id}/content`` — download (302 to a pre-signed URL)
 * ``GET /drives/{drive-id}/items/{item-id}/children`` — folder listing
+* ``PATCH /drives/{drive-id}/items/{item-id}`` with ``parentReference`` — move (re-attached file)
 * ``DELETE /drives/{drive-id}/items/{item-id}`` — to the site recycle bin
 """
 
@@ -1721,17 +1722,196 @@ def on_file_trash(doc, method=None):
 
 
 def on_file_update(doc, method=None):
-	"""File.on_update: keep a moved file's kept local copy in step with the File's privacy."""
-	if doc.get("custom_microsoft_status") != STORED or not doc.has_value_changed("is_private"):
+	"""File.on_update: keep a moved file's SharePoint copy and kept local copy in step with the File.
+
+	Its privacy decides where the kept local copy lives (follow_privacy), and the record it is
+	attached to decides which folder its SharePoint item is in (follow_attachment). Inserts are
+	left alone: a new File has nothing to follow yet, and an attachment copy shares its item with
+	the original, which stays where it is.
+	"""
+	before = doc.get_doc_before_save()
+	if doc.flags.in_insert or not before:
 		return
-	try:
-		follow_privacy(doc)
-	except Exception:
-		frappe.log_error(title=_("Microsoft 365: could not move the kept local copy"), message=doc.name)
-		if cint(doc.is_private):
-			# A copy that could not follow the File into private/files must not stay public.
-			# SharePoint holds the file; the kept copy is only a spare.
-			_drop_kept_copy(doc)
+	status = doc.get("custom_microsoft_status")
+	if status == STORED and doc.has_value_changed("is_private"):
+		try:
+			follow_privacy(doc)
+		except Exception:
+			frappe.log_error(title=_("Microsoft 365: could not move the kept local copy"), message=doc.name)
+			if cint(doc.is_private):
+				# A copy that could not follow the File into private/files must not stay public.
+				# SharePoint holds the file; the kept copy is only a spare.
+				_drop_kept_copy(doc)
+	if status in (STORED, ARCHIVED) and (
+		doc.has_value_changed("attached_to_doctype") or doc.has_value_changed("attached_to_name")
+	):
+		old = (before.get("attached_to_doctype"), before.get("attached_to_name"))
+		try:
+			follow_attachment(doc.name, *old)
+		except Exception:
+			frappe.log_error(title=_("Microsoft 365: could not move a re-attached file"), message=doc.name)
+			enqueue_follow_attachment(doc.name, *old)
+
+
+def enqueue_follow_attachment(file_name, old_doctype, old_name):
+	frappe.enqueue(
+		"frappe_microsoft365.microsoft_files.follow_attachment",
+		queue="long",
+		file_name=file_name,
+		old_doctype=old_doctype,
+		old_name=old_name,
+		in_job=True,
+		job_id=f"microsoft365-follow-{file_name}",
+		deduplicate=True,
+		enqueue_after_commit=True,
+	)
+
+
+def follow_attachment(file_name, old_doctype, old_name, in_job=False):
+	"""Move a stored File's SharePoint item to the folder of the record it is attached to now.
+
+	Whoever can read a record sees and opens everything in its folder, so a File re-attached to
+	another record must not stay in the first record's folder for that record's readers. Only an
+	item that is in the folder of the record the File was attached to before is moved: anything
+	else is not this File's to move (see assert_app_item).
+
+	Within one library the item is moved in place, at once. Copying it between libraries, giving
+	a File its own copy of an item it shares with attachment copies (they stay with the original),
+	and bringing it back to this server when its new record has no SharePoint folder to go to all
+	transfer the bytes, so they run as a background job (in_job).
+	"""
+	file_doc = frappe.get_doc("File", file_name)
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	item_id = file_doc.get("custom_microsoft_item_id")
+	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
+		return
+	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
+	if (doctype, name) == (old_doctype, old_name):
+		return
+
+	holder = _holder_of(file_doc)
+	if not holder:
+		return
+	if (holder.reference_doctype, holder.reference_name) == (doctype, name):
+		return  # already in the new record's folder
+	if (holder.reference_doctype, holder.reference_name) != (old_doctype, old_name):
+		frappe.log_error(
+			title=_("Microsoft 365: re-attached file not moved"),
+			message=_("File {0} names an item in the folder of {1} {2}, not of the record it was attached to.").format(
+				file_name, holder.reference_doctype, holder.reference_name
+			),
+		)
+		return
+
+	shared = frappe.db.exists("File", {"custom_microsoft_item_id": item_id, "name": ["!=", file_name]})
+	target = _folder_to_follow_into(file_doc)
+	if target and not shared and target.drive_id == drive_id:
+		item = graph.graph_request(
+			"PATCH",
+			f"/drives/{drive_id}/items/{item_id}",
+			APP,
+			json={"parentReference": {"id": target.item_id}},
+			params={"@microsoft.graph.conflictBehavior": "rename"},
+		)
+		_record_location(file_name, item, target)
+		return
+	if not in_job:
+		enqueue_follow_attachment(file_name, old_doctype, old_name)
+		return
+	if target:
+		_copy_into(file_doc, target)
+	elif file_doc.get("custom_microsoft_status") == STORED:
+		# Nowhere in SharePoint to go: the record's DocType is not mapped (or storage is off), so
+		# the file comes back to this server like any other attachment of that DocType.
+		bring_back(file_name)
+	else:
+		# An archived link: the link itself never moved, so only the copy has to leave.
+		frappe.db.set_value(
+			"File", file_name, {"custom_microsoft_status": None, "custom_microsoft_item_id": None}, update_modified=False
+		)
+	if not shared:
+		try:
+			graph.graph_request("DELETE", f"/drives/{drive_id}/items/{item_id}", APP)
+		except MsGraphNotFound:
+			_forget_message()
+
+
+def _folder_to_follow_into(file_doc):
+	"""The folder a re-attached File's item belongs in now, or None when its new record has none
+	to give: an unmapped DocType, storage switched off, a field attachment (those stay on this
+	server, see _eligible), or an On demand record nobody asked a folder for. Creating the folder
+	commits (see ensure_folder)."""
+	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
+	if not (files_enabled() and doctype and name) or file_doc.attached_to_field:
+		return None
+	row = mapping_for(doctype)
+	if not row or (is_on_demand(row) and not get_folder(doctype, name)):
+		return None
+	return ensure_folder(doctype, name)
+
+
+def _holder_of(file_doc):
+	"""The SharePoint Folder row of the record folder a File's item is in, or None."""
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	folders = {
+		row.item_id: row
+		for row in frappe.get_all(
+			"SharePoint Folder",
+			filters={"drive_id": drive_id},
+			fields=["item_id", "reference_doctype", "reference_name"],
+		)
+	}
+	holder = folders.get(file_doc.get("custom_microsoft_folder_id") or "")
+	if not holder:
+		try:
+			holder = folders.get(
+				_known_folder_holding(drive_id, file_doc.get("custom_microsoft_item_id"), folders) or ""
+			)
+		except MsGraphNotFound:
+			_forget_message()
+			return None
+	return holder
+
+
+def _record_location(file_name, item, folder):
+	"""Write where a File's SharePoint item now is."""
+	frappe.db.set_value(
+		"File",
+		file_name,
+		{
+			"custom_microsoft_drive_id": _drive_of(item, folder),
+			"custom_microsoft_item_id": item["id"],
+			"custom_microsoft_folder_id": folder.item_id,
+			"custom_microsoft_web_url": item.get("webUrl"),
+		},
+		update_modified=False,
+	)
+
+
+def _copy_into(file_doc, folder):
+	"""Give a File its own copy of its SharePoint item, in ``folder`` (another library, or an
+	item it shares with attachment copies). Streams through a temporary file."""
+	resp = graph.graph_request(
+		"GET",
+		f"/drives/{file_doc.custom_microsoft_drive_id}/items/{file_doc.custom_microsoft_item_id}/content",
+		APP,
+		raw=True,
+		stream=True,
+		timeout=120,
+	)
+	with tempfile.TemporaryFile() as fh:
+		try:
+			for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
+				fh.write(chunk)
+		finally:
+			resp.close()
+		size = fh.tell()
+		fh.seek(0)
+		name = upload_name(file_doc, folder)
+		item = upload_stream(
+			folder.drive_id, folder.item_id, name, fh, size, mimetypes.guess_type(name)[0] or "application/octet-stream"
+		)
+	_record_location(file_doc.name, item, folder)
 
 
 def on_file_delete(doc, method=None):

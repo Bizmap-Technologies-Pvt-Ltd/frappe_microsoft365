@@ -641,3 +641,96 @@ class TestRetryAfterALostCommit(FilesTestCase):
 		fake = self.left_behind({})
 		files.upload_file(self.file.name)
 		self.assertEqual([m for m, _u, _k in fake.calls], ["PUT"])
+
+
+# --- B26: a re-attached File's item moves with it ---------------------------------------------
+
+
+class TestReattachedFileMoves(FilesTestCase):
+	def setUp(self):
+		super().setUp()
+		# A name of its own: rows written by one test of a class are still there in the next.
+		self.name = f"moved-{frappe.generate_hash(length=6)}.csv"
+		self.file = self.attach(name=self.name)
+		files.upload_file(self.file.name)  # into self.todo's folder, FOLDER (FakeGraph)
+		self.item = frappe.db.get_value("File", self.file.name, "custom_microsoft_item_id")
+		self.second = frappe.get_doc({"doctype": "ToDo", "description": "second"}).insert()
+		files.add_folder_row(
+			MAPPED,
+			self.second.name,
+			{"drive_id": "DRIVE", "item_id": "FOLDER2", "folder_name": "S", "folder_path": "Projects/S"},
+		)
+		self.jobs = patch.object(frappe, "enqueue").start()
+		self.addCleanup(patch.stopall)
+		real_graph(self)
+
+	def reattach(self, doctype=MAPPED, name=None):
+		doc = frappe.get_doc("File", self.file.name)
+		doc.attached_to_doctype = doctype
+		doc.attached_to_name = name or self.second.name
+		doc.save()
+
+	def answer(self, method, url, kwargs):
+		path = url[len(GRAPH) :]
+		if (method, path) == ("PATCH", f"/drives/DRIVE/items/{self.item}"):
+			return HttpResponse(
+				200,
+				{"id": self.item, "webUrl": "https://x/S/m.csv", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}},
+			)
+		if (method, path) == ("GET", f"/drives/DRIVE/items/{self.item}/content"):
+			return HttpResponse(200, body=b"the bytes")
+		if (method, path) == ("PUT", f"/drives/DRIVE/items/FOLDER2:/{self.name}:/content"):
+			return HttpResponse(201, {"id": "OWN-COPY", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}})
+		if (method, path) == ("DELETE", f"/drives/DRIVE/items/{self.item}"):
+			return HttpResponse(204)
+		raise AssertionError(f"unexpected {method} {url}")
+
+	def location(self):
+		return frappe.db.get_value(
+			"File", self.file.name, ["custom_microsoft_item_id", "custom_microsoft_folder_id"], as_dict=True
+		)
+
+	def test_re_attaching_moves_the_item_to_the_new_records_folder(self):
+		fake = network(self, self.answer)
+		self.reattach()
+		self.assertEqual([(m, u) for m, u, _k in fake.calls], [("PATCH", f"{GRAPH}/drives/DRIVE/items/{self.item}")])
+		self.assertEqual(fake.calls[0][2]["json"], {"parentReference": {"id": "FOLDER2"}})
+		self.assertEqual(fake.calls[0][2]["params"], {"@microsoft.graph.conflictBehavior": "rename"})
+		self.assertEqual(self.location(), {"custom_microsoft_item_id": self.item, "custom_microsoft_folder_id": "FOLDER2"})
+		# Readers of the first record no longer find it through that record; readers of the second do.
+		files.assert_app_item(frappe.get_doc("File", self.file.name))
+
+	def test_an_item_shared_with_attachment_copies_is_copied_for_the_file_that_moved(self):
+		frappe.get_doc("File", self.file.name).create_attachment_copy("Note", "anything")
+		fake = network(self, self.answer)
+		self.reattach()
+		self.assertEqual(fake.calls, [])  # bytes are moved by a job, not in the save
+		job = self.jobs.call_args.kwargs
+		self.assertEqual((job["file_name"], job["old_name"]), (self.file.name, self.todo.name))
+		files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
+		self.assertEqual(
+			[m for m, _u, _k in fake.calls], ["GET", "PUT"]
+		)  # its own copy; the original stays for the copies
+		self.assertEqual(self.location(), {"custom_microsoft_item_id": "OWN-COPY", "custom_microsoft_folder_id": "FOLDER2"})
+
+	def test_re_attached_to_an_unmapped_record_it_comes_back_to_this_server(self):
+		fake = network(self, self.answer)
+		self.reattach("Note", "unmapped")
+		files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
+		row = frappe.db.get_value("File", self.file.name, ["file_url", "custom_microsoft_status"], as_dict=True)
+		self.assertFalse(row.custom_microsoft_status)
+		self.assertTrue(row.file_url.startswith("/private/files/"))
+		self.addCleanup(lambda p=files.local_path(row.file_url): os.path.exists(p) and os.remove(p))
+		self.assertEqual([m for m, _u, _k in fake.calls], ["GET", "DELETE"])
+
+	def test_an_item_that_was_not_in_the_old_records_folder_is_not_moved(self):
+		third = frappe.get_doc({"doctype": "ToDo", "description": "third"}).insert()
+		fake = network(self, self.answer)
+		files.follow_attachment(self.file.name, MAPPED, third.name, in_job=True)
+		self.assertEqual(fake.calls, [])
+
+	def test_saving_without_re_attaching_does_nothing(self):
+		fake = network(self, self.answer)
+		doc = frappe.get_doc("File", self.file.name)
+		doc.save()
+		self.assertEqual(fake.calls, [])

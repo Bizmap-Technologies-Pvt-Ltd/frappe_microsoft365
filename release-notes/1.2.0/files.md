@@ -11,6 +11,7 @@
 
 - Long paths: SharePoint refuses a file whose whole path passes 400 characters, and uploads used to fail with a path error. A mapping whose base folder leaves too little room is now refused when saved, with the length in the message; record folders are named to leave room for their files; and a file name that would pass the limit is shortened, keeping its extension. Files more than 10 folders deep inside a record's folder open again from the panel. (#41)
 - A worker that died after uploading a file but before recording it no longer leaves a duplicate (`report (1).pdf`): the retry looks in the record's folder for a file of the same name and size that this app uploaded and no other File claims, and adopts it. (#42)
+- A moved File re-attached to another record now takes its SharePoint file with it into that record's folder, so readers of the first record no longer find it there. A File that shares its SharePoint file with attachment copies gets a copy of its own (the copies keep theirs); one re-attached to a record with no SharePoint folder comes back to this server, and its SharePoint copy goes to the site recycle bin. Applies to re-attachments from now on; the upgrade report's existing `upgrade.sharepoint_files_in_other_folders` check still lists Files left in another record's folder. (#43)
 
 ### Changed
 
