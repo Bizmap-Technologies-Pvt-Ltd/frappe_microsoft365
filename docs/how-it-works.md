@@ -51,8 +51,14 @@ Worth knowing before you trust it with a real calendar:
   on the Microsoft Calendar and is the sync watermark.
 - **A failed pull never advances the watermark.** If Graph errors halfway, the next run repeats
   that window instead of skipping it. The reason is written to **Last Sync Error** on the form.
-- **Every page is read.** Collection reads follow `@odata.nextLink` to the end, so a calendar
-  with hundreds of events in the window imports completely, not just the first page.
+- **Every page is read, over as many runs as it takes.** The pull follows `@odata.nextLink` for
+  up to 50 pages (about 2,500 events) per run. A larger first sync or backlog stores where it
+  stopped and the next run carries on from there; the delta link only moves once the last page
+  has been read. If Microsoft stops handing out links that move forward, it says so in
+  **Last Sync Error**.
+- **Events only go to their owner's calendar.** An Event is pushed, patched or deleted in
+  Microsoft only when its owner is the user of the Microsoft Calendar it links to. Linking an
+  Event to somebody else's connection is refused on save, for System Managers too.
 - **Origin decides who wins.** An Event that originated in Frappe keeps
   `custom_pulled_from_microsoft = 0` for life: the pull refreshes its subject, times and
   location from Outlook but never overwrites its description (Graph only returns a truncated
@@ -129,7 +135,10 @@ than right ones. Open the event in Outlook for those.
 # Teams meeting transcripts and recordings
 
 Once a Teams meeting has finished, its transcript is **attached to the Event as a `.vtt` file**
-and its recordings are listed on the Event, ready to download.
+and its recordings are listed on the Event, ready to download. On a tenant that has speaker
+attribution switched off, Microsoft refuses the `.vtt`, and the app attaches the same transcript
+without speaker names as a `.txt` instead (see
+[troubleshooting](troubleshooting.md#speakerattributionnotallowed)).
 
 **Nothing is ready the moment a meeting ends.** Microsoft publishes no schedule for this: an
 ordinary meeting is usually ready in 5-30 minutes, a long or heavy one can take a few hours,
@@ -246,7 +255,11 @@ failed`, `535 5.7.3`, `invalid_grant` — with no clue which step was wrong.
   commands for app-only mailbox access, looking the service principal up by AppId rather
   than asking you to copy an Object ID — Microsoft's own documentation warns that copying
   the one from the App Registration page (instead of the Enterprise Application page) causes
-  authentication to fail with no useful error.
+  authentication to fail with no useful error. That lookup goes through Microsoft Graph
+  PowerShell (`Connect-MgGraph -Scopes Application.Read.All`), and Exchange's own record of the
+  app is found by AppId too, so a second site in the same tenant never picks up the wrong one.
+  Mailboxes must be plain addresses and every value is written as a single-quoted PowerShell
+  string, so nothing typed into the dialog can run as a command in the administrator's window.
 
 **The shared-mailbox identity conflict.** Microsoft requires the *shared mailbox address* in
 the IMAP XOAUTH2 string but the *signing-in user* for SMTP. Frappe sends `login_id or
@@ -264,7 +277,7 @@ Other apps depend on this app and call its utilities (they never re-implement Gr
 | Settings / liveness | `frappe_microsoft365.microsoft_graph.get_settings()` |
 | Authorize / callback / disconnect / test | `…doctype.microsoft_calendar.microsoft_calendar` → `authorize_access(calendar_name)`, `callback`, `test_connection(calendar_name)`, `disconnect(calendar_name)` |
 | Create a Teams meeting | `frappe_microsoft365.microsoft_meetings.create_meeting(calendar_name, subject, start_datetime, end_datetime, attendees=None, body=None, create_calendar_event=True)` → `{event_id, web_link, join_url, online_meeting_id}` |
-| Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt}` |
+| Transcripts for a join URL | `frappe_microsoft365.microsoft_transcripts.get_transcripts_for_join_url(calendar_name, join_url)` → `{online_meeting_id, transcripts, latest_vtt, latest_format}` (`latest_format` is `text/vtt`, or `application/vnd.microsoft.graph.transcript+text` when speaker attribution is off) |
 | Read calendar events | `frappe_microsoft365.microsoft_calendar_sync.fetch_events(calendar_name, start_datetime, end_datetime)` |
 | Reply to an invitation | `frappe_microsoft365.microsoft_rsvp.respond_to_event(event, response, comment=None, send_response=1)` — `response` is `accept`, `decline` or `tentative` |
 

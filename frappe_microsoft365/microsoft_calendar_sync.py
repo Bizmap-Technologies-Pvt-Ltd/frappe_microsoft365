@@ -450,6 +450,8 @@ def _sync_locked(doc):
 			pull_ok = False
 			messages.append(f"Pull failed: {e}")
 			frappe.log_error(title=f"MS Calendar pull failed: {calendar_name}")
+		if doc.flags.pull_warning:
+			messages.append(doc.flags.pull_warning)
 
 	if doc.push_to_microsoft_calendar:
 		try:
@@ -480,12 +482,17 @@ def _sync_locked(doc):
 	# meeting all over again. The watermark belongs with them.
 	frappe.db.commit()  # nosemgrep
 
+	summary = f"Pulled {pulled}, deleted {deleted}, pushed {pushed}."
+	if doc.flags.pull_unfinished:
+		# Not an error: a large calendar is read over several runs, and this says so.
+		summary += " " + _("More changes are waiting in Microsoft; the next sync carries on from here.")
+
 	return {
 		"ok": not messages,
 		"pulled": pulled,
 		"deleted": deleted,
 		"pushed": pushed,
-		"message": "; ".join(messages) or f"Pulled {pulled}, deleted {deleted}, pushed {pushed}.",
+		"message": "; ".join(messages) or summary,
 	}
 
 
@@ -503,7 +510,9 @@ def background_reasons(doc):
 
 	reasons = []
 	if doc.pull_from_microsoft_calendar:
-		if not doc.delta_link:
+		if doc.get("delta_next_link"):
+			reasons.append(_("The last sync stopped part-way through a large calendar and carries on from there."))
+		elif not doc.delta_link:
 			reasons.append(_("This is a first sync, so the whole calendar window is read."))
 		elif _delta_window_is_stale(doc):
 			reasons.append(_("The sync window has run out, so the calendar is read again in full."))
@@ -529,11 +538,9 @@ def _pending_push_count(doc):
 	The same filters as ``_push``, on purpose: an estimate that counts something other than what
 	the push actually does is worse than having no estimate at all.
 	"""
-	base_filters = {
-		"custom_sync_with_microsoft_calendar": 1,
-		"custom_microsoft_calendar": doc.name,
-		"custom_pulled_from_microsoft": 0,
-	}
+	if not doc.user:
+		return 0
+	base_filters = _push_filters(doc)
 	pending = frappe.db.count("Event", {**base_filters, "custom_microsoft_event_id": ["is", "not set"]})
 	if doc.last_sync:
 		pending += frappe.db.count(
@@ -549,34 +556,87 @@ def _pending_push_count(doc):
 
 # --- pull (Graph -> Frappe) ----------------------------------------------------------
 
-def _initial_delta_path():
-	start = _iso_utc(add_to_date(now_datetime(), days=-WINDOW_PAST_DAYS))
-	end = _iso_utc(add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS))
+def _initial_delta_path(now=None):
+	now = now or now_datetime()
+	start = _iso_utc(add_to_date(now, days=-WINDOW_PAST_DAYS))
+	end = _iso_utc(add_to_date(now, days=WINDOW_FUTURE_DAYS))
 	return (
 		f"/me/calendarView/delta?startDateTime={start}&endDateTime={end}"
 		f"&$select={EVENT_SELECT}"
 	)
 
 
-def _delta_window_is_stale(doc):
-	"""True when the stored delta window is close to its end and must be re-initialised."""
-	if not doc.delta_window_end:
+def _window_end_is_stale(window_end):
+	"""True when a delta window ending at ``window_end`` is too close to its end to keep using."""
+	if not window_end:
 		return True
 	margin = add_to_date(now_datetime(), days=WINDOW_REFRESH_MARGIN_DAYS)
-	return get_datetime(doc.delta_window_end) <= margin
+	return get_datetime(window_end) <= margin
+
+
+def _delta_window_is_stale(doc):
+	"""True when the stored delta window is close to its end and must be re-initialised."""
+	return _window_end_is_stale(doc.delta_window_end)
+
+
+def _has_resume_point_fields():
+	"""Whether this site has migrated the resume-point columns yet.
+
+	The sync is scheduled, so it can run between the code update and `bench migrate`. Writing a
+	column that does not exist yet would fail the whole pull; without it the pull simply behaves
+	as it did before — each run reads as far as the page cap allows.
+	"""
+	return frappe.get_meta("Microsoft Calendar").has_field("delta_next_link")
+
+
+def _start_of_pull(doc):
+	"""Where this run's pull starts: ``(path, round_window_end)``.
+
+	A *round* is one full delta read, from its first page to the page that carries the
+	deltaLink. A large calendar can take several runs to get through one, so where it stopped
+	is kept as a resume point and the next run carries on from there instead of starting over.
+
+	``round_window_end`` is set when the round re-initialises the window, and is the end of the
+	window it asked Graph for — stored as ``delta_window_end`` once the round completes. It is
+	None for an incremental round, which keeps the window the stored deltaLink already has.
+	"""
+	resume = doc.get("delta_next_link")
+	resume_window_end = doc.get("delta_next_window_end")
+	if resume:
+		if resume_window_end:
+			# Carrying on with a first read. Only worth it while that window is still good.
+			if not _window_end_is_stale(resume_window_end):
+				return resume, get_datetime(resume_window_end)
+		elif doc.delta_link and not _delta_window_is_stale(doc):
+			return resume, None
+
+	if doc.delta_link and not _delta_window_is_stale(doc):
+		return doc.delta_link, None
+	return _new_round()
+
+
+def _new_round():
+	now = now_datetime()
+	return _initial_delta_path(now), add_to_date(now, days=WINDOW_FUTURE_DAYS)
 
 
 def _pull(doc):
-	"""Pull changes from Microsoft into Frappe. Returns (upserted, deleted)."""
-	reuse_delta = doc.delta_link and not _delta_window_is_stale(doc)
-	path = doc.delta_link if reuse_delta else _initial_delta_path()
+	"""Pull changes from Microsoft into Frappe. Returns (upserted, deleted).
+
+	Reads at most graph.MAX_PAGES pages per run. When that is not enough the round is left
+	unfinished: the link to the next page is stored as the resume point and the next run
+	carries on from it, so a large calendar catches up over a few runs instead of re-reading
+	the same first pages forever. ``doc.flags.pull_unfinished`` tells the caller this happened.
+	"""
+	path, round_window_end = _start_of_pull(doc)
 
 	try:
-		items, delta_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
+		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 	except MsGraphResyncRequired:
-		# Token expired or the mailbox was moved: start the window again from scratch.
-		items, delta_link = graph.graph_delta(_initial_delta_path(), doc.name, headers=UTC_PREFER)
-		reuse_delta = False
+		# Token expired or the mailbox was moved: start the window again from scratch. A resume
+		# point belongs to the round Graph has just refused, so it goes with it.
+		path, round_window_end = _new_round()
+		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 
 	# One query per 500 events instead of one per event. Asking "do I already have this one?"
 	# separately for every incoming event meant 500 round trips for a 500-event page, all of
@@ -598,13 +658,45 @@ def _pull(doc):
 	finally:
 		frappe.flags.in_microsoft_sync = False
 
-	# Only store the new watermark once every page was consumed without raising. Without a
-	# delta link we simply redo this window next run, which repeats work but loses nothing.
+	resumable = _has_resume_point_fields()
+
+	# Only store the new watermark once every page of the round was consumed without raising.
+	# Until then the old deltaLink stays exactly as it was: a round that never finishes repeats
+	# work, but never skips any.
 	if delta_link:
 		updates = {"delta_link": delta_link}
-		if not reuse_delta:
-			updates["delta_window_end"] = add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS)
+		if round_window_end:
+			updates["delta_window_end"] = round_window_end
+		if resumable:
+			updates.update({"delta_next_link": None, "delta_next_window_end": None})
 		frappe.db.set_value("Microsoft Calendar", doc.name, updates, update_modified=False)
+	elif next_link and resumable:
+		if next_link == path:
+			# Graph handed back the very page this run started from, so carrying on from it would
+			# read the same pages forever. Said out loud rather than repeated in silence.
+			raise MsGraphError(
+				_("Microsoft returned the same page again, so the calendar read is not moving forward.")
+			)
+		frappe.db.set_value(
+			"Microsoft Calendar",
+			doc.name,
+			{"delta_next_link": next_link, "delta_next_window_end": round_window_end},
+			update_modified=False,
+		)
+		doc.flags.pull_unfinished = True
+	elif next_link:
+		# Not migrated yet: nowhere to keep the resume point, so a calendar this large cannot
+		# move past its first pages until the site is migrated. Reported, not hidden.
+		doc.flags.pull_warning = _(
+			"The calendar has more changes than one sync reads. Run bench migrate so the sync can "
+			"carry on where it stopped."
+		)
+	else:
+		# Graph ended the read with neither a next page nor a deltaLink. Nothing is lost — the
+		# next run reads the same changes again — but it can never move forward like this.
+		raise MsGraphError(
+			_("Microsoft ended the calendar read without a sync link, so the next run reads it again.")
+		)
 
 	return upserted, removed
 
@@ -903,13 +995,27 @@ def _apply(doc, values):
 
 # --- push (Frappe -> Graph) ----------------------------------------------------------
 
-def _push(doc):
-	"""Create new Frappe events in Microsoft and patch ones edited while offline."""
-	base_filters = {
+def _push_filters(doc):
+	"""The Events this calendar sends to Microsoft: its own user's, and nobody else's.
+
+	The owner is part of the filter because linking an Event to a calendar proves nothing about
+	who may write to it, and the scheduled push runs as Administrator — so without it, an Event
+	anyone linked to this calendar would be sent from this person's mailbox.
+	"""
+	return {
 		"custom_sync_with_microsoft_calendar": 1,
 		"custom_microsoft_calendar": doc.name,
 		"custom_pulled_from_microsoft": 0,
+		"owner": doc.user,
 	}
+
+
+def _push(doc):
+	"""Create new Frappe events in Microsoft and patch ones edited while offline."""
+	if not doc.user:
+		# A connection with no user has no owner whose Events it could send.
+		return 0
+	base_filters = _push_filters(doc)
 
 	count = 0
 	new_events = frappe.get_all(
@@ -1251,6 +1357,41 @@ def _create_graph_event(calendar_name, event):
 	)
 
 
+# --- whose calendar is it? -------------------------------------------------------------
+
+def _calendar_user(calendar_name):
+	"""The Frappe user a Microsoft Calendar belongs to, or None.
+
+	Read from the database rather than the document cache: this answers a permission question,
+	and a cached copy can lag a change of user by the rest of the request.
+	"""
+	if not calendar_name:
+		return None
+	return frappe.db.get_value("Microsoft Calendar", calendar_name, "user")
+
+
+def _event_owner(doc):
+	"""Who the Event belongs to, as stored — not whatever owner a client sent with the save.
+
+	On insert Frappe stamps the owner itself, so the value on the document is trustworthy. On
+	an update the document carries whatever the request sent, so the stored owner is used.
+	"""
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	return (before.owner if before else None) or doc.owner
+
+
+def _is_owners_calendar(owner, calendar_name):
+	"""True when ``calendar_name`` is the Microsoft Calendar of ``owner``.
+
+	An Event is only ever written to its owner's own mailbox. There is no exception for System
+	Managers: they can repair, re-authorise or disconnect any connection, but sending an Event
+	from somebody else's mailbox — with invitations going out in that person's name — is not
+	something any role is allowed to do.
+	"""
+	user = _calendar_user(calendar_name)
+	return bool(owner) and bool(user) and owner == user
+
+
 # --- doc_events (single Frappe Event lifecycle -> Graph) -----------------------------
 
 def event_validate(doc, method=None):
@@ -1271,6 +1412,9 @@ def event_validate(doc, method=None):
 		return
 	if not getattr(doc, "custom_sync_with_microsoft_calendar", 0):
 		return
+
+	_validate_calendar_owner(doc)
+
 	if not doc.starts_on or not doc.ends_on:
 		return
 
@@ -1281,6 +1425,32 @@ def event_validate(doc, method=None):
 			),
 			title=_("Check the times"),
 		)
+
+
+def _validate_calendar_owner(doc):
+	"""Refuse to link an Event to a Microsoft calendar that is not its owner's.
+
+	Frappe's Link check only proves the calendar exists, not that the person saving may write to
+	it; and Microsoft Calendar names are whatever their owners typed, so they are easy to guess.
+	Without this, anybody could have an Event created in a colleague's Outlook — invitations and
+	all, in the colleague's name.
+
+	Mirrors pulled from Microsoft are left alone: saving one never sends anything, and they
+	belong to the calendar's own user already.
+	"""
+	calendar_name = getattr(doc, "custom_microsoft_calendar", None)
+	if not calendar_name or getattr(doc, "custom_pulled_from_microsoft", 0):
+		return
+	if _is_owners_calendar(_event_owner(doc), calendar_name):
+		return
+	frappe.throw(
+		_(
+			"The Microsoft Calendar {0} does not belong to the owner of this event. An event can "
+			"only be synced with its owner's own Microsoft calendar."
+		).format(frappe.bold(calendar_name)),
+		frappe.PermissionError,
+		title=_("Not your Microsoft Calendar"),
+	)
 
 
 def event_on_update(doc, method=None):
@@ -1300,6 +1470,10 @@ def event_on_update(doc, method=None):
 	if not getattr(doc, "custom_microsoft_calendar", None):
 		return
 	if getattr(doc, "custom_pulled_from_microsoft", 0):
+		return
+	# Checked again after validate: other code can save an Event with ignore_validate, and this
+	# is the step that actually writes to someone's mailbox.
+	if not _is_owners_calendar(_event_owner(doc), doc.custom_microsoft_calendar):
 		return
 
 	try:
@@ -1342,6 +1516,10 @@ def patch_event_in_graph(event_name):
 		return
 	if doc.custom_pulled_from_microsoft or not doc.custom_microsoft_event_id:
 		return
+	# The job runs later and as whoever the worker runs as, so the save's own check proves
+	# nothing by now: the Event or the calendar may have changed hands in between.
+	if not _is_owners_calendar(doc.owner, doc.custom_microsoft_calendar):
+		return
 
 	# The guard on the doc_events side reads a flag that lives in the request that set it, and
 	# a worker has no such request: it starts with the flag unset. Setting it here keeps the
@@ -1382,6 +1560,13 @@ def event_on_trash(doc, method=None):
 		# whenever someone deleted the mirror in Frappe.
 		if not frappe.db.get_value("Microsoft Calendar", cal_name, "push_to_microsoft_calendar"):
 			return
+		# Only the owner's own Events are removed from their own calendar, and only when the
+		# owner is the one deleting. A Public Event can be deleted by anyone with Event access,
+		# and that must not reach into its owner's mailbox and cancel the meeting there; nor may
+		# a System Manager's delete, for the same reason. The Frappe record still goes — the
+		# Outlook event is simply left for its owner.
+		if frappe.session.user != doc.owner or not _is_owners_calendar(doc.owner, cal_name):
+			return
 		_queue_or_do_it_after_commit(
 			"frappe_microsoft365.microsoft_calendar_sync.delete_event_in_graph",
 			queue="short",
@@ -1392,12 +1577,13 @@ def event_on_trash(doc, method=None):
 			# somebody's Outlook, so this job only exists once the deletion is real.
 			calendar_name=cal_name,
 			ms_event_id=ms_id,
+			event_owner=doc.owner,
 		)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_trash sync failed: {doc.name}")
 
 
-def delete_event_in_graph(calendar_name, ms_event_id):
+def delete_event_in_graph(calendar_name, ms_event_id, event_owner=None):
 	"""Remove an event from Microsoft after its Frappe Event has been deleted.
 
 	Takes two plain ids and no document reference, because by the time a worker runs this the
@@ -1408,8 +1594,15 @@ def delete_event_in_graph(calendar_name, ms_event_id):
 	the meantime, and some other Event may have come to carry this same Microsoft id — deleting
 	it then would strand that mirror, and the next pull would delete it locally too, taking a
 	live meeting off both sides.
+
+	``event_owner`` is checked against the calendar's user once more, in case the connection
+	changed hands since the delete. A job with no owner — queued by an older version, before
+	this check existed — cannot be verified and does nothing: an Outlook event left behind can
+	be deleted by hand, a meeting cancelled in the wrong mailbox cannot be undone.
 	"""
 	if not calendar_name or not ms_event_id:
+		return
+	if not _is_owners_calendar(event_owner, calendar_name):
 		return
 
 	try:
@@ -1464,3 +1657,72 @@ def _check_owner(doc):
 		return
 	if doc.user and doc.user != frappe.session.user:
 		frappe.throw(_("You can only manage your own Microsoft Calendar."), frappe.PermissionError)
+
+
+# --- upgrade checks (read-only, run after migrate) -----------------------------------
+
+#: How many Event names each upgrade finding lists; the count covers the rest.
+UPGRADE_SAMPLE_SIZE = 10
+
+
+def upgrade_check_event_owners():
+	"""Events linked to a Microsoft Calendar that belongs to somebody other than their owner.
+
+	Since 1.1.1 an Event is only pushed, patched or deleted in its owner's own Microsoft
+	calendar, so these stop syncing and cannot be saved with sync ticked until they are
+	re-linked. Nothing is changed here: it reads, counts per calendar and names a few of them.
+	"""
+	from frappe_microsoft365 import doctor
+
+	if not frappe.db.table_exists("Microsoft Calendar") or not frappe.db.has_column(
+		"Event", "custom_microsoft_calendar"
+	):
+		return []
+
+	# Only Events that would ever reach Microsoft: ticked for sync, or already carrying an id —
+	# deleting one of those is a write to the mailbox even when sync was later unticked.
+	rows = frappe.db.sql(
+		"""
+		select e.name, e.owner, e.custom_microsoft_calendar as calendar, c.`user` as calendar_user
+		from `tabEvent` e
+		inner join `tabMicrosoft Calendar` c on c.name = e.custom_microsoft_calendar
+		where (e.custom_sync_with_microsoft_calendar = 1
+				or coalesce(e.custom_microsoft_event_id, '') != '')
+			and (coalesce(c.`user`, '') = '' or e.owner != c.`user`)
+		order by e.custom_microsoft_calendar, e.creation
+		""",
+		as_dict=True,
+	)
+
+	by_calendar = {}
+	for row in rows:
+		by_calendar.setdefault(row.calendar, {"user": row.calendar_user, "events": []})["events"].append(row)
+
+	findings = []
+	for calendar, group in by_calendar.items():
+		events = group["events"]
+		sample = ", ".join(
+			f"{row.name} ({row.owner or _('no owner')})" for row in events[:UPGRADE_SAMPLE_SIZE]
+		)
+		more = len(events) - UPGRADE_SAMPLE_SIZE
+		if more > 0:
+			sample += " " + _("and {0} more").format(more)
+		findings.append(
+			doctor.finding(
+				"upgrade.calendar_event_owner",
+				doctor.WARN,
+				_("{0} events on Microsoft Calendar {1} belong to someone else").format(len(events), calendar),
+				_(
+					"This connection belongs to {0}, but these events are owned by other users: {1}. "
+					"Events are now only synced with their owner's own Microsoft calendar, so these "
+					"no longer reach Outlook, are not deleted there, and cannot be saved with sync "
+					"ticked. Nothing was changed."
+				).format(group["user"] or _("no user"), sample),
+				_(
+					"Have each event's owner link it to their own Microsoft Calendar, or untick "
+					"Sync with Microsoft Calendar on it."
+				),
+				target=calendar,
+			)
+		)
+	return findings

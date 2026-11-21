@@ -26,6 +26,11 @@ frees disk space, which matters on hosted plans with a fixed quota (Frappe Cloud
      adding a row to the mapping's **Folders** table. Records nobody asked about keep their files on the
      server. Creating the folder also sends that record's existing attachments into it.
 
+   A record's folder is always its own. If a folder of that name is already there (two records
+   with the same title, names that become equal once cleaned, a deleted record whose folder was
+   kept), SharePoint gives the new one a free name such as `PRJ-2026-001 1` instead of handing
+   over the existing folder.
+
    Who may create folders is set per mapping in **Who can create folders**: empty means System
    Managers only; listed roles may too. Either way the user must be able to edit the record.
 
@@ -33,8 +38,10 @@ frees disk space, which matters on hosted plans with a fixed quota (Frappe Cloud
    records get theirs. To add one by hand, **Add Row**, pick the record and **Save**: the folder
    is created where the mapping says, or, with **Existing Folder** filled in, **a folder that
    already exists is linked**: paste its SharePoint address (from the browser or *Copy link*) or
-   its path in the library, e.g. `Projects/PRJ-0001`. Deleting a row removes only the link; the
-   folder and its files stay in SharePoint.
+   its path in the library, e.g. `Projects/PRJ-0001`. That is the only way an existing folder
+   becomes a record's folder, and a folder that is already another record's is refused. A row's
+   folder is set by the app: to point a record at another folder, delete its row and add a new
+   one. Deleting a row removes only the link; the folder and its files stay in SharePoint.
 3. When someone attaches a file to the record, a background job uploads it to that folder.
    The `File` row is then pointed at `/api/method/frappe_microsoft365.microsoft_files.open_file`.
    The attachment still opens from the form, previews, prints and emails as before, and the copy
@@ -51,6 +58,13 @@ frees disk space, which matters on hosted plans with a fixed quota (Frappe Cloud
 Nothing is ever deleted from SharePoint by default. Removing an attachment in Frappe leaves the
 SharePoint copy alone. **Remove from SharePoint when the attachment is deleted** changes that, and
 even then the file goes to the site's recycle bin. Deleting a record keeps its folder too.
+
+Where a File lives in SharePoint is the app's to say. The *Microsoft 365* fields on File and the
+`open_file` address cannot be set or changed through the form or the API (a copy of a moved
+attachment, which repeats them, is the exception), and the app only opens, reads or deletes an
+item that is in a record's folder. If a moved file's SharePoint copy is gone, a kept local copy is
+served only while it is still that file: same bytes as when it moved, or, for files moved before
+1.1.1, a disk name no other attachment has taken since.
 
 ### Options, site-wide and per DocType
 
@@ -124,13 +138,18 @@ asks for `Sites.ReadWrite.All`.
    *SharePoint Settings* gives one script for every mapped site.) For each site it runs:
 
    ```powershell
-   Connect-MgGraph -Scopes "Sites.FullControl.All"
-   $site = Get-MgSite -SiteId "contoso.sharepoint.com:/sites/Sales"
+   Connect-MgGraph -Scopes 'Sites.FullControl.All'
+   $site = Get-MgSite -SiteId 'contoso.sharepoint.com:/sites/Sales'
    New-MgSitePermission -SiteId $site.Id -BodyParameter @{
-       roles = @("write")
-       grantedToIdentities = @(@{ application = @{ id = "<client id>"; displayName = "Frappe" } })
+       roles = @('write')
+       grantedToIdentities = @(@{ application = @{ id = '<client id>'; displayName = 'Frappe' } })
    }
    ```
+
+   The client id is the *Application Access* registration's when one is set, since that is the
+   app SharePoint calls are made as, and the main registration's otherwise. Every value is
+   written as a single-quoted string, which PowerShell never expands, and the site address must
+   be on `<tenant>.sharepoint.com`.
 
 5. **Test** on the mapping (or *Troubleshoot → Test SharePoint Connection* on Microsoft Settings
    or SharePoint Settings, for all of them). It signs in as the app, resolves the site and library, and creates and
@@ -213,7 +232,7 @@ All Graph v1.0, application permission `Sites.Selected`:
 | Site by URL | `GET /sites/{hostname}:/{server-relative-path}` |
 | Libraries | `GET /sites/{site-id}/drives`, `GET /sites/{site-id}/drive` |
 | Item by path | `GET /drives/{drive-id}/root:/{path}:`, `GET /drives/{drive-id}/items/{id}:/{name}:` |
-| Create folder | `POST /drives/{drive-id}/items/{parent-id}/children` (`conflictBehavior: fail`) |
+| Create folder | `POST /drives/{drive-id}/items/{parent-id}/children` (`conflictBehavior: rename` for a record's folder, `fail` for base folders) |
 | Upload ≤ 4 MB | `PUT /drives/{drive-id}/items/{parent-id}:/{name}:/content?@microsoft.graph.conflictBehavior=rename` |
 | Upload > 4 MB | `POST …:/{name}:/createUploadSession`, then `PUT {uploadUrl}` in 320 KiB-multiple ranges, without a bearer token |
 | Download | `GET /drives/{drive-id}/items/{item-id}/content` (302 to a pre-authenticated URL) |

@@ -6,7 +6,18 @@ from frappe.model.document import Document
 
 
 class MicrosoftSettings(Document):
+	def onload(self):
+		from frappe_microsoft365 import upgrade
+
+		# The form points at the doctor when the last upgrade left something to look at.
+		report = upgrade.get_report()
+		if report:
+			self.set_onload(
+				"upgrade_report", {"version": report.get("version"), "count": len(report["findings"])}
+			)
+
 	def validate(self):
+		self._keep_upgrade_state()
 		# Surface the effective redirect URI so the admin can register it in Azure.
 		if not self.redirect_uri:
 			from frappe_microsoft365.microsoft_graph import get_redirect_uri
@@ -34,6 +45,7 @@ class MicrosoftSettings(Document):
 				)
 
 		self._reject_the_secret_id()
+		self._require_guid_client_ids()
 		self._drop_capabilities_that_lost_their_prerequisite()
 		self._refuse_capabilities_this_frappe_cannot_run()
 
@@ -51,6 +63,18 @@ class MicrosoftSettings(Document):
 			from frappe_microsoft365.microsoft_files import refresh_desk_boot
 
 			refresh_desk_boot()
+
+	def _keep_upgrade_state(self):
+		"""The upgrade report belongs to migrate, not to whoever saves this form.
+
+		A form opened before a migrate and saved after it would otherwise write the old report
+		back over the new one, and the fields are only read-only in the browser.
+		"""
+		from frappe_microsoft365 import upgrade
+
+		for field in (upgrade.VERSION_FIELD, upgrade.REPORT_FIELD):
+			if self.meta.has_field(field):
+				self.set(field, frappe.db.get_single_value(self.doctype, field, cache=False))
 
 	def _drop_capabilities_that_lost_their_prerequisite(self):
 		"""A capability that builds on another cannot work without it — transcripts, for one,
@@ -83,6 +107,19 @@ class MicrosoftSettings(Document):
 		for capability in capabilities.ticked(self):
 			if major and major < capability.min_frappe:
 				frappe.throw(capabilities.unmet(capability, self, major))
+
+	def _require_guid_client_ids(self):
+		"""Azure's Application (client) ID is always a GUID, so anything else is a paste error.
+
+		Checked here as well as when a setup script is generated, because the client id is
+		written into scripts a tenant administrator runs: only a value of the right shape may
+		ever reach one.
+		"""
+		from frappe_microsoft365.script_values import validate_client_id
+
+		for field, label in (("client_id", _("Client ID")), ("app_client_id", _("Application Client ID"))):
+			if (self.get(field) or "").strip():
+				self.set(field, validate_client_id(self.get(field), label))
 
 	def _reject_the_secret_id(self):
 		"""Azure shows a secret's Value and its Secret ID together, and only the Value works.

@@ -82,7 +82,19 @@ def _tenant_switch_hint():
 #: Asking for the attributed VTT from a tenant that does not allow attribution. Distinct from
 #: the tenant switch above: Graph access to transcripts is ON, the list call works, and only
 #: fetching the content fails — so the generic permission advice sends people nowhere.
+#:
+#: Graph puts this code in error.innerError, and the error text this app keeps carries only the
+#: outer code ("Forbidden") and the message. The message is therefore matched as well; Microsoft
+#: says it may change wording, which is why the content fetch below does not depend on either.
 SPEAKER_ATTRIBUTION = "SpeakerAttributionNotAllowed"
+SPEAKER_ATTRIBUTION_TEXT = "Speaker-attributed transcript content is disabled"
+
+#: The two content formats Graph serves. VTT carries `<v Speaker>` voice tags and may be chosen
+#: with $format or Accept. The plain-text one has the same timestamped lines without the names,
+#: can only be asked for with the Accept header ($format rejects it), and is never blocked by
+#: the speaker-attribution setting — which is what makes it the fallback.
+VTT_FORMAT = "text/vtt"
+PLAIN_TEXT_FORMAT = "application/vnd.microsoft.graph.transcript+text"
 
 
 def _speaker_attribution_hint():
@@ -95,7 +107,7 @@ def _speaker_attribution_hint():
 
 def _wrap_403(e, hint):
 	msg = str(e)
-	if SPEAKER_ATTRIBUTION in msg:
+	if _names_speaker_attribution(msg):
 		frappe.throw(
 			_speaker_attribution_hint(), MsGraphError, title=_("Speaker names are not allowed here")
 		)
@@ -149,29 +161,81 @@ def list_transcripts(calendar_name: str, online_meeting_id: str):
 	]
 
 
+def _names_speaker_attribution(msg):
+	return SPEAKER_ATTRIBUTION in msg or SPEAKER_ATTRIBUTION_TEXT in msg
+
+
+def _names_tenant_switch(msg):
+	return TENANT_SWITCH in msg or TENANT_SWITCH_TEXT in msg
+
+
+def _fetch_content(calendar_name, online_meeting_id, transcript_id, fmt):
+	"""One content request in one format. VTT goes by $format as it always has; the plain-text
+	format by the Accept header, the only way Graph accepts it."""
+	path = f"/me/onlineMeetings/{online_meeting_id}/transcripts/{transcript_id}/content"
+	if fmt == PLAIN_TEXT_FORMAT:
+		resp = graph.graph_request(
+			"GET", path, calendar_name, headers={"Accept": PLAIN_TEXT_FORMAT}, raw=True
+		)
+	else:
+		resp = graph.graph_request("GET", path, calendar_name, params={"$format": fmt}, raw=True)
+	return _decode(resp)
+
+
+def _decode(resp):
+	"""The body as text. Both formats are UTF-8 text, never JSON.
+
+	Not ``resp.text``: requests falls back to ISO-8859-1 for a text/* type without a charset and
+	guesses for the vendor plain-text type, and either turns a name like "Zoë" into mojibake.
+	"""
+	content = resp.content or b""
+	if isinstance(content, str):
+		return content
+	return content.decode("utf-8", errors="replace")
+
+
 @frappe.whitelist()
-def get_transcript_content(calendar_name: str, online_meeting_id: str, transcript_id: str, fmt: str = "text/vtt"):
-	"""Return the raw transcript content (VTT by default). Owner-checked."""
+def get_transcript_content(calendar_name: str, online_meeting_id: str, transcript_id: str, fmt: str = VTT_FORMAT):
+	"""Return a transcript's content, VTT by default. Owner-checked.
+
+	Returns {format, content}; ``format`` is what Microsoft actually sent, which is not always
+	what was asked for. A tenant that has speaker attribution off refuses VTT with
+	SpeakerAttributionNotAllowed and documents the way round it: ask again for the plain-text
+	format, which has the same timestamped lines without the speakers' names. Getting the words
+	without names beats getting nothing, so that retry happens here, once.
+
+	Any 403 on the VTT is retried, not only one whose text names the code: Graph keeps the code
+	in innerError, which the error text does not always carry. The tenant switch is the one 403
+	not worth a second request, because it refuses every format alike.
+	"""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
 	try:
-		resp = graph.graph_request(
-			"GET",
-			f"/me/onlineMeetings/{online_meeting_id}/transcripts/{transcript_id}/content",
-			calendar_name,
-			params={"$format": fmt},
-			raw=True,
-		)
+		content = _fetch_content(calendar_name, online_meeting_id, transcript_id, fmt)
+		return {"format": fmt, "content": content}
 	except MsGraphError as e:
+		msg = str(e)
+		refused = "403" in msg or "Forbidden" in msg
+		if fmt != VTT_FORMAT or not refused or _names_tenant_switch(msg):
+			_wrap_403(e, _transcript_perm_hint())
+
+	try:
+		content = _fetch_content(calendar_name, online_meeting_id, transcript_id, PLAIN_TEXT_FORMAT)
+	except MsGraphError as e:
+		# This refusal, not the VTT one, is explained: speaker attribution never blocks the
+		# plain-text format, so whatever stops it is the real reason, and naming attribution
+		# here would send someone to switch on a setting that would not help.
 		_wrap_403(e, _transcript_perm_hint())
-	return {"format": fmt, "content": resp.text}
+	return {"format": PLAIN_TEXT_FORMAT, "content": content}
 
 
 @frappe.whitelist()
 def get_transcripts_for_join_url(calendar_name: str, join_url: str):
-	"""Resolve a join URL -> online meeting, then list transcripts + fetch the latest VTT.
+	"""Resolve a join URL -> online meeting, then list transcripts + fetch the latest one.
 
-	Returns {online_meeting_id, transcripts:[...], latest_vtt}. Owner-checked.
+	Returns {online_meeting_id, transcripts:[...], latest_vtt, latest_format}. Owner-checked.
+	``latest_vtt`` keeps its name for existing callers, but on a tenant with speaker attribution
+	off it holds the plain-text transcript, and ``latest_format`` says which one it is.
 	"""
 	doc = frappe.get_doc("Microsoft Calendar", calendar_name)
 	_check_owner(doc)
@@ -183,25 +247,25 @@ def get_transcripts_for_join_url(calendar_name: str, join_url: str):
 		# /me/onlineMeetings path, which reads like the transcript permission failing.
 		_wrap_join_url_403(e)
 	if not online_meeting_id:
-		return {"online_meeting_id": None, "transcripts": [], "latest_vtt": None}
+		return {"online_meeting_id": None, "transcripts": [], "latest_vtt": None, "latest_format": None}
 
 	transcripts = list_transcripts(calendar_name, online_meeting_id)
-	latest_vtt = None
+	latest_vtt = latest_format = None
 	if transcripts:
 		latest = sorted(
 			transcripts, key=lambda t: t.get("created_date_time") or "", reverse=True
 		)[0]
 		try:
-			latest_vtt = get_transcript_content(
-				calendar_name, online_meeting_id, latest["id"]
-			).get("content")
+			fetched = get_transcript_content(calendar_name, online_meeting_id, latest["id"])
+			latest_vtt, latest_format = fetched.get("content"), fetched.get("format")
 		except Exception:
-			latest_vtt = None
+			latest_vtt = latest_format = None
 
 	return {
 		"online_meeting_id": online_meeting_id,
 		"transcripts": transcripts,
 		"latest_vtt": latest_vtt,
+		"latest_format": latest_format,
 	}
 
 

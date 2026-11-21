@@ -102,6 +102,10 @@ jobs:
           bench set-config -g redis_cache    redis://localhost:6379
           bench set-config -g redis_queue    redis://localhost:6379
           bench set-config -g redis_socketio redis://localhost:6379
+          # The runner's MariaDB client now requires TLS by default and the service container
+          # offers none. An option file covers every client call, including the ones Frappe
+          # makes itself when it creates a site.
+          printf '[client]\nskip-ssl\n' > ~/.my.cnf
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
@@ -129,18 +133,187 @@ jobs:
         working-directory: /home/runner/frappe-bench/sites
         shell: bash
         run: |
-          # Administrators paste this script into PowerShell; check it with PowerShell's own parser.
-          ../env/bin/python -c "
-          from frappe_microsoft365.doctor import powershell_for_site_grant
-          print(powershell_for_site_grant('APP-ID', ['https://c.sharepoint.com/sites/Sales', 'https://c.sharepoint.com/teams/Ops']), end='')
-          " > /tmp/site-grant.ps1
+          # Administrators paste these scripts into PowerShell; check them with PowerShell's own
+          # parser. hostile.ps1 holds a value built to break out of a string if quoting regresses.
+          ../env/bin/python - <<'EOF'
+          from frappe_microsoft365.doctor import powershell_for_app_only, powershell_for_site_grant
+          from frappe_microsoft365.script_values import ps_literal
+
+          app = "038b9c8e-2699-4858-b5f1-4f7a3d4077c4"
+          sites = ["https://c.sharepoint.com/sites/Sales", "https://c.sharepoint.com/teams/Ops"]
+          hostile = "x$(Get-Date)\"; `whoami` \u2019 ' ;"
+          scripts = {
+              "/tmp/site-grant.ps1": powershell_for_site_grant(app, sites),
+              "/tmp/exchange.ps1": powershell_for_app_only(app, mailboxes=["support@c.com", "o'brien@c.com"], send_as=True),
+              "/tmp/hostile.ps1": "$v = " + ps_literal(hostile) + "\n",
+              "/tmp/hostile.txt": hostile,
+          }
+          for path, text in scripts.items():
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+          EOF
           pwsh -NoProfile -Command '
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile("/tmp/site-grant.ps1", [ref]$null, [ref]$errors) | Out-Null
-            if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
-            "Site Grant Script parses"'
+            foreach ($f in "/tmp/site-grant.ps1", "/tmp/exchange.ps1", "/tmp/hostile.ps1") {
+              $errors = $null
+              $ast = [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errors)
+              if ($errors) { $errors | ForEach-Object { Write-Error "${f}: $($_.Message)" }; exit 1 }
+              # Nothing we generate is ever evaluated, so no $(...) may appear anywhere in it.
+              if ($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.SubExpressionAst] }, $true).Count) { Write-Error "${f} contains a subexpression"; exit 1 }
+              "${f} parses"
+            }
+            if ($ast.EndBlock.Statements[0].Right.Expression.Value -cne (Get-Content -Raw -Encoding utf8 /tmp/hostile.txt)) { Write-Error "hostile value not kept literally"; exit 1 }
+            "hostile value stays literal"'
 
       - name: Run tests
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site test_site set-config allow_tests true
+          bench --site test_site run-tests --app frappe_microsoft365
+
+  # Every real site gets a release by upgrading, with its data already in place. This job does
+  # exactly that: install the last release, give it the data a site has, check out this change,
+  # migrate, and check that nothing was lost, the patches did their job and the upgrade report
+  # was produced. Then the whole test suite runs on the upgraded site.
+  upgrade:
+    name: Frappe ${{ matrix.frappe-branch }} (upgrade from the last release)
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - frappe-branch: version-15
+            python-version: "3.10"
+            node-version: "18"
+          - frappe-branch: version-16
+            python-version: "3.14"
+            node-version: "24"
+
+    services:
+      mariadb:
+        image: mariadb:10.6
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mariadb-admin ping --host=localhost --password=root"
+          --health-interval=5s --health-timeout=2s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=2s --health-retries=10
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          # The whole history and its tags: the release to upgrade from is found among them.
+          fetch-depth: 0
+
+      # The newest release tag in this change's history whose version is below the version this
+      # change carries. Before a release commit that is the previous release; on the release
+      # commit itself (already tagged on main) it is still the one before, never itself.
+      - name: Find the release to upgrade from
+        id: base
+        run: |
+          current=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' frappe_microsoft365/__init__.py)
+          base=""
+          for tag in $(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname); do
+            version="${tag#v}"
+            if [ "$version" != "$current" ] && \
+               [ "$(printf '%s\n%s\n' "$version" "$current" | sort -V | head -n1)" = "$version" ]; then
+              base="$tag"
+              break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "::error::No release tag below ${current} in this branch's history"
+            exit 1
+          fi
+          echo "Upgrading ${base} -> ${current} (this change)"
+          echo "tag=${base}" >> "$GITHUB_OUTPUT"
+          # A name the bench's copy of the app can fetch: a pull request is checked out detached.
+          git tag -f ci-under-test HEAD
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client redis-tools libcups2-dev
+
+      - name: Install frappe-bench
+        run: pip install frappe-bench
+
+      - name: Init bench + Frappe
+        run: |
+          bench init --skip-redis-config-generation --skip-assets \
+            --frappe-branch ${{ matrix.frappe-branch }} --python "$(which python)" ~/frappe-bench
+
+      - name: Point bench at the CI services
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench set-config -g redis_cache    redis://localhost:6379
+          bench set-config -g redis_queue    redis://localhost:6379
+          bench set-config -g redis_socketio redis://localhost:6379
+          # The runner's MariaDB client now requires TLS by default and the service container
+          # offers none. An option file covers every client call, including the ones Frappe
+          # makes itself when it creates a site.
+          printf '[client]\nskip-ssl\n' > ~/.my.cnf
+          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
+          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
+
+      # get-app installs this change's Python dependencies; the app's code is then switched to
+      # the release. The install is editable, so a checkout is all it takes to change version.
+      - name: Install the last release on a new site
+        working-directory: /home/runner/frappe-bench
+        env:
+          CI: "Yes"
+        run: |
+          bench get-app --skip-assets frappe_microsoft365 "${GITHUB_WORKSPACE}"
+          git -C apps/frappe_microsoft365 fetch --force --tags "${GITHUB_WORKSPACE}"
+          git -C apps/frappe_microsoft365 checkout --detach "${{ steps.base.outputs.tag }}"
+          bench new-site test_site \
+            --mariadb-root-password root --admin-password admin \
+            --db-host 127.0.0.1 --db-port 3306 --mariadb-user-host-login-scope='%'
+          bench --site test_site install-app frappe_microsoft365
+          bench --site test_site migrate
+
+      - name: Seed the data a site running that release has
+        working-directory: /home/runner/frappe-bench/sites
+        run: ../env/bin/python "${GITHUB_WORKSPACE}/.github/upgrade/seed.py" test_site /tmp/upgrade-manifest.json
+
+      - name: Upgrade to this change
+        working-directory: /home/runner/frappe-bench
+        run: |
+          git -C apps/frappe_microsoft365 checkout --detach ci-under-test
+          bench --site test_site migrate | tee /tmp/migrate-1.log
+          # The report is printed once per release: the first migrate says something, whether or
+          # not there is anything to report.
+          grep -q "^Microsoft 365 " /tmp/migrate-1.log
+          # A second migrate must neither fail nor report (or notify) again.
+          bench --site test_site migrate | tee /tmp/migrate-2.log
+          if grep -q "^Microsoft 365 " /tmp/migrate-2.log; then
+            echo "::error::The second migrate reported again"
+            exit 1
+          fi
+
+      - name: Check data, patches and the upgrade report
+        working-directory: /home/runner/frappe-bench/sites
+        run: ../env/bin/python "${GITHUB_WORKSPACE}/.github/upgrade/assert_upgrade.py" test_site /tmp/upgrade-manifest.json
+
+      - name: Run tests on the upgraded site
         working-directory: /home/runner/frappe-bench
         run: |
           bench --site test_site set-config allow_tests true

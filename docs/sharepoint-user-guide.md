@@ -75,7 +75,7 @@ From **Overview**, note the **Application (client) ID** and the **Directory (ten
 - It must be under **Microsoft Graph**, as an **Application** permission. The SharePoint API lists a permission with the same name that does not work for this.
 - `Sites.Selected` on its own reaches no site. Step 4 grants the sites.
 
-**4. Grant the app each SharePoint site** it should use, with the role `write`. The ERP generates the script: open the mapping (next section) and click **Site Grant Script**, or copy the one for every mapped site from the **Site Grant Script** section of SharePoint Settings. Click **Copy**, paste it into a Microsoft Graph PowerShell window and press Enter, as a SharePoint or Global Administrator. Each line is a complete command, so it runs as pasted.
+**4. Grant the app each SharePoint site** it should use, with the role `write`. The ERP generates the script: open the mapping (next section) and click **Site Grant Script**, or copy the one for every mapped site from the **Site Grant Script** section of SharePoint Settings. Click **Copy**, paste it into a Microsoft Graph PowerShell window and press Enter, as a SharePoint or Global Administrator. Each line is a complete command, so it runs as pasted. If you use a separate *Application Access* registration (step 1), the script grants that one, since it is the app that makes the SharePoint calls; anyone who ran an older script against the main registration runs the new one once.
 
 Without PowerShell, use Graph Explorer: consent to `Sites.FullControl.All` for your own session, click **Reload**, then `GET /sites/<tenant>.sharepoint.com:/sites/<SiteName>` to get the site id, and `POST /sites/<site id>/permissions` with this request body:
 
@@ -103,7 +103,7 @@ Three places hold the configuration: **Microsoft Settings** for the connection, 
 
 | Option | Off (default) | On |
 | --- | --- | --- |
-| Keep a local copy after upload | The server copy is deleted once the file is in SharePoint, freeing disk space | Both copies are kept; useful while trialling. If the SharePoint copy disappears, the local one is served |
+| Keep a local copy after upload | The server copy is deleted once the file is in SharePoint, freeing disk space | Both copies are kept; useful while trialling. If the SharePoint copy disappears, the local one is served, as long as it is still the same file |
 | Also copy linked files into SharePoint | Attachments that are only a web link stay links | The linked file is downloaded once and archived in the record's folder; the link is kept |
 | Remove from SharePoint when the attachment is deleted | SharePoint keeps the file | The file goes to the site's recycle bin, where it can be restored |
 
@@ -159,7 +159,7 @@ After saving, use the buttons at the top of the mapping: **Test**, **Site Grant 
 - leave **Existing Folder** empty, and the folder is created where the mapping says; or
 - paste the address of a folder that already exists, from the browser or *Copy link* in SharePoint or Teams, or its path in the library such as `Projects/PROJ-0001`, to link it.
 
-The record's attachments still on the server then move into the folder. Each record can have one folder. Deleting a row and saving removes only the link: the folder and its files stay in SharePoint, and files already stored there keep opening.
+The record's attachments still on the server then move into the folder. Each record can have one folder, and a folder belongs to one record: linking a folder that is already another record's is refused. Deleting a row and saving removes only the link: the folder and its files stay in SharePoint, and files already stored there keep opening.
 
 **Check a file's status.** Open an attachment's File record and expand **Microsoft 365**:
 

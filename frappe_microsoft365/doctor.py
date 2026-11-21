@@ -152,8 +152,8 @@ def check_settings(settings):
 				WARN,
 				_("Tenant is set to '{0}'").format(tenant),
 				_(
-					"App-only (client credentials) access requires a specific tenant id. "
-					"'{0}' works for interactive sign-in only."
+					"App-only (client credentials) access requires a specific tenant id, and so does "
+					"Sign in with Microsoft: with '{0}', accounts from any organisation are accepted."
 				).format(tenant),
 				_("Use the Directory (tenant) ID from the Azure app registration Overview page."),
 				MS_OAUTH_DOC,
@@ -340,6 +340,8 @@ def check_credentials(settings):
 			)
 		)
 
+	out += _check_app_access_credentials(settings)
+
 	redirect = (settings.get("redirect_uri") or "").strip()
 	if redirect and CALLBACK_METHOD.rsplit(".", 1)[-1] not in redirect:
 		out.append(
@@ -352,6 +354,57 @@ def check_credentials(settings):
 			)
 		)
 
+	return out
+
+
+def _check_app_access_credentials(settings):
+	"""The optional Application access registration, which SharePoint calls are made as.
+
+	Its secret is checked as carefully as the main one: with a client id and no secret every
+	SharePoint call fails, and the Secret ID pasted for the Value fails the same way it does on
+	the main registration — only later, and on a background job nobody is watching.
+	"""
+	out = []
+	app_client_id = (settings.get("app_client_id") or "").strip()
+	app_secret = (settings.get("app_client_secret") or "").strip()
+	if not app_client_id:
+		return out
+
+	if not looks_like_guid(app_client_id):
+		out.append(
+			finding(
+				"settings.app_client_id_shape",
+				FAIL,
+				_("The Application access Client ID is not a GUID"),
+				_("Found: {0}").format(app_client_id),
+				_("Copy Application (client) ID from that app registration's Overview page."),
+			)
+		)
+
+	if not (app_secret or settings.get("has_app_client_secret")):
+		out.append(
+			finding(
+				"settings.app_client_secret",
+				FAIL,
+				_("Application access has a Client ID but no client secret"),
+				_("Every call made as the app, such as SharePoint document storage, is refused until it has one."),
+				_("Create a secret on that app registration and paste its Value into Application Client Secret Value."),
+			)
+		)
+	elif app_secret and not MASKED.match(app_secret) and looks_like_guid(app_secret):
+		out.append(
+			finding(
+				"settings.app_secret_is_the_id",
+				FAIL,
+				_("The Application Client Secret looks like the Secret ID"),
+				_("A GUID was entered, and a secret value is never a GUID."),
+				_(
+					"In Azure, Certificates & secrets shows Value next to Secret ID. Copy the "
+					"Value column, creating a new secret if it is no longer shown."
+				),
+				MS_OAUTH_DOC,
+			)
+		)
 	return out
 
 
@@ -636,7 +689,6 @@ def check_social_login_key(key, settings=None):
 	out = []
 	settings = settings or {}
 	name = key.get("name") or "Office 365"
-	tenant = (settings.get("tenant_id") or "").strip()
 
 	if not key.get("enable_social_login"):
 		out.append(
@@ -663,24 +715,12 @@ def check_social_login_key(key, settings=None):
 			)
 		)
 
+	out += check_sign_in_tenant(key, settings)
+
 	for field, label in (("authorize_url", _("authorize")), ("access_token_url", _("token"))):
 		uri = (key.get(field) or "").strip()
 		if not uri:
 			continue
-
-		# Frappe's built-in Office 365 provider ships /common/ + v1.0 endpoints, which
-		# cannot work with a single-tenant app registration.
-		if "/common/" in uri and tenant and tenant.lower() not in ("common", "organizations"):
-			out.append(
-				finding(
-					f"sso.tenant_{field}",
-					FAIL,
-					_("Sign-in {0} URL points at /common/").format(label),
-					_("Your app is registered in tenant {0}, not the shared endpoint.").format(tenant),
-					_("Use https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(tenant),
-					target=name,
-				)
-			)
 		if "/oauth2/v2.0/" not in uri:
 			out.append(
 				finding(
@@ -692,6 +732,67 @@ def check_social_login_key(key, settings=None):
 					target=name,
 				)
 			)
+
+	return out
+
+
+def check_sign_in_tenant(key, settings=None):
+	"""Can accounts from another organisation's directory sign in? Pure.
+
+	``key``: dict of name, authorize_url, access_token_url. ``settings``: dict with tenant_id.
+
+	Frappe signs in whoever has the email address in Microsoft's ID token. On a multi-tenant
+	authority that token can come from any directory, whose owner picks its users' addresses,
+	so sign-in has to name the organisation's own directory — in Tenant ID and in the URLs.
+	Frappe's built-in Office 365 provider ships /common/ URLs, so a record made by hand is
+	usually open in exactly this way.
+	"""
+	from frappe_microsoft365 import sign_in
+
+	out = []
+	settings = settings or {}
+	name = key.get("name") or "Office 365"
+	tenant = (settings.get("tenant_id") or "").strip()
+	single = sign_in.is_single_tenant(tenant)
+
+	if not single:
+		out.append(
+			finding(
+				"sso.multi_tenant",
+				FAIL,
+				_("Microsoft sign-in accepts accounts from any organisation"),
+				_(
+					"Tenant ID is '{0}', which does not name your directory, so an account in "
+					"another organisation's directory with the same email address as one of your "
+					"users could sign in as them. Sign-in keeps working for now; from version 1.2.0 "
+					"it is refused until this is fixed."
+				).format(tenant or "common"),
+				_(
+					"Set Tenant ID in Microsoft Settings to the Directory (tenant) ID from the app "
+					"registration's Overview page, make the registration single-tenant, and point "
+					"the Social Login Key's URLs at https://login.microsoftonline.com/<tenant id>/oauth2/v2.0/..."
+				),
+				MS_OAUTH_DOC,
+				target=name,
+			)
+		)
+
+	for field, label in (("authorize_url", _("authorize")), ("access_token_url", _("token"))):
+		segment = sign_in.authority_tenant(key.get(field))
+		if segment is None or segment.lower() not in sign_in.MULTI_TENANT:
+			continue
+		out.append(
+			finding(
+				f"sso.tenant_{field}",
+				FAIL,
+				_("Sign-in {0} URL points at /{1}/").format(label, segment or "common"),
+				_("That endpoint signs in accounts from any organisation's directory, not only yours."),
+				_("Use https://login.microsoftonline.com/{0}/oauth2/v2.0/...").format(
+					tenant if single else "<tenant id>"
+				),
+				target=name,
+			)
+		)
 
 	return out
 
@@ -852,13 +953,15 @@ def error_patterns():
 		# listing succeeds — the switch is already on — so every generic transcript rule below
 		# would send somebody to fix something that is not broken. A literal code, so unlike
 		# those it can never swallow a match that belongs to the rule above it.
-		r"SpeakerAttributionNotAllowed",
+		# Graph keeps the code in innerError, so the message Microsoft sends with it is matched
+		# too: that is the part of the error this app's messages actually carry.
+		r"SpeakerAttributionNotAllowed|Speaker-attributed transcript content is disabled",
 		_("Speaker attribution is off for this tenant"),
 		_(
-			"The transcript is fetched in the attributed format, which this tenant does not "
-			"allow. Teams admin center > Meetings > Meeting settings > Transcript API access > "
-			"Configure > Include speaker attribution On. Listing transcripts keeps working "
-			"without it; only fetching the text fails."
+			"This tenant does not allow speaker names in transcripts, so the app falls back to "
+			"a plain-text .txt transcript without them. For names, in the Teams admin center: "
+			"Meetings > Meeting settings > Transcript API access > Configure > Include speaker "
+			"attribution On."
 		),
 	),
 	(
@@ -1370,28 +1473,39 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 	needs someone who can manage the sites (SharePoint admin or Sites.FullControl.All), which
 	is deliberately not this app.
 
+	``client_id`` is the registration that makes the SharePoint calls: the Application access
+	one when it is set (see site_grant_client_id). Granting any other leaves every upload at 403.
+
 	Pasted, not saved as a file: one complete statement per line, and a line break at the end.
 	A line ending inside @{ ... } leaves a PowerShell window at ">>" waiting for the rest, and
 	a last line without a line break is never run.
-	"""
-	from frappe_microsoft365.microsoft_files import parse_site_url
 
+	A SharePoint administrator runs this with far more rights than whoever saved the values in
+	it, so every value is checked again here and written as a single-quoted, never-expanded
+	string.
+	"""
+	from frappe_microsoft365.script_values import ps_literal, validate_client_id, validate_site_url
+
+	if client_id:
+		client_id = validate_client_id(client_id)
 	lines = [
 		"# Grants the Frappe app access to the SharePoint sites in this site's SharePoint Mappings.",
 		"# Run as a SharePoint or Global administrator. Requires: Install-Module Microsoft.Graph.Sites",
-		'Connect-MgGraph -Scopes "Sites.FullControl.All"',
-		f'$appId = "{client_id or "<client id>"}"',
+		"Connect-MgGraph -Scopes 'Sites.FullControl.All'",
+		f"$appId = {ps_literal(client_id or '<client id>')}",
 		"",
 	]
 	for url in site_urls:
-		host, path = parse_site_url(url)
+		host, path = validate_site_url(url)
 		site_ref = f"{host}:{path}" if path else host
 		lines += [
-			f"# {url}",
-			f'$site = Get-MgSite -SiteId "{site_ref}"',
+			# The validated site, not the pasted text: whatever followed it in the address bar
+			# has no business in a script, not even in a comment.
+			f"# https://{host}{path}",
+			f"$site = Get-MgSite -SiteId {ps_literal(site_ref)}",
 			"New-MgSitePermission -SiteId $site.Id -BodyParameter @{ "
-			f'roles = @("{role}"); '
-			'grantedToIdentities = @(@{ application = @{ id = $appId; displayName = "Frappe" } }) }',
+			f"roles = @({ps_literal(role)}); "
+			"grantedToIdentities = @(@{ application = @{ id = $appId; displayName = 'Frappe' } }) }",
 			"",
 		]
 	lines += [
@@ -1399,6 +1513,15 @@ def powershell_for_site_grant(client_id, site_urls, role="write"):
 		"Get-MgSitePermission -SiteId $site.Id | Format-List Roles, GrantedToIdentities",
 	]
 	return "\n".join(lines) + "\n"
+
+
+def site_grant_client_id(settings):
+	"""The registration the Site Grant Script must name: the one SharePoint calls are made as.
+
+	Mirrors microsoft_graph.app_credentials, which uses the Application access registration when
+	its client id is filled in and the main one otherwise.
+	"""
+	return (settings.get("app_client_id") or "").strip() or (settings.get("client_id") or "").strip()
 
 
 # --- Exchange PowerShell for app-only access ------------------------------------------
@@ -1409,44 +1532,66 @@ def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None
 	Microsoft's biggest documented trap: New-ServicePrincipal wants the Object ID from the
 	ENTERPRISE APPLICATION blade, not the one shown on the App Registration page. Using the
 	wrong one fails at authentication time with no useful message, so the generated script
-	looks it up by AppId instead of asking anyone to copy it.
+	looks it up by AppId instead of asking anyone to copy it. That lookup is a Microsoft Graph
+	call, so the script signs in to Graph as well as to Exchange Online.
+
+	Every value is validated and written as a single-quoted string: the Exchange administrator
+	who pastes this runs it with their own rights.
 	"""
-	mailboxes = mailboxes or []
+	from frappe_microsoft365.script_values import ps_literal, validate_client_id, validate_mailbox
+
+	if client_id:
+		client_id = validate_client_id(client_id)
+	if enterprise_object_id:
+		enterprise_object_id = validate_client_id(enterprise_object_id, _("Enterprise application Object ID"))
+	mailboxes = [validate_mailbox(m) for m in mailboxes or []]
+	targets = [ps_literal(m) for m in mailboxes] or [ps_literal("<shared@yourdomain.com>")]
+
 	lines = [
-		"# Run in Exchange Online PowerShell as a tenant admin.",
+		"# Run in PowerShell as a tenant admin.",
 		"Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser",
+	]
+	if not enterprise_object_id:
+		lines.append("Install-Module -Name Microsoft.Graph.Applications -Scope CurrentUser")
+	lines += [
 		"Import-Module ExchangeOnlineManagement",
 		"Connect-ExchangeOnline",
+	]
+	if not enterprise_object_id:
+		lines.append("Connect-MgGraph -Scopes 'Application.Read.All'")
+	lines += [
 		"",
 		"# Look the service principal up by AppId so the correct (Enterprise Application)",
 		"# Object ID is used — copying the App Registration one causes silent auth failures.",
-		f'$appId = "{client_id or "<CLIENT_ID>"}"',
+		f"$appId = {ps_literal(client_id or '<CLIENT_ID>')}",
 	]
 
 	if enterprise_object_id:
-		lines.append(f'$objectId = "{enterprise_object_id}"')
+		lines.append(f"$objectId = {ps_literal(enterprise_object_id)}")
 	else:
 		lines += [
-			"$sp = Get-MgServicePrincipal -Filter \"appId eq '$appId'\"   # or Get-AzureADServicePrincipal",
+			"$sp = Get-MgServicePrincipal -Filter \"appId eq '$appId'\"",
 			"$objectId = $sp.Id",
 		]
 
 	lines += [
 		"",
-		"New-ServicePrincipal -AppId $appId -ObjectId $objectId -DisplayName \"Frappe mail access\"",
-		"$exoSp = Get-ServicePrincipal -Identity \"Frappe mail access\"",
+		"# Exchange's own record of the app, found by AppId: a display name is shared by every site",
+		"# in the tenant that ran this script. Created only if an earlier run has not done so.",
+		"$exoSp = Get-ServicePrincipal -Identity $appId -ErrorAction SilentlyContinue",
+		"if (-not $exoSp) { $exoSp = New-ServicePrincipal -AppId $appId -ObjectId $objectId -DisplayName 'Frappe mail access' }",
 		"",
 		"# Grant only the mailboxes this app should ever read. Access is scoped per mailbox,",
 		"# so the app cannot reach anything not listed here.",
 	]
 
-	for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+	for mailbox in targets:
 		lines.append(
-			f'Add-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity -AccessRights FullAccess'
+			f"Add-MailboxPermission -Identity {mailbox} -User $exoSp.Identity -AccessRights FullAccess"
 		)
 		if send_as:
 			lines.append(
-				f'Add-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+				f"Add-RecipientPermission -Identity {mailbox} -Trustee $exoSp.Identity "
 				f"-AccessRights SendAs -Confirm:$false"
 			)
 
@@ -1459,19 +1604,20 @@ def powershell_for_app_only(client_id, enterprise_object_id=None, mailboxes=None
 			"# TO UNDO. Removes the application's access again; run as a tenant admin.",
 			"# " + "-" * 72,
 		]
-		for mailbox in mailboxes or ["<shared@yourdomain.com>"]:
+		for mailbox in targets:
 			if send_as:
 				lines.append(
-					f'# Remove-RecipientPermission -Identity "{mailbox}" -Trustee $exoSp.Identity '
+					f"# Remove-RecipientPermission -Identity {mailbox} -Trustee $exoSp.Identity "
 					f"-AccessRights SendAs -Confirm:$false"
 				)
 			lines.append(
-				f'# Remove-MailboxPermission -Identity "{mailbox}" -User $exoSp.Identity '
+				f"# Remove-MailboxPermission -Identity {mailbox} -User $exoSp.Identity "
 				f"-AccessRights FullAccess -Confirm:$false"
 			)
 		lines.append("# Remove-ServicePrincipal -Identity $exoSp.Identity   # revokes it everywhere")
 
-	return "\n".join(lines)
+	# Pasted, not saved as a file: a last line without a line break is never run.
+	return "\n".join(lines) + "\n"
 
 
 # --- collectors -----------------------------------------------------------------------
@@ -1481,6 +1627,11 @@ def _settings_config():
 	secret = get_decrypted_password(
 		"Microsoft Settings", "Microsoft Settings", "client_secret", raise_exception=False
 	)
+	app_secret = None
+	if settings.get("app_client_id"):
+		app_secret = get_decrypted_password(
+			"Microsoft Settings", "Microsoft Settings", "app_client_secret", raise_exception=False
+		)
 	return {
 		"enabled": settings.enabled,
 		"tenant_id": settings.tenant_id,
@@ -1499,6 +1650,9 @@ def _settings_config():
 		"default_scopes": settings.get("default_scopes") or "",
 		"authorized_scopes": settings.get("authorized_scopes") or "",
 		"use_files": settings.get("use_files"),
+		"app_client_id": settings.get("app_client_id") or "",
+		"app_client_secret": app_secret,
+		"has_app_client_secret": bool(app_secret),
 	}
 
 
@@ -1630,6 +1784,16 @@ def run_diagnostics():
 					_("Use Set Up on Microsoft Settings to create the Social Login Key."),
 				)
 			)
+	elif frappe.db.exists("Social Login Key", {"social_login_provider": "Office 365"}):
+		# Sign-in not ticked, but a Microsoft sign-in record exists anyway — typically one made
+		# by hand before this app. Whether it lets other organisations in still matters.
+		key = frappe.db.get_value(
+			"Social Login Key",
+			{"social_login_provider": "Office 365"},
+			["name", "authorize_url", "access_token_url"],
+			as_dict=True,
+		)
+		findings += check_sign_in_tenant(key, settings)
 
 	if wants_mail and not oauth_accounts:
 		findings.append(
@@ -1649,7 +1813,18 @@ def run_diagnostics():
 		)
 
 	counts = {status: len([f for f in findings if f["status"] == status]) for status in (PASS, WARN, FAIL, SKIP)}
-	return {"findings": findings, "counts": counts, "checked_connected_apps": sorted(checked_apps)}
+
+	# What the last upgrade found, shown above everything else until an admin dismisses it.
+	# Kept out of findings and counts: it describes the upgrade, not the configuration as it is
+	# now, and it must not hide the "No configuration problems found" line.
+	from frappe_microsoft365 import upgrade
+
+	return {
+		"findings": findings,
+		"counts": counts,
+		"checked_connected_apps": sorted(checked_apps),
+		"upgrade_report": upgrade.get_report(),
+	}
 
 
 @frappe.whitelist()
@@ -1732,4 +1907,4 @@ def site_grant_powershell(mapping: str | None = None):
 			urls.append(url)
 	if not urls:
 		frappe.throw(_("Create a SharePoint Mapping with a SharePoint site first."))
-	return {"script": powershell_for_site_grant(settings.client_id, urls), "sites": urls}
+	return {"script": powershell_for_site_grant(site_grant_client_id(settings), urls), "sites": urls}

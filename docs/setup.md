@@ -42,9 +42,12 @@ all, both follow from it.
 `entra.microsoft.com → Entra ID → App registrations → New registration`
 
 - **Name:** anything you will recognise later, e.g. `Frappe Microsoft 365`.
-- **Supported account types:** *Accounts in this organizational directory only* unless people from
-  other Microsoft work/school tenants have to connect. Personal Microsoft accounts cannot use the
-  Teams or transcript permissions at all.
+- **Supported account types:** *Accounts in this organizational directory only*. **Sign in with
+  Microsoft requires it**: on a multi-tenant authority any organisation's directory can vouch for
+  an email address that matches one of your users, so Set Up will not create the sign-in record
+  unless **Tenant ID** names your directory (its GUID, or a domain such as
+  `contoso.onmicrosoft.com`). Invite people from other organisations as guests instead. Personal
+  Microsoft accounts cannot use the Teams or transcript permissions at all.
 - Leave the redirect URI blank — it is the next step.
 
 Afterwards, from the app's **Overview** page, copy **Application (client) ID** and **Directory
@@ -129,14 +132,20 @@ every permission granted and consented still gets:
 ```
 
 Turn **Microsoft Graph access** **On**. Then select **Configure** and turn **Include speaker
-attribution** **On** if you want speaker names in the VTT — that one is off by default too, and
-without it the transcript is text with nobody's name against it.
+attribution** **On** if you want speaker names in the transcript — that one is off by default too.
+Without it Microsoft will not hand over the `.vtt`, and the app attaches the same transcript as a
+`.txt` with nobody's name against it.
 
-The PowerShell equivalent, if you would rather not click:
+The PowerShell equivalent, if you would rather not click. Update the MicrosoftTeams module first
+(`Update-Module MicrosoftTeams`, or `Install-Module MicrosoftTeams` if it is not installed): these
+two parameters are recent, and an older module may not know them.
 
 ```powershell
-Set-CsTeamsMeetingConfiguration -EnableGraphTranscriptAccess true -EnableAttributedTranscripts true -Identity Global
+Connect-MicrosoftTeams
+Set-CsTeamsMeetingConfiguration -Identity Global -EnableGraphTranscriptAccess $true -EnableAttributedTranscripts $true
 ```
+
+Both parameters are Booleans, so they take `$true`; a bare `true` is refused.
 
 There is no request-side workaround and re-granting consent does nothing, which is why both the
 error message and the doctor name this switch specifically rather than blaming permissions.
@@ -256,8 +265,10 @@ survives untouched. Running Set Up twice does nothing the second time.
 Two details it gets right that are easy to miss by hand:
 
 - Frappe's built-in Office 365 sign-in provider defaults to the `/common/` authority and the
-  **v1.0** endpoints, neither of which works with a single-tenant app registration. Provisioning
-  writes tenant-specific v2.0 endpoints instead.
+  **v1.0** endpoints. `/common/` lets any organisation's directory sign people in, and v1.0 does
+  not work with a single-tenant registration. Provisioning writes tenant-specific v2.0 endpoints
+  instead, and refuses to create the sign-in record at all while Tenant ID is `common`,
+  `organizations` or `consumers`.
 - The `Connected App` redirect URI is computed by Frappe from the record name, so it is a
   *different* endpoint from this app's callback and cannot be known before the record exists.
   Azure needs **both** registered; the doctor prints the exact URI to add. A missing one shows

@@ -148,10 +148,16 @@ removed. `bench uninstall-app --dry-run` reports what would happen and changes n
 
 ## Which Frappe and ERPNext versions does it work with?
 
-Frappe v15 and v16, from one codebase. Nothing is version-gated, and CI does a real install,
-migrate and full test run against **both** on every push and pull request. Use
-`--branch version-15` or `--branch version-16` if you follow the Frappe convention; `main` is
-the source of truth and works for either. The API-by-API evidence is in
+Frappe v15 and v16, from one codebase, with one exception: **SharePoint document storage needs
+Frappe v16**, and Microsoft Settings refuses the tickbox on v15. Calendar sync, Teams meetings,
+transcripts and recordings, Outlook mail and Sign in with Microsoft work on both. On v15, Microsoft
+sign-in relies on Frappe 15's own OAuth `state` handling; v16 validates the `state` server-side.
+
+CI does a real install, migrate, asset build and full test run against **both** on every push and
+pull request. Use `--branch version-15` or `--branch version-16` if you follow the Frappe
+convention; `main` is the source of truth and works for either. After installing or updating, run
+`bench build --app frappe_microsoft365` (`bench update` does it) — the desk scripts are built
+bundles. The feature table and the API-by-API evidence are in
 [`compatibility.md`](compatibility.md).
 
 ## Does it need ERPNext?

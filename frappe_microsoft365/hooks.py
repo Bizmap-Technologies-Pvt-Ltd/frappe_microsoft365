@@ -21,6 +21,18 @@ has_permission = {
 after_install = "frappe_microsoft365.setup.after_install"
 after_migrate = "frappe_microsoft365.setup.after_migrate"
 
+# Read-only checks run after `bench migrate`; their findings form the upgrade report.
+# Keyed by the release that introduced them; see upgrade.py.
+microsoft365_upgrade_checks = {
+	"1.1.1": [
+		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_event_owners",
+		"frappe_microsoft365.sign_in.upgrade_check",
+		"frappe_microsoft365.script_values.upgrade_check",
+		"frappe_microsoft365.microsoft_files.upgrade_check_file_items",
+		"frappe_microsoft365.microsoft_files.upgrade_check_shared_folders",
+	],
+}
+
 doc_events = {
 	"Event": {
 		"validate": "frappe_microsoft365.microsoft_calendar_sync.event_validate",
@@ -30,6 +42,9 @@ doc_events = {
 	# SharePoint document storage. Each handler returns at once unless Document Storage is on
 	# and the document's DocType is mapped, so the "*" entries cost one cached read.
 	"File": {
+		# Not gated on the capability: Files already in SharePoint keep opening after it is
+		# switched off, so their fields stay protected too.
+		"validate": "frappe_microsoft365.microsoft_files.on_file_validate",
 		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
 		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
 	},
@@ -51,6 +66,11 @@ boot_session = "frappe_microsoft365.microsoft_files.boot_session"
 
 # Old /files and /private/files links of attachments that moved to SharePoint redirect to them.
 before_request = ["frappe_microsoft365.microsoft_files.redirect_moved_file"]
+
+# Sign in with Microsoft accepts only accounts from the directory in Microsoft Settings. Frappe 16
+# calls this before the session is created; Frappe 15 has no such hook and never calls it.
+on_social_login = ["frappe_microsoft365.sign_in.on_social_login"]
+
 
 scheduler_events = {
 	"cron": {
@@ -328,4 +348,3 @@ before_uninstall = "frappe_microsoft365.uninstall.before_uninstall"
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-
