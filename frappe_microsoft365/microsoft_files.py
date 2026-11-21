@@ -1935,6 +1935,10 @@ def follow_attachment(file_name, old_doctype, old_name, in_job=False):
 	and bringing it back to this server when its new record has no SharePoint folder to go to all
 	transfer the bytes, so they run as a background job (in_job).
 	"""
+	if not files_enabled():
+		# Storage switched off: nothing moves or comes back until it is on again; the 1.1.2
+		# check (assert_app_item) still keeps the item to readers of the folder's record.
+		return
 	file_doc = frappe.get_doc("File", file_name)
 	drive_id = file_doc.get("custom_microsoft_drive_id")
 	item_id = file_doc.get("custom_microsoft_item_id")
@@ -1996,11 +2000,11 @@ def follow_attachment(file_name, old_doctype, old_name, in_job=False):
 
 def _folder_to_follow_into(file_doc):
 	"""The folder a re-attached File's item belongs in now, or None when its new record has none
-	to give: an unmapped DocType, storage switched off, a field attachment (those stay on this
+	to give: an unmapped DocType, a field attachment (those stay on this
 	server, see _eligible), or an On demand record nobody asked a folder for. Creating the folder
 	commits (see ensure_folder)."""
 	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
-	if not (files_enabled() and doctype and name) or file_doc.attached_to_field:
+	if not (doctype and name) or file_doc.attached_to_field:
 		return None
 	row = mapping_for(doctype)
 	if not row or (is_on_demand(row) and not get_folder(doctype, name)):

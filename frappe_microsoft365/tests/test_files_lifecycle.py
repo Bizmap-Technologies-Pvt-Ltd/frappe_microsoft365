@@ -785,6 +785,14 @@ class TestReattachedFileMoves(FilesTestCase):
 		doc.save()
 		self.assertEqual(fake.calls, [])
 
+	def test_nothing_moves_while_storage_is_off(self):
+		fake = network(self, self.answer)
+		with patch.object(files, "files_enabled", return_value=False):
+			self.reattach("Note", "unmapped")
+			files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
+		self.assertEqual(fake.calls, [])
+		self.assertEqual(frappe.db.get_value("File", self.file.name, "custom_microsoft_status"), files.STORED)
+
 
 # --- B30: get_content never reads a huge file into memory -------------------------------------
 
