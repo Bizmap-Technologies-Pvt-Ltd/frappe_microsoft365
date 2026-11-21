@@ -1565,7 +1565,6 @@ def _push(doc):
 
 	if throttled:
 		doc.flags.push_warning = str(throttled)
-	frappe.db.commit()  # nosemgrep
 	return count
 
 
