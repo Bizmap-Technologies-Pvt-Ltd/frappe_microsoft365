@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.1.2 — 2026-11-21
+
+A fix for a regression in 1.1.1 that stopped Teams transcripts from being found for new
+meetings, and two SharePoint storage protections from 1.1.1 completed for files moved before it.
+Every site on 1.1.1 should update; sites on 1.1.0 or earlier should go straight to 1.1.2. After
+updating, run `bench --site <site> migrate` and `bench build --app frappe_microsoft365`
+(`bench update` does both), and read the `Microsoft 365 1.1.2:` line at the end of the migrate
+output.
+
+### Security
+
+- **SharePoint storage:** an item stored in another record's folder is opened only by someone
+  who may read that record, and is never deleted through a File attached elsewhere. 1.1.1 stopped
+  File rows from being edited to point at another record's file, but a row edited that way
+  before the upgrade could still open it.
+- **SharePoint storage:** a file moved before 1.1.1 (which has no content hash) no longer falls
+  back to a local path that another File now keeps as its own local copy.
+
+### Fixed
+
+- Teams transcripts and recordings are found again for meetings that have no meeting id stored
+  yet. 1.1.1's check that tokens only go to Microsoft Graph refused the join-link lookup, whose
+  query contains spaces, so it never reached Microsoft; the URL is now encoded exactly as 1.1.0
+  sent it.
+- The *Files in Microsoft 365* panel no longer forgets a record's folder after a single "not
+  found" from SharePoint's listing: it asks for the folder itself first. Forgetting it made the
+  next attachment create a second folder (`Name 1`) beside the first. (Part of #40.)
+
+### Added
+
+- **Give Linked Events to <user>** on a Microsoft Calendar (Microsoft menu, System Managers):
+  makes the calendar's user the owner of the Events linked to it that someone else owns, after
+  saying how many, with a comment on each naming its previous owner. Since 1.1.1 such Events —
+  typically created by an administrator for a colleague — are not synced, and Frappe offers no
+  way to change an Event's owner from the form.
+
+### Upgrade notes
+
+- **Behaviour changes**
+  - An attachment copied from one record to another (for example when a document is made from
+    another) still opens, but only for users who can also read the record whose SharePoint
+    folder holds it.
+- **Patches that run on migrate:** none.
+- **Warnings to expect** in the upgrade report
+  - `upgrade.sharepoint_files_in_other_folders`: Files attached to one record but stored in
+    another record's folder — usually attachment copies, otherwise Files edited before 1.1.1 to
+    point at someone else's file. Delete the ones that should not exist; attach the file to the
+    record again where a copy must be readable on its own.
+- **Manual steps**
+  - If 1.1.1's upgrade report listed `upgrade.calendar_event_owner` (Events on a calendar that
+    belong to someone else) and they were made for that calendar's user, open the Microsoft
+    Calendar and choose *Microsoft > Give Linked Events to <user>*.
+  - Meetings that ended while a site ran 1.1.1 may have stopped looking for their transcript.
+    Press *Get Transcript & Recording* on those Events.
+
 ## 1.1.1 — 2026-11-21
 
 Security fixes across calendar sync, SharePoint storage, sign-in and the generated setup
