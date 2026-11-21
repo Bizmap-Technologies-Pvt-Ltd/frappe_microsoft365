@@ -254,7 +254,13 @@ A weekly series always includes the day it starts on, because Graph rejects one 
 
 The occurrences Microsoft generates from that series are not mirrored back as separate Frappe
 Events; the repeating Event already stands for them, in the same way one Graph series master
-stands for its own occurrences.
+stands for its own occurrences. One occurrence moved or renamed in Outlook is mirrored as its
+own Event beside the series (Frappe's repeat rule still shows the original slot, since Frappe
+has no way to mark one occurrence as changed). When the series is deleted in Outlook, the
+repeating Event in Frappe is marked **Missing From Outlook** and listed by **Run Diagnostics**;
+it is deleted only if **Delete events missing from Outlook** is ticked in Microsoft Settings.
+It is not deleted outright because a connection re-authorised as a different Microsoft account
+cannot see the old account's series either, and that must not wipe them.
 
 In the other direction a recurring series organised **in Outlook** arrives as individual
 occurrences, one Frappe Event each, since Frappe has nothing else to attach them to.

@@ -2008,6 +2008,9 @@ def run_diagnostics():
 		findings += check_event_custom_fields(
 			[f for f in EVENT_CUSTOM_FIELDS if not frappe.db.has_column("Event", f)]
 		)
+		from frappe_microsoft365.microsoft_calendar_sync import orphaned_event_findings
+
+		findings += orphaned_event_findings()
 
 	# Only where something actually depends on the queue. refresh=True because this is the one
 	# place a person looks *after* starting a worker to find out whether it worked, and a

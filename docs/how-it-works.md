@@ -33,7 +33,11 @@ occurrences. A repeating Frappe Event is sent as a real Outlook series — daily
 days you tick), monthly, quarterly, half-yearly or yearly, ending on **Repeat Till** or never.
 The occurrences Microsoft generates from it are not mirrored back as separate Events: the
 repeating Event already represents them, exactly as one Graph series master represents its own.
-A frequency this app cannot map is sent as a single event rather than as a wrong series.
+An occurrence changed on its own in Outlook (moved or renamed) is mirrored beside the repeating
+Event; when the whole series is deleted in Outlook, the repeating Event is marked **Missing From
+Outlook** (and deleted only if Microsoft Settings says to, see below). The recurrence is
+only sent again when it changes in Frappe. A frequency this app cannot map is sent as a single
+event rather than as a wrong series.
 
 **What it does not cover.** It syncs the signed-in person's **default** calendar
 (`/me/calendarView`) — a second calendar in the same mailbox is neither read nor written, and
@@ -63,11 +67,30 @@ Worth knowing before you trust it with a real calendar:
   `custom_pulled_from_microsoft = 0` for life: the pull refreshes its subject, times and
   location from Outlook but never overwrites its description (Graph only returns a truncated
   plain-text preview) and never flips the flag, so later local edits keep syncing out.
-  Events that originated in Microsoft are mirrors and are fully overwritten.
+  Events that originated in Microsoft are mirrors and are fully overwritten. Unticking
+  **Sync with Microsoft Calendar** on either kind takes it out of the sync: the pull leaves it
+  alone from then on.
+- **Only what changed in Frappe is sent.** Each Event remembers what Outlook was last sent or
+  last showed, so a push sends just the fields edited in Frappe. Attendees are merged into
+  Outlook's own list rather than replacing it, so people invited from Outlook stay invited and
+  an agenda rewritten there survives a title change in Frappe.
 - **Nothing is saved when nothing changed**, so `modified` does not churn and the push step does
   not patch the same event back to Graph on every run.
-- **The delta window** covers 30 days back and 180 days forward, and is re-initialised
-  automatically when its far edge gets within 14 days.
+- **All-day events keep their dates** in both directions, whatever the site's timezone.
+- **The delta window** covers 30 days back and at least 180 days forward. It is renewed about
+  once a month (each renewal reads the whole window once), so an event up to 180 days ahead is
+  always pulled.
+- **Events deleted in Outlook during a resync.** A renewal first reads the old delta link for
+  its deletions. After any full read of the window, an Event pulled from Outlook that the read
+  did not return is marked **Missing From Outlook** and listed by **Run Diagnostics**, as is a
+  repeating Event pushed from Frappe whose Outlook series is gone; either is
+  deleted only if **Delete events missing from Outlook** is ticked in Microsoft Settings (off by
+  default, because other records may link to those Events).
+- **Moving an Event to another Microsoft Calendar** deletes it from the old mailbox and creates
+  it in the new one, so its attendees get a cancellation and a new invitation.
+- **Saves never wait on an ordinary create.** A new Event is created in Outlook just after its
+  save commits; only a new Teams meeting is created inside the save, so its join link is on the
+  form straight away (and it is deleted again if that save fails).
 - **Concurrency and throttling.** Each calendar syncs under a file lock, so a slow run is never
   overlapped by the next cron. A `429` is retried once after a short `Retry-After`; longer
   backoffs are left to the next scheduled run. A `410` (expired delta token) restarts a full
