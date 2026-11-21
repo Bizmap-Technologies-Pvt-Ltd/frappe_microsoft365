@@ -119,9 +119,10 @@ def _graph_azure_permissions(field):
 	Taken from the same derivation get_scopes uses, so the Set Up dialog can never advertise a
 	permission the sign-in will not request — the mismatch that had admins granting Teams
 	permissions for a calendar-only setup. offline_access is appended because it is requested
-	on every sign-in and has to be consented like any other.
+	on every sign-in and has to be consented like any other. What the site was already granted
+	is passed on too, so a site that kept OnlineMeetings.ReadWrite is shown that, not Read.
 	"""
-	return [*graph.derive_scopes({field: 1}), OFFLINE_ACCESS]
+	return [*graph.derive_scopes({field: 1}, graph.granted_scopes()), OFFLINE_ACCESS]
 
 
 def capabilities():
@@ -306,11 +307,21 @@ def plan():
 			_("A Client Secret is required for mail and sign-in. Add it in Microsoft Settings first.")
 		)
 
+	# A copy whose secret no longer matches is drift too, whichever capability made it: report it
+	# on that record's step, and offer Sync Secret in the dialog.
+	drifted = [c for c in doctor._secret_copies(doctor._settings_config()) if not c["same"]]
+	for copy in drifted:
+		for step in steps:
+			if step["target"] == copy["name"] and step["action"] in (EXISTS, DRIFT):
+				step["action"] = DRIFT
+				step["findings"] += doctor.check_secret_copies([copy])
+
 	return {
 		"steps": steps,
 		"capabilities": capabilities(),
 		"selected": chosen,
 		"blockers": blockers,
+		"secret_drift": [{"doctype": c["doctype"], "name": c["name"]} for c in drifted],
 		"mail_flow": settings.get("mail_flow"),
 		# The combined Graph list, so the dialog can show the exact set to consent to rather
 		# than leaving the admin to union the per-capability lists by eye.
@@ -335,6 +346,39 @@ def _create_social_login_key(settings):
 	doc = frappe.get_doc(social_login_key_values(settings))
 	doc.insert(ignore_permissions=True)
 	return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def sync_client_secret():
+	"""Copy the secrets in Microsoft Settings to the records holding an old copy. System Manager.
+
+	The one exception to "never rewrite": a secret has a single right value, the one in
+	Microsoft Settings, and a stale copy only ever breaks mail or sign-in. Only records the
+	doctor compares (same client id) are touched, and only their secret. Returns the records
+	updated; never a secret.
+	"""
+	frappe.only_for("System Manager")
+	from frappe.utils.password import set_encrypted_password
+
+	settings = doctor._settings_config()
+	secrets = {}
+	if (settings.get("app_client_id") or "").strip() and settings.get("app_client_secret"):
+		secrets[settings["app_client_id"].strip()] = settings["app_client_secret"]
+	if (settings.get("client_id") or "").strip() and settings.get("client_secret"):
+		secrets[settings["client_id"].strip()] = settings["client_secret"]
+
+	updated = []
+	for copy in doctor._secret_copies(settings):
+		if copy["same"]:
+			continue
+		client_id = (frappe.db.get_value(copy["doctype"], copy["name"], "client_id") or "").strip()
+		secret = secrets.get(client_id)
+		if not secret:
+			continue
+		set_encrypted_password(copy["doctype"], copy["name"], secret, "client_secret")
+		frappe.clear_document_cache(copy["doctype"], copy["name"])
+		updated.append({"doctype": copy["doctype"], "name": copy["name"]})
+	return {"updated": updated}
 
 
 @frappe.whitelist(methods=["POST"])

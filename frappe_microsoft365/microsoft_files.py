@@ -26,16 +26,19 @@ Graph contract used (all v1.0, see docs/graph-api-reference.md):
 * ``POST .../{filename}:/createUploadSession`` then ``PUT {uploadUrl}`` in ranges — large upload
 * ``GET /drives/{drive-id}/items/{item-id}/content`` — download (302 to a pre-signed URL)
 * ``GET /drives/{drive-id}/items/{item-id}/children`` — folder listing
-* ``PATCH /drives/{drive-id}/items/{item-id}`` — rename
+* ``PATCH /drives/{drive-id}/items/{item-id}`` with ``parentReference`` — move (re-attached file)
 * ``DELETE /drives/{drive-id}/items/{item-id}`` — to the site recycle bin
 """
 
 import ipaddress
+import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import tempfile
+import time
 from urllib.parse import quote, urlparse
 
 import frappe
@@ -74,8 +77,22 @@ MAX_ATTEMPTS = 5
 #: Minutes a Pending/Failed file waits before the hourly sweep picks it up again.
 RETRY_AFTER_MINUTES = 15
 
-#: How far up the tree open_item walks to prove an item sits inside a record's folder.
-MAX_FOLDER_DEPTH = 10
+#: SharePoint's limit on a file's whole decoded path, counted from the site's address on
+#: (``sites/Sales/Shared Documents/Projects/PRJ-0001/spec.pdf``).
+MAX_PATH_LENGTH = 400
+
+#: What a mapping's base folder must leave of MAX_PATH_LENGTH for a record's folder and the
+#: files in it; a base path longer than that is refused when the mapping is saved.
+MIN_ROOM_FOR_RECORDS = 100
+
+#: What a record's folder must leave for the name of a file in it. A longer folder name is
+#: shortened when the folder is created, and a file name that does not fit is shortened.
+MIN_ROOM_FOR_FILE_NAME = 50
+
+#: How far up the tree open_item walks to prove an item sits inside a record's folder. Not a
+#: limit SharePoint has; its path limit allows at most this many levels (one character and a
+#: slash each), so no file anyone can reach is ever refused for being deep.
+MAX_FOLDER_DEPTH = MAX_PATH_LENGTH // 2
 
 OPEN_METHOD = "frappe_microsoft365.microsoft_files.open_file"
 
@@ -84,6 +101,10 @@ PENDING = "Pending"
 STORED = "Stored"  # moved: the file now lives in SharePoint and file_url points at open_file
 ARCHIVED = "Archived"  # a link attachment whose target was copied; the link itself is unchanged
 FAILED = "Failed"
+#: A moved File re-attached to another record, whose SharePoint item a background job is moving
+#: to that record's folder (follow_attachment). It still opens from where it is meanwhile, and a
+#: failed move stays Moving, with the error recorded, and is retried hourly.
+MOVING = "Moving"
 
 #: Characters SharePoint and OneDrive refuse in a name, plus # and % which it accepts but which
 #: break more tools than they are worth.
@@ -399,6 +420,62 @@ def encode_path(segments):
 	return "/".join(quote(segment, safe="") for segment in segments)
 
 
+def library_path(row):
+	"""The decoded path of a mapping's library, from the site's address on. Pure.
+
+	Counted the way SharePoint counts its path limit. The library a Teams team keeps its files in
+	is called Documents but lives at Shared Documents; any other library is assumed to live at its
+	name, which is what SharePoint uses unless the library was renamed after it was made.
+	"""
+	_host, site_path = parse_site_url(row.get("site_url"))
+	library = (row.get("library") or "").strip()
+	if library.lower() in ("", "documents", "shared documents"):
+		library = "Shared Documents"
+	return "/".join(part for part in (site_path.strip("/"), library) if part)
+
+
+def base_path_length(row):
+	"""How much of SharePoint's path limit a mapping's library and base folder use. Pure."""
+	return len("/".join([library_path(row), *base_segments(row)]))
+
+
+def assert_base_path_fits(row):
+	"""Refuse a base folder that leaves no room for record folders and their files."""
+	used = base_path_length(row)
+	if used > MAX_PATH_LENGTH - MIN_ROOM_FOR_RECORDS:
+		frappe.throw(
+			_(
+				"The library and base folder path is {0} characters long, counted from the site address. SharePoint allows {1} characters for a file's whole path, so this leaves too little room for each record's folder and the files in it (at least {2} are needed). Use a shorter base folder."
+			).format(used, MAX_PATH_LENGTH, MIN_ROOM_FOR_RECORDS),
+			title=_("SharePoint path too long"),
+		)
+
+
+def folder_path_length(folder, row=None):
+	"""How much of SharePoint's path limit a record folder's own path uses.
+
+	Read from the folder's address when there is one (the real path, whatever the folder was
+	called or moved to since), else from the mapping and the recorded path.
+	"""
+	from urllib.parse import unquote
+
+	if folder.get("web_url"):
+		return len(unquote(urlparse(folder.web_url).path).strip("/"))
+	row = row or mapping_for(folder.get("reference_doctype")) or {}
+	return len("/".join(part for part in (library_path(row), folder.get("folder_path") or "") if part))
+
+
+def fit_file_name(name, room):
+	"""``name`` shortened, keeping its extension, to ``room`` characters; None if it cannot be. Pure."""
+	if len(name) <= room:
+		return name
+	stem, ext = os.path.splitext(name)
+	keep = room - len(ext)
+	if keep < 8:
+		return None
+	return stem[:keep].rstrip(" .-") + ext
+
+
 def parse_site_url(url):
 	"""``(hostname, server-relative path)`` for the site a URL belongs to.
 
@@ -457,6 +534,39 @@ def resolve_drive(row):
 	row.site_id, row.drive_id = site_id, drive_id
 	clear_mapping_cache()
 	return site_id, drive_id
+
+
+def _drive_gone(drive_id):
+	"""Ask for the library itself, by id: True when SharePoint says there is no such drive."""
+	try:
+		graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "id"})
+	except MsGraphNotFound:
+		_forget_message()
+		return True
+	return False
+
+
+def with_current_drive(row, work):
+	"""``work(drive_id)`` against the mapping's library, looking the library up again once if the
+	cached id has stopped existing.
+
+	The site and drive ids are cached on the mapping (resolve_drive). A library or site that was
+	deleted and created again under the same address gets new ids, and the cached drive id then
+	answers 404 for everything, so every new folder fails until someone re-saves the mapping.
+	On a 404 the drive itself is asked for; only if it is gone are the ids looked up again from
+	the URL, and the work is tried once more against the new drive.
+	"""
+	cached = bool(row.get("site_id") and row.get("drive_id"))
+	_site_id, drive_id = resolve_drive(row)
+	try:
+		return work(drive_id)
+	except MsGraphNotFound:
+		if not cached or not _drive_gone(drive_id):
+			raise
+		_forget_message()
+	row.site_id = row.drive_id = None
+	_site_id, fresh = resolve_drive(row)
+	return work(fresh)
 
 
 def _find_drive(site_id, library):
@@ -658,12 +768,18 @@ def new_folder_values(row, doctype, name):
 	1``) rather than hand that folder over. Using a folder that already exists is something an
 	administrator does on purpose, with Existing Folder on the mapping's Folders table.
 	"""
-	_site_id, drive_id = resolve_drive(row)
 	doc = frappe.get_doc(doctype, name)
-	folder_name = render_pattern(row.folder_pattern, doc)
+	assert_base_path_fits(row)
 	base = base_segments(row)
-	parent_id = ensure_path(drive_id, base)["id"] if base else None
-	item = _create_folder(drive_id, parent_id, folder_name, conflict="rename")
+	# The record's folder must leave room for the names of the files that go in it.
+	room = MAX_PATH_LENGTH - base_path_length(row) - 1 - MIN_ROOM_FOR_FILE_NAME
+	folder_name = safe_name(render_pattern(row.folder_pattern, doc), max_length=min(MAX_FOLDER_NAME, room))
+
+	def create(drive_id):
+		parent_id = ensure_path(drive_id, base)["id"] if base else None
+		return drive_id, _create_folder(drive_id, parent_id, folder_name, conflict="rename")
+
+	drive_id, item = with_current_drive(row, create)
 	if "folder" not in item:
 		frappe.throw(_("SharePoint did not create the folder {0}.").format(folder_name), MsGraphError)
 	folder_name = item.get("name") or folder_name
@@ -687,33 +803,44 @@ def existing_folder_values(row, location):
 	import base64
 	from urllib.parse import parse_qs, unquote
 
-	_site_id, drive_id = resolve_drive(row)
 	value = (location or "").strip()
-	item = None
-	if value.lower().startswith(("http://", "https://")):
-		parsed = urlparse(value)
-		ids = parse_qs(parsed.query).get("id")
-		path = unquote(ids[0] if ids else parsed.path).rstrip("/")
-		drive = graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "webUrl"})
-		root = unquote(urlparse(drive.get("webUrl") or "").path).rstrip("/")
-		if root and path.lower().startswith(root.lower() + "/"):
-			item = _get_by_path(drive_id, [p for p in path[len(root) + 1 :].split("/") if p])
-		else:
-			# A sharing link (…/:f:/s/…) names no path; Graph resolves those through /shares.
-			token = "u!" + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
-			try:
-				item = graph.graph_request(
-					"GET",
-					f"/shares/{token}/driveItem",
-					APP,
-					params={"$select": "id,name,folder,webUrl,parentReference"},
-				)
-			except MsGraphError:
-				_forget_message()
-				item = None
-	else:
-		item = _get_by_path(drive_id, [p for p in value.replace("\\", "/").split("/") if p.strip()])
 
+	def find(drive_id):
+		item = None
+		if value.lower().startswith(("http://", "https://")):
+			parsed = urlparse(value)
+			ids = parse_qs(parsed.query).get("id")
+			path = unquote(ids[0] if ids else parsed.path).rstrip("/")
+			drive = graph.graph_request("GET", f"/drives/{drive_id}", APP, params={"$select": "webUrl"})
+			root = unquote(urlparse(drive.get("webUrl") or "").path).rstrip("/")
+			if root and path.lower().startswith(root.lower() + "/"):
+				item = _get_by_path(drive_id, [p for p in path[len(root) + 1 :].split("/") if p])
+			else:
+				# A sharing link (…/:f:/s/…) names no path; Graph resolves those through /shares.
+				token = "u!" + base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+				try:
+					item = graph.graph_request(
+						"GET",
+						f"/shares/{token}/driveItem",
+						APP,
+						params={"$select": "id,name,folder,webUrl,parentReference"},
+					)
+				except MsGraphError:
+					_forget_message()
+					item = None
+		else:
+			item = _get_by_path(drive_id, [p for p in value.replace("\\", "/").split("/") if p.strip()])
+
+		if not item:
+			# Raised bare, not thrown: nothing for the desk to show unless the retry fails too.
+			raise MsGraphNotFound("folder not found")
+		return drive_id, item
+
+	try:
+		drive_id, item = with_current_drive(row, find)
+	except MsGraphNotFound:
+		_forget_message()
+		item = None
 	if not item:
 		frappe.throw(
 			_(
@@ -839,6 +966,13 @@ def is_open_url(url):
 	return OPEN_METHOD in unquote(url or "").lower()
 
 
+def is_moved(file_doc):
+	"""Whether a File is a moved attachment, opened through open_file from SharePoint: Stored, or
+	Moving (re-attached, its item on the way to the new record's folder) with that address."""
+	status = file_doc.get("custom_microsoft_status")
+	return status == STORED or (status == MOVING and is_open_url(file_doc.get("file_url")))
+
+
 def _same(a, b):
 	return str(a or "") == str(b or "")
 
@@ -935,7 +1069,7 @@ def upload_file(file_name):
 	if not frappe.db.exists("File", file_name):
 		return
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED) or not _eligible(file_doc):
+	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED, MOVING) or not _eligible(file_doc):
 		return
 
 	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
@@ -957,6 +1091,8 @@ def upload_file(file_name):
 	frappe.db.savepoint("microsoft365_upload")
 	try:
 		item = _already_uploaded(file_doc, folder)
+		if not item and attempts > 1:
+			item = _left_by_an_earlier_attempt(file_doc, folder)
 		if not item:
 			try:
 				item = _upload(file_doc, folder)
@@ -1078,6 +1214,53 @@ def _already_uploaded(file_doc, folder):
 	return item
 
 
+def _left_by_an_earlier_attempt(file_doc, folder):
+	"""The item an earlier attempt uploaded but did not live to record, if it is in the folder.
+
+	A worker killed between the upload and the commit of its ids leaves the bytes in SharePoint
+	and nothing here saying so; the retry would upload them again and SharePoint keep both, as
+	``report (1).pdf``. So a retry first looks in the record's folder for a file under the same
+	name with the same size, uploaded by this app rather than by a person, that no other File
+	claims, and adopts it.
+	"""
+	if not is_local(file_doc):
+		return None  # a link's size is only known once it is downloaded again
+	try:
+		size = os.path.getsize(file_doc.get_full_path())
+	except OSError:
+		return None
+	name = upload_name(file_doc, folder)
+	try:
+		item = graph.graph_request(
+			"GET",
+			f"/drives/{folder.drive_id}/items/{folder.item_id}:/{quote(name, safe='')}:",
+			APP,
+			params={"$select": "id,name,size,file,webUrl,parentReference,createdBy"},
+		)
+	except MsGraphNotFound:
+		_forget_message()
+		return None
+	if "file" not in item or cint(item.get("size")) != size or not _uploaded_by_this_app(item):
+		return None
+	if frappe.db.exists("File", {"custom_microsoft_item_id": item["id"], "name": ["!=", file_doc.name]}):
+		return None
+	return item
+
+
+def _uploaded_by_this_app(item):
+	"""Whether a driveItem was created by this app, as far as SharePoint says: by its client id
+	when SharePoint names the application, else by naming no signed-in user."""
+	created = item.get("createdBy") or {}
+	app_id = (created.get("application") or {}).get("id")
+	if app_id:
+		settings = graph.get_settings()
+		return app_id in {
+			(settings.get("app_client_id") or "").strip(),
+			(settings.get("client_id") or "").strip(),
+		} - {""}
+	return not (created.get("user") or {}).get("id")
+
+
 def _record_failure(file_name, attempts, error):
 	frappe.db.set_value(
 		"File",
@@ -1103,11 +1286,13 @@ MOVED_EVENT = "microsoft365_file_moved"
 def redirect_moved_file():
 	"""before_request: send an old /files or /private/files link of a moved file to its new home.
 
-	The disk copy is gone, so Frappe would answer the old link with Forbidden (private) or Not
-	Found (public). The redirect target, open_file, checks permission exactly as the old URL
-	would have, so this reveals nothing to someone who could not open the file before.
-	Costs nothing on other requests: a prefix check, then one indexed lookup only when the
-	file is missing from disk.
+	Decided by the database, not the disk: with Keep Local Copy on the old path still exists, but
+	no File carries it as its address any more, so Frappe would answer it with Forbidden. The
+	moved File is found by its recorded old address; when several moved Files share one (Frappe
+	stores identical content once, so attachments of different records can share a disk name),
+	the redirect goes to one this user may read. The target, open_file, checks permission again
+	exactly as the old URL would have, so this reveals nothing to someone who could not open the
+	file before. Other requests cost a prefix check; old-style file paths one indexed lookup.
 	"""
 	request = getattr(frappe.local, "request", None)
 	if not request or request.method not in ("GET", "HEAD"):
@@ -1117,15 +1302,36 @@ def redirect_moved_file():
 	path = unquote(request.path or "")
 	if not path.startswith(("/private/files/", "/files/")) or ".." in path.split("/"):
 		return
-	if os.path.exists(local_path(path)) or not has_file_fields():
+	if not has_file_fields():
 		return
-	name = frappe.db.get_value(
-		"File", {"custom_microsoft_local_url": path, "custom_microsoft_status": STORED}, "name"
+	moved = frappe.get_all(
+		"File",
+		filters={"custom_microsoft_local_url": path, "custom_microsoft_status": ["in", [STORED, MOVING]]},
+		pluck="name",
+		order_by="creation asc",
 	)
-	if name:
+	if not moved:
+		return
+	on_disk = os.path.exists(local_path(path))
+	if on_disk and _readable_file_at(path):
+		# The bytes there are also an unmoved File's own, which this user may read: Frappe serves it.
+		return
+	target = next((name for name in moved if frappe.has_permission("File", "read", doc=name)), None)
+	if not target and not on_disk:
+		# Nothing this user may read. open_file refuses them just as the old URL would have.
+		target = moved[0]
+	if target:
 		from werkzeug.routing import RequestRedirect
 
-		raise RequestRedirect(stored_url(name))
+		raise RequestRedirect(stored_url(target))
+
+
+def _readable_file_at(url):
+	"""Whether a File whose address is this local URL is one the user may read."""
+	return any(
+		frappe.has_permission("File", "read", doc=name)
+		for name in frappe.get_all("File", filters={"file_url": url}, pluck="name")
+	)
 
 
 def _repoint_links(file_doc, old_url, new_url):
@@ -1174,8 +1380,24 @@ def _repoint_links(file_doc, old_url, new_url):
 	)
 
 
-def _upload(file_doc, folder):
+def upload_name(file_doc, folder):
+	"""The name a File is stored under in its record's folder: made safe for SharePoint, and
+	shortened (keeping its extension) where the whole path would pass SharePoint's limit."""
 	name = safe_file_name(file_doc.file_name or os.path.basename(file_doc.file_url or ""))
+	used = folder_path_length(folder)
+	fitted = fit_file_name(name, MAX_PATH_LENGTH - used - 1)
+	if not fitted:
+		frappe.throw(
+			_(
+				"This record's SharePoint folder path is already {0} characters long, counted from the site address, and SharePoint allows {1} for a file's whole path, so no file fits in it. Shorten the mapping's base folder, or the folder's name in SharePoint."
+			).format(used, MAX_PATH_LENGTH),
+			MsGraphError,
+		)
+	return fitted
+
+
+def _upload(file_doc, folder):
+	name = upload_name(file_doc, folder)
 	content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
 	if is_local(file_doc):
 		# get_full_path refuses anything outside the site's files directories.
@@ -1193,6 +1415,11 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 
 	An existing file of the same name is never overwritten: Microsoft renames the new one
 	(``Spec (1).pdf``), which is what a person dropping a file into Teams would get too.
+
+	A large file goes through an upload session, which survives interruptions: a throttled or
+	failed range is sent again after the wait SharePoint asks for, and when the wait is longer
+	than a job should sit idle (or the ranges keep failing) the session is kept, so the next
+	attempt carries on from where SharePoint says it stopped instead of starting again.
 	"""
 	target = f"/drives/{drive_id}/items/{parent_id}:/{quote(name, safe='')}:"
 	if size <= SIMPLE_UPLOAD_MAX_BYTES:
@@ -1206,24 +1433,52 @@ def upload_stream(drive_id, parent_id, name, fh, size, content_type="application
 			timeout=120,
 		)
 
-	session = graph.graph_request(
-		"POST",
-		f"{target}/createUploadSession",
-		APP,
-		json={
-			"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
-		},
-	)
-	upload_url = session["uploadUrl"]
+	key = _session_key(drive_id, parent_id, name, size)
+	upload_url, start = _resume_session(key)
+	if not upload_url:
+		session = graph.graph_request(
+			"POST",
+			f"{target}/createUploadSession",
+			APP,
+			json={
+				"item": {"@microsoft.graph.conflictBehavior": "rename", "name": name},
+			},
+		)
+		upload_url, start = session["uploadUrl"], 0
+		_remember_session(key, upload_url, session.get("expirationDateTime"))
 	try:
-		return _send_ranges(upload_url, fh, size)
+		item = _send_ranges(upload_url, fh, size, start)
+	except UploadInterrupted:
+		# Kept: the next attempt resumes this session (see _resume_session).
+		raise
 	except Exception:
+		_forget_session(key)
 		# An abandoned session holds its partial bytes on Microsoft's side until it expires.
 		try:
 			graph._release(graph._http_request("DELETE", upload_url, timeout=30))
 		except Exception:
 			pass
 		raise
+	_forget_session(key)
+	return item
+
+
+class UploadInterrupted(MsGraphError):
+	"""An upload session stopped part way for a reason that passes (throttling, a dropped
+	connection). The session is kept, and the next attempt resumes it."""
+
+
+#: Statuses after which a range is sent again rather than the upload given up.
+RETRYABLE_UPLOAD_STATUSES = (429, 500, 502, 503, 504)
+
+#: How many times one range is sent again, waiting as SharePoint asks in between, before the
+#: rest of the upload is left to the next attempt.
+UPLOAD_RETRIES_PER_RANGE = 3
+
+UPLOAD_SESSION_CACHE_PREFIX = "frappe_microsoft365:upload_session:"
+
+#: How long a session is remembered when SharePoint gives no expiry with it.
+UPLOAD_SESSION_TTL_SECONDS = 6 * 3600
 
 
 def chunk_ranges(size, chunk=UPLOAD_CHUNK_BYTES):
@@ -1231,34 +1486,153 @@ def chunk_ranges(size, chunk=UPLOAD_CHUNK_BYTES):
 	return [(start, min(start + chunk, size) - 1) for start in range(0, size, chunk)]
 
 
-def _send_ranges(upload_url, fh, size):
-	"""PUT each range to the pre-authenticated upload URL.
+def _session_key(drive_id, parent_id, name, size):
+	import hashlib
+
+	return (
+		UPLOAD_SESSION_CACHE_PREFIX
+		+ hashlib.sha256(f"{drive_id}\0{parent_id}\0{name}\0{size}".encode()).hexdigest()
+	)
+
+
+def _remember_session(key, upload_url, expires=None):
+	"""Keep an upload session's URL for the next attempt, encrypted: it is a credential of its own."""
+	from datetime import datetime, timezone
+
+	from dateutil import parser
+	from frappe.utils.password import encrypt
+
+	ttl = UPLOAD_SESSION_TTL_SECONDS
+	try:
+		if expires:
+			# SharePoint gives the expiry in UTC, e.g. 2026-11-21T10:00:00.000Z.
+			left = (parser.isoparse(expires) - datetime.now(timezone.utc)).total_seconds()
+			ttl = int(min(ttl, left))
+	except (ValueError, TypeError):
+		pass
+	if ttl > 60:
+		frappe.cache().set_value(key, encrypt(upload_url), expires_in_sec=ttl)
+
+
+def _forget_session(key):
+	frappe.cache().delete_value(key)
+
+
+def _resume_session(key):
+	"""``(upload_url, next byte)`` of a session an earlier attempt left, or ``(None, 0)``."""
+	from frappe.utils.password import decrypt
+
+	cached = frappe.cache().get_value(key, expires=True)
+	if not cached:
+		return None, 0
+	try:
+		upload_url = decrypt(cached)
+		start = _next_expected(upload_url)
+	except Exception:
+		_forget_session(key)
+		return None, 0
+	if start is None:
+		_forget_session(key)
+		return None, 0
+	return upload_url, start
+
+
+def _next_expected(upload_url):
+	"""Ask an upload session where it wants the next bytes from: an offset, or None if it is
+	gone or wants nothing more."""
+	resp = graph._http_request("GET", upload_url, timeout=30)
+	try:
+		if resp.status_code != 200:
+			return None
+		ranges = (resp.json() or {}).get("nextExpectedRanges") or []
+	finally:
+		graph._release(resp)
+	if not ranges:
+		return None
+	return int(str(ranges[0]).split("-", 1)[0])
+
+
+def _send_ranges(upload_url, fh, size, start=0):
+	"""PUT the ranges from ``start`` on to the pre-authenticated upload URL.
 
 	No Authorization header: the URL carries its own credential, and Microsoft documents that
 	sending a bearer token to it can make the request fail.
+
+	A range refused with 429 or a 5xx is sent again after its Retry-After (a short one; see
+	microsoft_graph._retry_after_seconds). A dropped connection leaves it unknown what arrived,
+	so the session is asked (nextExpectedRanges) and the upload carries on from there. When the
+	wait would be long, or a range keeps failing, UploadInterrupted leaves the rest to the next
+	attempt, which resumes the same session.
 	"""
-	for start, end in chunk_ranges(size):
-		body = fh.read(end - start + 1)
-		resp = graph._http_request(
-			"PUT",
-			upload_url,
-			data=body,
-			timeout=300,
-			headers={
-				"Content-Length": str(len(body)),
-				"Content-Range": f"bytes {start}-{end}/{size}",
-			},
-		)
-		if resp.status_code in (200, 201):
-			return resp.json()
-		if resp.status_code != 202:
-			detail = graph._safe_error(resp)
-			graph._release(resp)
-			frappe.throw(
-				_("SharePoint refused part of the upload ({0}): {1}").format(resp.status_code, detail),
-				MsGraphError,
+	import requests
+
+	offset = start
+	if start:
+		fh.seek(start)
+	tries = 0
+	body = None
+	while offset < size:
+		end = min(offset + UPLOAD_CHUNK_BYTES, size) - 1
+		if body is None:
+			body = fh.read(end - offset + 1)
+		try:
+			resp = graph._http_request(
+				"PUT",
+				upload_url,
+				data=body,
+				timeout=300,
+				headers={
+					"Content-Length": str(len(body)),
+					"Content-Range": f"bytes {offset}-{end}/{size}",
+				},
 			)
-		graph._release(resp)
+		except requests.RequestException as e:
+			resp, reason = None, str(e)
+		else:
+			reason = str(resp.status_code)
+			if resp.status_code in (200, 201):
+				return resp.json()
+			if resp.status_code == 202:
+				graph._release(resp)
+				offset, body, tries = end + 1, None, 0
+				continue
+			if resp.status_code not in (*RETRYABLE_UPLOAD_STATUSES, 416):
+				detail = graph._safe_error(resp)
+				graph._release(resp)
+				frappe.throw(
+					_("SharePoint refused part of the upload ({0}): {1}").format(resp.status_code, detail),
+					MsGraphError,
+				)
+
+		tries += 1
+		wait = graph._retry_after_seconds(resp) if resp is not None else graph.DEFAULT_RETRY_AFTER_SECONDS
+		status = resp.status_code if resp is not None else None
+		if resp is not None:
+			graph._release(resp)
+		# Longer than one call may sleep (graph._max_inline_wait): keep the session for next time.
+		if wait is None or wait > graph._max_inline_wait() or tries > UPLOAD_RETRIES_PER_RANGE:
+			raise UploadInterrupted(
+				_(
+					"The upload to SharePoint stopped at byte {0} of {1} ({2}); the next attempt carries on from there."
+				).format(offset, size, reason)
+			)
+		if status in RETRYABLE_UPLOAD_STATUSES:
+			# Refused outright: the same range goes again, once SharePoint is ready for it.
+			time.sleep(wait)
+			continue
+		# A dropped connection, or 416 (that range has arrived already): SharePoint knows best.
+		if status is None:
+			time.sleep(wait)
+		resumed = _next_expected(upload_url)
+		if resumed is None or resumed >= size:
+			raise UploadInterrupted(
+				_(
+					"SharePoint lost track of the upload at byte {0} of {1}; the next attempt starts again."
+				).format(offset, size)
+			)
+		if resumed != offset:
+			fh.seek(resumed)
+			offset, body = resumed, None
 	frappe.throw(_("SharePoint did not confirm the upload after the last part."), MsGraphError)
 
 
@@ -1270,48 +1644,37 @@ class _download_link:
 		self.fh = None
 
 	def __enter__(self):
-		assert_public_url(self.url)
-		import requests
-
-		resp = requests.get(
-			self.url,
-			stream=True,
-			timeout=60,
-			allow_redirects=False,
-			headers={"User-Agent": "frappe_microsoft365"},
-		)
+		url = self.url
+		resp = _pinned_get(url)
 		hops = 0
-		while resp.is_redirect and hops < 5:
+		while resp.status in REDIRECT_STATUSES and hops < 5:
 			location = resp.headers.get("Location") or ""
-			resp.close()
-			nxt = requests.compat.urljoin(self.url, location)
-			assert_public_url(nxt)
-			resp = requests.get(
-				nxt,
-				stream=True,
-				timeout=60,
-				allow_redirects=False,
-				headers={"User-Agent": "frappe_microsoft365"},
-			)
+			resp.release_conn()
+			from urllib.parse import urljoin
+
+			url = urljoin(url, location)
+			# Every hop is checked and pinned again: a public page may redirect anywhere.
+			resp = _pinned_get(url)
 			hops += 1
-		if resp.status_code != 200:
-			resp.close()
-			frappe.throw(_("Could not download {0} ({1}).").format(self.url, resp.status_code), MsGraphError)
+		if resp.status != 200:
+			resp.release_conn()
+			frappe.throw(_("Could not download {0} ({1}).").format(self.url, resp.status), MsGraphError)
 
 		self.fh = tempfile.TemporaryFile()
 		size = 0
-		for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
-			size += len(chunk)
-			if size > MAX_LINK_DOWNLOAD_BYTES:
-				resp.close()
-				frappe.throw(
-					_("{0} is larger than {1} MB; not archived.").format(
-						self.url, MAX_LINK_DOWNLOAD_BYTES // (1024 * 1024)
-					),
-					MsGraphError,
-				)
-			self.fh.write(chunk)
-		resp.close()
+		try:
+			for chunk in resp.stream(DOWNLOAD_CHUNK_BYTES):
+				size += len(chunk)
+				if size > MAX_LINK_DOWNLOAD_BYTES:
+					frappe.throw(
+						_("{0} is larger than {1} MB; not archived.").format(
+							self.url, MAX_LINK_DOWNLOAD_BYTES // (1024 * 1024)
+						),
+						MsGraphError,
+					)
+				self.fh.write(chunk)
+		finally:
+			resp.release_conn()
 		self.fh.seek(0)
 		content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or None
 		return self.fh, size, content_type
@@ -1322,25 +1685,91 @@ class _download_link:
 		return False
 
 
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _pinned_get(url, timeout=60):
+	"""GET a public URL, connecting only to the address assert_public_url checked.
+
+	Resolving the name a second time to connect, as any HTTP library does, would let a name that
+	answers differently the second time (DNS rebinding) send the request to an internal address
+	after the check passed. So the connection is made to the checked IP itself, with the Host
+	header and, for https, the TLS server name and certificate check set to the name in the link.
+	No proxy is used either, for the same reason: the proxy would resolve the name again.
+	Returns a urllib3 response with its body still unread.
+	"""
+	import certifi
+	import urllib3
+	from requests.utils import requote_uri
+
+	url = requote_uri(url)
+	address = assert_public_url(url)
+	parsed = urlparse(url)
+	https = parsed.scheme == "https"
+	host = parsed.hostname
+	host_header = f"[{host}]" if ":" in host else host
+	if parsed.port:
+		host_header += f":{parsed.port}"
+	options = {
+		"host": address,
+		"port": parsed.port or (443 if https else 80),
+		"timeout": urllib3.Timeout(connect=min(timeout, 30), read=timeout),
+		"retries": False,
+		"maxsize": 1,
+	}
+	if https:
+		pool = urllib3.HTTPSConnectionPool(
+			cert_reqs="CERT_REQUIRED",
+			ca_certs=certifi.where(),
+			server_hostname=host,
+			assert_hostname=host,
+			**options,
+		)
+	else:
+		pool = urllib3.HTTPConnectionPool(**options)
+	target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+	try:
+		return pool.urlopen(
+			"GET",
+			target,
+			headers={"Host": host_header, "User-Agent": "frappe_microsoft365", "Accept-Encoding": "identity"},
+			redirect=False,
+			retries=False,
+			preload_content=False,
+		)
+	except urllib3.exceptions.HTTPError as e:
+		frappe.throw(
+			_("Could not download {0}: {1}").format(frappe.utils.escape_html(url), frappe.utils.escape_html(str(e))),
+			MsGraphError,
+		)
+
+
 def assert_public_url(url):
-	"""Refuse to fetch anything but a public http(s) address.
+	"""Refuse to fetch anything but a public http(s) address; return the address to connect to.
 
 	A link attachment is typed by a user and fetched by the server, so without this it is a way
 	to make the server read its own metadata endpoint or a neighbour on the private network.
+	Every address the name has must be public, and the caller connects to the one returned
+	(see _pinned_get) rather than resolving the name again.
 	"""
 	parsed = urlparse(url or "")
 	if parsed.scheme not in ("http", "https") or not parsed.hostname:
 		frappe.throw(_("Only http and https links can be archived."), MsGraphError)
 	try:
-		infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
-	except socket.gaierror:
+		infos = socket.getaddrinfo(
+			parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
+		)
+	except (socket.gaierror, ValueError):
+		frappe.throw(_("Could not resolve {0}.").format(parsed.hostname), MsGraphError)
+	if not infos:
 		frappe.throw(_("Could not resolve {0}.").format(parsed.hostname), MsGraphError)
 	for info in infos:
-		address = ipaddress.ip_address(info[4][0])
+		address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
 		if not address.is_global:
 			frappe.throw(
 				_("{0} is not a public address; not archived.").format(parsed.hostname), MsGraphError
 			)
+	return infos[0][4][0]
 
 
 def _remove_local_copy(local_url):
@@ -1359,6 +1788,68 @@ def _remove_local_copy(local_url):
 		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=local_url)
 
 
+def _privacy_prefix(file_doc):
+	"""Where a File's bytes belong on disk, by its privacy as it is now."""
+	return "/private/files/" if cint(file_doc.get("is_private")) else "/files/"
+
+
+def _blob_users(url, except_name):
+	"""Other File rows that use the bytes at a local URL, as their address or as their kept copy."""
+	return frappe.get_all(
+		"File",
+		filters={"name": ["!=", except_name or ""]},
+		or_filters={"file_url": url, "custom_microsoft_local_url": url},
+		pluck="name",
+	)
+
+
+def follow_privacy(file_doc):
+	"""Put a moved File's kept local copy where its privacy says: public/files or private/files.
+
+	Frappe moves a File's bytes when its privacy changes, but a moved File's file_url is the
+	open_file address, so Frappe leaves the kept copy alone. Left in public/files, the copy of a
+	File made private would stay readable by anyone through the web server. Moved when no other
+	File uses those bytes, copied when one does (that File's bytes are its own business).
+	Returns the kept copy's new URL, or None when there was nothing to move.
+	"""
+	local = file_doc.get("custom_microsoft_local_url")
+	if not is_moved(file_doc) or not local or ".." in local.split("/"):
+		return None
+	prefix = _privacy_prefix(file_doc)
+	if local.startswith(prefix) or not own_local_copy(file_doc, local):
+		# In place already, or nothing of this File's is there to move (keep-local off, or the
+		# name belongs to another file by now).
+		return None
+	basename = local.rsplit("/", 1)[-1]
+	target = prefix + basename
+	if os.path.exists(local_path(target)) or _blob_users(target, file_doc.name):
+		target = prefix + f"{file_doc.name}-{basename}"
+		if os.path.exists(local_path(target)):
+			target = prefix + f"{file_doc.name}-{frappe.generate_hash(length=8)}-{basename}"
+	source, destination = local_path(local), local_path(target)
+	if _blob_users(local, file_doc.name):
+		shutil.copyfile(source, destination)
+	else:
+		os.replace(source, destination)
+	frappe.db.set_value("File", file_doc.name, "custom_microsoft_local_url", target, update_modified=False)
+	file_doc.custom_microsoft_local_url = target
+	return target
+
+
+def _drop_kept_copy(file_doc):
+	"""Remove a moved File's kept local copy, unless another File still uses those bytes."""
+	local = file_doc.get("custom_microsoft_local_url")
+	if not is_moved(file_doc) or not local:
+		return
+	if _blob_users(local, file_doc.name) or not own_local_copy(file_doc, local):
+		return
+	try:
+		# own_local_copy accepted the URL: a /files or /private/files path without "..".
+		os.remove(local_path(local))  # nosemgrep
+	except OSError:
+		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=local)
+
+
 # --- deletes and renames -----------------------------------------------------------------
 
 
@@ -1372,7 +1863,7 @@ def on_file_trash(doc, method=None):
 	item_id = doc.get("custom_microsoft_item_id")
 	if not item_id or not doc.get("custom_microsoft_drive_id"):
 		return
-	if doc.get("custom_microsoft_status") not in (STORED, ARCHIVED):
+	if doc.get("custom_microsoft_status") not in (STORED, ARCHIVED, MOVING):
 		return
 	settings = _settings()
 	if not (files_enabled(settings) and storage_option("files_delete_remote", doc.attached_to_doctype)):
@@ -1400,6 +1891,291 @@ def on_file_trash(doc, method=None):
 		frappe.log_error(title=_("Microsoft 365: could not remove file from SharePoint"))
 
 
+def on_file_update(doc, method=None):
+	"""File.on_update: keep a moved file's SharePoint copy and kept local copy in step with the File.
+
+	Its privacy decides where the kept local copy lives (follow_privacy), and the record it is
+	attached to decides which folder its SharePoint item is in (follow_attachment). Inserts are
+	left alone: a new File has nothing to follow yet, and an attachment copy shares its item with
+	the original, which stays where it is.
+	"""
+	before = doc.get_doc_before_save()
+	if doc.flags.in_insert or not before:
+		return
+	status = doc.get("custom_microsoft_status")
+	if is_moved(doc) and doc.has_value_changed("is_private"):
+		try:
+			follow_privacy(doc)
+		except Exception:
+			frappe.log_error(title=_("Microsoft 365: could not move the kept local copy"), message=doc.name)
+			if cint(doc.is_private):
+				# A copy that could not follow the File into private/files must not stay public.
+				# SharePoint holds the file; the kept copy is only a spare.
+				_drop_kept_copy(doc)
+	if status in (STORED, ARCHIVED, MOVING) and (
+		doc.has_value_changed("attached_to_doctype") or doc.has_value_changed("attached_to_name")
+	):
+		queue_follow_attachment(doc, before)
+
+
+def queue_follow_attachment(doc, before):
+	"""Mark a re-attached File Moving and queue the job that moves its item (follow_attachment).
+
+	Nothing here talks to SharePoint or commits: the user's save stays one transaction, and the
+	job is queued to run once it has committed. Only an item in the folder of the record the File
+	was attached to before is this File's to move (see assert_app_item). Where the File records
+	that folder (every move since 1.1.1) that is checked here, from the database; a File moved
+	before has no such record, so the job asks SharePoint, given the previous record to compare.
+	"""
+	old = None
+	if doc.get("custom_microsoft_status") != MOVING:
+		old = (before.get("attached_to_doctype"), before.get("attached_to_name"))
+		folder_id = doc.get("custom_microsoft_folder_id")
+		if folder_id:
+			holder = frappe.db.get_value(
+				"SharePoint Folder",
+				{"drive_id": doc.get("custom_microsoft_drive_id"), "item_id": folder_id},
+				["reference_doctype", "reference_name"],
+			)
+			if tuple(holder or ()) != old:
+				# An attachment copy (its item is the original's) or a row pointed elsewhere
+				# before 1.1.1: not this File's item to move.
+				return
+	doc.db_set(
+		{"custom_microsoft_status": MOVING, "custom_microsoft_error": None, "custom_microsoft_attempts": 0},
+		update_modified=False,
+	)
+	enqueue_follow_attachment(doc.name, *(old or (None, None)))
+
+
+def enqueue_follow_attachment(file_name, old_doctype=None, old_name=None):
+	frappe.enqueue(
+		"frappe_microsoft365.microsoft_files.follow_attachment",
+		queue="long",
+		file_name=file_name,
+		old_doctype=old_doctype,
+		old_name=old_name,
+		job_id=f"microsoft365-follow-{file_name}",
+		deduplicate=True,
+		enqueue_after_commit=True,
+	)
+
+
+def _settled_status(file_doc):
+	"""What a Moving File is once its move is done: Stored, or Archived for a link."""
+	return STORED if is_open_url(file_doc.file_url) else ARCHIVED
+
+
+def follow_attachment(file_name, old_doctype=None, old_name=None):
+	"""Background job: move a re-attached File's SharePoint item to its new record's folder.
+
+	Whoever can read a record sees and opens everything in its folder, so a File re-attached to
+	another record must not stay in the first record's folder for that record's readers.
+	Idempotent; counted, recorded and retried like an upload (MAX_ATTEMPTS, retry_pending).
+	``old_doctype``/``old_name``, the record it was attached to before, are given when the File
+	does not record its folder yet; see queue_follow_attachment.
+	"""
+	if not files_enabled() or not frappe.db.exists("File", file_name):
+		# With storage switched off the File stays Moving and still opens from where it is; the
+		# hourly retry carries on once storage is on again.
+		return
+	file_doc = frappe.get_doc("File", file_name)
+	if file_doc.get("custom_microsoft_status") != MOVING:
+		return
+	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
+	frappe.db.set_value("File", file_name, "custom_microsoft_attempts", attempts, update_modified=False)
+	frappe.db.commit()  # nosemgrep
+	try:
+		_follow(file_doc, (old_doctype, old_name) if old_doctype else None)
+		frappe.db.commit()  # nosemgrep
+	except Exception as e:
+		frappe.db.rollback()
+		frappe.db.set_value(
+			"File",
+			file_name,
+			{"custom_microsoft_error": str(e)[:1000], "custom_microsoft_attempts": attempts},
+			update_modified=False,
+		)
+		frappe.db.commit()  # nosemgrep
+		if attempts >= MAX_ATTEMPTS:
+			frappe.log_error(
+				title=_("Microsoft 365: re-attached file not moved"), message=f"File {file_name}: {e}"
+			)
+
+
+def _settle(file_doc, status=None, error=None):
+	frappe.db.set_value(
+		"File",
+		file_doc.name,
+		{"custom_microsoft_status": status or _settled_status(file_doc), "custom_microsoft_error": error},
+		update_modified=False,
+	)
+
+
+def _follow(file_doc, old):
+	"""The move itself; see follow_attachment. Raises on failure, for the job to record."""
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	item_id = file_doc.get("custom_microsoft_item_id")
+	if not (drive_id and item_id):
+		return _settle(file_doc)
+	holder = _holder_of(file_doc)
+	if not file_doc.get("custom_microsoft_folder_id"):
+		if not (holder and old) or (holder.reference_doctype, holder.reference_name) != old:
+			return _settle(
+				file_doc,
+				error=_(
+					"Not moved: its SharePoint item is not in the folder of the record it was attached to."
+				),
+			)
+		# Checked against the previous record; recorded, so a retry need not know that record.
+		frappe.db.set_value(
+			"File", file_doc.name, "custom_microsoft_folder_id", holder.item_id, update_modified=False
+		)
+	elif not holder:
+		return _settle(file_doc, error=_("Not moved: its SharePoint item is not in a record's folder."))
+
+	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
+	if (holder.reference_doctype, holder.reference_name) == (doctype, name):
+		return _settle(file_doc)  # already in the new record's folder (re-attached back, say)
+
+	shared = frappe.db.exists("File", {"custom_microsoft_item_id": item_id, "name": ["!=", file_doc.name]})
+	# The old item is removed only where the site has asked for SharePoint copies to be removed
+	# with their attachments; otherwise the File gets a copy and the old item stays put.
+	remove_old = not shared and bool(storage_option("files_delete_remote", holder.reference_doctype))
+	target = _folder_to_follow_into(file_doc)
+	if target and not shared and target.drive_id == drive_id:
+		# Within one library a move is one request and removes nothing.
+		item = graph.graph_request(
+			"PATCH",
+			f"/drives/{drive_id}/items/{item_id}",
+			APP,
+			json={"parentReference": {"id": target.item_id}},
+			params={"@microsoft.graph.conflictBehavior": "rename"},
+		)
+		_record_location(file_doc.name, item, target)
+		return _settle(file_doc)
+	if target:
+		_copy_into(file_doc, target)
+		_settle(file_doc)
+	elif is_open_url(file_doc.file_url):
+		# Nowhere in SharePoint to go: the new record's DocType is not mapped (or it is On demand
+		# with no folder), so the file comes back to this server like any of its attachments.
+		_settle(file_doc)
+		bring_back(file_doc.name)
+	else:
+		# An archived link: the link itself never moved, so only the copy is let go.
+		frappe.db.set_value(
+			"File",
+			file_doc.name,
+			{
+				"custom_microsoft_status": None,
+				"custom_microsoft_item_id": None,
+				"custom_microsoft_error": None,
+			},
+			update_modified=False,
+		)
+	if remove_old:
+		try:
+			graph.graph_request("DELETE", f"/drives/{drive_id}/items/{item_id}", APP)
+		except MsGraphNotFound:
+			_forget_message()
+
+
+def _folder_to_follow_into(file_doc):
+	"""The folder a re-attached File's item belongs in now, or None when its new record has none
+	to give: an unmapped DocType, a field attachment (those stay on this
+	server, see _eligible), or an On demand record nobody asked a folder for. Creating the folder
+	commits (see ensure_folder)."""
+	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
+	if not (doctype and name) or file_doc.attached_to_field:
+		return None
+	row = mapping_for(doctype)
+	if not row or (is_on_demand(row) and not get_folder(doctype, name)):
+		return None
+	return ensure_folder(doctype, name)
+
+
+def _holder_of(file_doc):
+	"""The SharePoint Folder row of the record folder a File's item is in, or None."""
+	drive_id = file_doc.get("custom_microsoft_drive_id")
+	folders = {
+		row.item_id: row
+		for row in frappe.get_all(
+			"SharePoint Folder",
+			filters={"drive_id": drive_id},
+			fields=["item_id", "reference_doctype", "reference_name"],
+		)
+	}
+	holder = folders.get(file_doc.get("custom_microsoft_folder_id") or "")
+	if not holder:
+		try:
+			holder = folders.get(
+				_known_folder_holding(drive_id, file_doc.get("custom_microsoft_item_id"), folders) or ""
+			)
+		except MsGraphNotFound:
+			_forget_message()
+			return None
+	return holder
+
+
+def _record_location(file_name, item, folder):
+	"""Write where a File's SharePoint item now is."""
+	frappe.db.set_value(
+		"File",
+		file_name,
+		{
+			"custom_microsoft_drive_id": _drive_of(item, folder),
+			"custom_microsoft_item_id": item["id"],
+			"custom_microsoft_folder_id": folder.item_id,
+			"custom_microsoft_web_url": item.get("webUrl"),
+		},
+		update_modified=False,
+	)
+
+
+def _copy_into(file_doc, folder):
+	"""Give a File its own copy of its SharePoint item, in ``folder`` (another library, or an
+	item it shares with attachment copies). Streams through a temporary file."""
+	resp = graph.graph_request(
+		"GET",
+		f"/drives/{file_doc.custom_microsoft_drive_id}/items/{file_doc.custom_microsoft_item_id}/content",
+		APP,
+		raw=True,
+		stream=True,
+		timeout=120,
+	)
+	with tempfile.TemporaryFile() as fh:
+		try:
+			for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
+				fh.write(chunk)
+		finally:
+			resp.close()
+		size = fh.tell()
+		fh.seek(0)
+		name = upload_name(file_doc, folder)
+		item = upload_stream(
+			folder.drive_id,
+			folder.item_id,
+			name,
+			fh,
+			size,
+			mimetypes.guess_type(name)[0] or "application/octet-stream",
+		)
+	_record_location(file_doc.name, item, folder)
+
+
+def on_file_delete(doc, method=None):
+	"""File.after_delete: remove a moved file's kept local copy with it.
+
+	Frappe deletes a File's bytes only when it has a content_hash, which the move clears, so
+	without this the kept copy would stay on disk (in public/files, for a public file) forever.
+	"""
+	try:
+		_drop_kept_copy(doc)
+	except Exception:
+		frappe.log_error(title=_("Microsoft 365: could not remove local copy"), message=doc.name)
+
+
 def on_doc_trash(doc, method=None):
 	"""Any document's on_trash: forget its folder record. The SharePoint folder is kept."""
 	if doc.doctype in ("SharePoint Folder", "File") or doc.doctype not in mapped_doctypes():
@@ -1411,7 +2187,14 @@ def on_doc_trash(doc, method=None):
 
 
 def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
-	"""Any document's after_rename: keep the folder record, and rename the folder to match."""
+	"""Any document's after_rename: keep the record's folder linked to it under its new name.
+
+	The SharePoint folder itself is never renamed. It may be one an administrator linked by hand
+	(a Teams channel's folder, shared by people who never use the ERP), people bookmark and sync
+	folders by name, and the link does not need it: it is kept by the folder's item id. Frappe
+	normally rewrites the folder row's reference_name (a Dynamic Link) before this runs; this
+	covers a row it did not.
+	"""
 	if doc.doctype not in mapped_doctypes():
 		return
 	folder = get_folder(doc.doctype, old)
@@ -1419,32 +2202,10 @@ def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
 		return
 	touch_mapping(doc.doctype)
 	if merge or get_folder(doc.doctype, new):
+		# Merged into a record that has a folder of its own: that one stays its folder.
 		frappe.db.delete("SharePoint Folder", {"name": folder.name})
 		return
 	frappe.db.set_value("SharePoint Folder", folder.name, "reference_name", new, update_modified=False)
-	row = mapping_for(doc.doctype)
-	new_name = render_pattern(row.folder_pattern, frappe.get_doc(doc.doctype, new))
-	if new_name == folder.folder_name:
-		return
-	try:
-		item = graph.graph_request(
-			"PATCH",
-			f"/drives/{folder.drive_id}/items/{folder.item_id}",
-			APP,
-			json={
-				"name": new_name,
-				"@microsoft.graph.conflictBehavior": "fail",
-			},
-		)
-		frappe.db.set_value(
-			"SharePoint Folder",
-			folder.name,
-			{"folder_name": new_name, "web_url": item.get("webUrl")},
-			update_modified=False,
-		)
-	except Exception:
-		# The record is renamed either way; the folder keeps its old name and still links.
-		frappe.log_error(title=_("Microsoft 365: could not rename SharePoint folder"))
 
 
 # --- retries and migration ---------------------------------------------------------------
@@ -1469,6 +2230,18 @@ def retry_pending():
 	)
 	for name in names:
 		enqueue_upload(name)
+	# Re-attached files whose move to the new record's folder has not finished (follow_attachment).
+	for name in frappe.get_all(
+		"File",
+		filters={
+			"custom_microsoft_status": MOVING,
+			"custom_microsoft_attempts": ["<", MAX_ATTEMPTS],
+			"modified": ["<", cutoff],
+		},
+		pluck="name",
+		limit=200,
+	):
+		enqueue_follow_attachment(name)
 
 
 @frappe.whitelist()
@@ -1516,7 +2289,7 @@ def storage_summary():
 	# One count per status rather than a GROUP BY: newer Frappe refuses SQL functions written as
 	# strings in fields, and the dict form it wants instead does not exist on v15.
 	counts = {}
-	for status in (STORED, ARCHIVED, PENDING, FAILED):
+	for status in (STORED, ARCHIVED, MOVING, PENDING, FAILED):
 		count = frappe.db.count("File", {"custom_microsoft_status": status})
 		if count:
 			counts[status] = count
@@ -1607,7 +2380,9 @@ def assert_app_item(file_doc, for_delete=False):
 	"""
 	drive_id = file_doc.get("custom_microsoft_drive_id")
 	item_id = file_doc.get("custom_microsoft_item_id")
-	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
+	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED, MOVING) or not (
+		drive_id and item_id
+	):
 		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
 	folders = {
@@ -1702,23 +2477,28 @@ def own_local_copy(file_doc, url):
 	return not frappe.db.exists("File", {**others, "custom_microsoft_local_url": url})
 
 
-@frappe.whitelist(methods=["GET"])
+# Guest for public Files only (is_private=0), which were readable by anyone at /files before
+# they moved; a private one still needs a signed-in user who may read it (see below).
+@frappe.whitelist(methods=["GET"], allow_guest=True)  # nosemgrep
 def open_file(file: str, download: int = 0):
 	"""Open a File that was moved to SharePoint. The file_url of every moved File points here.
 
-	Permission is the File's own, exactly as for /private/files: any File row carrying this URL
-	that the user may read will do, because attachment copies share one URL.
+	Permission is the File's own, exactly as for /files and /private/files: any File row carrying
+	this URL that the user may read will do, because attachment copies share one URL. A public
+	File (is_private=0) was readable by anyone at /files before it moved — an image on a web
+	page, a link in a customer email — so it still is, signed in or not; a private one needs a
+	signed-in user who may read it.
 	"""
 	from frappe.core.doctype.access_log.access_log import make_access_log
 	from frappe.core.doctype.file.utils import find_file_by_url
 
-	if frappe.session.user == "Guest":
-		raise frappe.PermissionError(_("You must be logged in to open this file."))
-
+	guest = frappe.session.user == "Guest"
 	file_doc = find_file_by_url(stored_url(file))
+	if guest and (not file_doc or cint(file_doc.is_private)):
+		raise frappe.PermissionError(_("You must be logged in to open this file."))
 	if not file_doc:
 		raise frappe.PermissionError(_("You don't have permission to access this file"))
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
 	local = file_doc.get("custom_microsoft_local_url")
@@ -1751,13 +2531,71 @@ def open_file(file: str, download: int = 0):
 	return response
 
 
-def fetch_content(drive_id, item_id):
-	"""The whole content of a driveItem as bytes. For File.get_content; not for big files."""
+#: The default for max_content_bytes when Frappe names no upload limit of its own.
+DEFAULT_MAX_CONTENT_BYTES = 25 * 1024 * 1024
+
+
+def max_content_bytes():
+	"""The largest file File.get_content reads from SharePoint, in bytes.
+
+	get_content hands back the whole file as one value (to attach it to an email, a print, an
+	import), so a multi-gigabyte video would take a worker's memory with it. The limit is
+	Frappe's own upload limit, the size Frappe already holds in memory when a file is attached,
+	unless site_config.json sets ``microsoft365_max_content_bytes``.
+	"""
+	configured = cint(frappe.conf.get("microsoft365_max_content_bytes"))
+	if configured:
+		return configured
+	try:
+		from frappe.core.api.file import get_max_file_size
+
+		return cint(get_max_file_size()) or DEFAULT_MAX_CONTENT_BYTES
+	except ImportError:
+		return DEFAULT_MAX_CONTENT_BYTES
+
+
+def _too_big(size, limit):
+	frappe.throw(
+		_(
+			"This file is {0} MB, more than the {1} MB that can be read from SharePoint in one piece (to attach it to an email, a print or an import). Open it from the record instead, or send a link to it."
+		).format(round(size / (1024 * 1024), 1), round(limit / (1024 * 1024), 1)),
+		title=_("File too large"),
+	)
+
+
+def iter_content(drive_id, item_id, chunk_size=DOWNLOAD_CHUNK_BYTES):
+	"""A driveItem's bytes in pieces, for callers that can take them as a stream. Any size."""
 	resp = graph.graph_request(
-		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, timeout=120
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, stream=True, timeout=120
 	)
 	try:
-		return resp.content
+		yield from resp.iter_content(chunk_size)
+	finally:
+		graph._release(resp)
+
+
+def fetch_content(drive_id, item_id):
+	"""The whole content of a driveItem as bytes, for File.get_content.
+
+	Streamed and counted, so that a file over max_content_bytes is refused with a clear message
+	— from its Content-Length before any of it is read, or as soon as the count passes the
+	limit — instead of being read into memory whole. iter_content serves callers that stream.
+	"""
+	limit = max_content_bytes()
+	resp = graph.graph_request(
+		"GET", f"/drives/{drive_id}/items/{item_id}/content", APP, raw=True, stream=True, timeout=120
+	)
+	try:
+		length = cint((resp.headers or {}).get("Content-Length"))
+		if length > limit:
+			_too_big(length, limit)
+		parts, size = [], 0
+		for chunk in resp.iter_content(DOWNLOAD_CHUNK_BYTES):
+			size += len(chunk)
+			if size > limit:
+				_too_big(size, limit)
+			parts.append(chunk)
+		return b"".join(parts)
 	finally:
 		graph._release(resp)
 
@@ -2087,14 +2925,19 @@ def bring_back(file_name):
 	SharePoint copy is left where it is. Returns the local URL the file now has.
 	"""
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		return file_doc.file_url
 
 	old_url = file_doc.file_url
+	# A kept copy in the wrong place for the File's privacy is moved first, so that what comes
+	# back is where the File's privacy says, never at the old public address of a private file.
+	follow_privacy(file_doc)
 	target = file_doc.get("custom_microsoft_local_url")
-	prefix = "/private/files/" if file_doc.is_private else "/files/"
-	if not target or ".." in target.split("/"):
-		target = prefix + safe_file_name(file_doc.file_name or file_doc.name)
+	prefix = _privacy_prefix(file_doc)
+	if not target or ".." in target.split("/") or not target.startswith(prefix):
+		target = prefix + safe_file_name(
+			(target or "").rsplit("/", 1)[-1] or file_doc.file_name or file_doc.name
+		)
 	path = local_path(target)
 
 	# A kept copy is reused only if it is still this file's bytes (see own_local_copy).
@@ -2160,7 +3003,7 @@ def leave_in_sharepoint(file_name):
 	whoever has access to the site. Returns the URL the attachment now has.
 	"""
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		return file_doc.file_url
 	old_url = file_doc.file_url
 	web_url = file_doc.get("custom_microsoft_web_url")
@@ -2273,7 +3116,10 @@ def upgrade_check_files_in_other_records_folders():
 		"custom_microsoft_web_url",
 	] + (["custom_microsoft_folder_id"] if has_folder_id else [])
 	rows = frappe.get_all(
-		"File", filters={"custom_microsoft_status": ["in", [STORED, ARCHIVED]]}, fields=fields, order_by="name asc"
+		"File",
+		filters={"custom_microsoft_status": ["in", [STORED, ARCHIVED, MOVING]]},
+		fields=fields,
+		order_by="name asc",
 	)
 	if not rows:
 		return []
@@ -2358,7 +3204,7 @@ def upgrade_check_file_items():
 		for r in frappe.get_all(
 			"File",
 			or_filters={
-				"custom_microsoft_status": ["in", [STORED, ARCHIVED]],
+				"custom_microsoft_status": ["in", [STORED, ARCHIVED, MOVING]],
 				"file_url": ["like", f"%{OPEN_METHOD}%"],
 			},
 			fields=fields,
@@ -2386,9 +3232,9 @@ def upgrade_check_file_items():
 	for row in rows:
 		if (row.drive_id, row.item_id) in folder_ids:
 			is_folder.append(row)
-		elif row.status not in (STORED, ARCHIVED) or not (row.drive_id and row.item_id):
+		elif row.status not in (STORED, ARCHIVED, MOVING) or not (row.drive_id and row.item_id):
 			odd_status.append(row)
-		elif row.status == STORED and not is_open_url(row.file_url):
+		elif row.status in (STORED,) and not is_open_url(row.file_url):
 			odd_status.append(row)
 		elif not under_known_folder(row):
 			outside.append(row)
@@ -2431,6 +3277,100 @@ def upgrade_check_file_items():
 					"Judged by their recorded SharePoint address, so a folder renamed or removed since the move also shows up here: {0}"
 				).format(_names(outside)),
 				fix,
+			)
+		)
+	return out
+
+
+def upgrade_check_orphaned_kept_copies():
+	"""Kept local copies of moved Files that were deleted before 1.2.0, still on disk.
+
+	Frappe removes a File's bytes only when it has a content_hash, which the move clears, so until
+	1.2.0 deleting a moved File left its kept copy behind (in public/files for a public file). The
+	deleted rows are read back from Deleted Document; a copy is listed when it is still on disk,
+	no File uses it, and, where the bytes were hashed at the move, they are still those bytes.
+	Read only: nothing is deleted, because only a person can say nothing else needs the file.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	if not has_file_fields() or not frappe.db.table_exists("Deleted Document"):
+		return []
+	filters = {"deleted_doctype": "File", "data": ["like", '%"custom_microsoft_local_url": "/%']}
+	if frappe.get_meta("Deleted Document").has_field("restored"):
+		filters["restored"] = 0
+	left = []
+	for row in frappe.get_all(
+		"Deleted Document", filters=filters, fields=["deleted_name", "data"], order_by="creation asc"
+	):
+		try:
+			data = frappe._dict(json.loads(row.data))
+		except ValueError:
+			continue
+		local = data.get("custom_microsoft_local_url") or ""
+		if data.get("custom_microsoft_status") not in (STORED, MOVING) or local in left:
+			continue
+		if ".." in local.split("/") or not local.startswith(("/files/", "/private/files/")):
+			continue
+		path = local_path(local)
+		if not os.path.isfile(path) or _blob_users(local, None):
+			continue
+		recorded = data.get("custom_microsoft_content_hash")
+		if recorded and _hash_of(path) != recorded:
+			continue
+		left.append(local)
+	if not left:
+		return []
+	public = [url for url in left if url.startswith("/files/")]
+	return [
+		finding(
+			"upgrade.sharepoint_orphaned_kept_copies",
+			WARN,
+			_("{0} kept local copies of deleted Files are still on this server ({1} in public files)").format(
+				len(left), len(public)
+			),
+			_names(left),
+			_(
+				"These Files were moved to SharePoint with Keep Local Copy on and deleted later; their copies on disk were never removed, and the ones under /files/ can be downloaded by anyone who has the address. Nothing in Frappe uses them. Delete them from the site's public/files and private/files folders unless something outside Frappe needs them. Files deleted from 1.2.0 on take their kept copy with them."
+			),
+		)
+	]
+
+
+def upgrade_check_long_paths():
+	"""SharePoint Mappings whose library and base folder leave little of SharePoint's path limit.
+
+	SharePoint refuses a file whose whole path passes 400 characters. From 1.2.0 a mapping whose
+	base path leaves too little room is refused when it is saved, and record folders are named to
+	leave room for their files; mappings saved before are listed here. Read only, without Graph.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	if not frappe.db.table_exists("SharePoint Mapping"):
+		return []
+	out = []
+	for row in frappe.get_all(
+		"SharePoint Mapping",
+		fields=["name", "reference_doctype", "site_url", "library", "use_base_folder", "base_folder"],
+		order_by="name asc",
+	):
+		try:
+			used = base_path_length(row)
+		except Exception:
+			continue  # an unreadable site address is the doctor's to report
+		if used <= MAX_PATH_LENGTH - MIN_ROOM_FOR_RECORDS:
+			continue
+		out.append(
+			finding(
+				"upgrade.sharepoint_long_paths",
+				WARN,
+				_("The {0} mapping's base folder uses {1} of SharePoint's {2} path characters").format(
+					_(row.reference_doctype), used, MAX_PATH_LENGTH
+				),
+				"/".join([library_path(row), *base_segments(row)]),
+				_(
+					"Uploads into it fail once a record folder and a file name take the path past {0} characters. Shorten the Base Folder on the mapping (and rename or move the folder in SharePoint to match); the mapping cannot be saved again until its base path leaves at least {1} characters."
+				).format(MAX_PATH_LENGTH, MIN_ROOM_FOR_RECORDS),
+				target=row.reference_doctype,
 			)
 		)
 	return out

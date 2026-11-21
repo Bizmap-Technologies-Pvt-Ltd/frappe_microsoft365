@@ -3,7 +3,8 @@
 This app ships **one codebase for both versions**, and CI installs, migrates, builds and runs the
 full suite against both on every push and pull request. Almost everything behaves the same on
 both. The exceptions are few and deliberate, and this page lists them all: one capability is
-v16-only, and the app finds out which version it is running on through a single function.
+v16-only, the app finds out which version it is running on through a single function, and
+Microsoft sign-in checks for two Frappe 16 features directly.
 
 This document records *why* the rest is safe, so the next change does not have to re-derive it.
 
@@ -15,7 +16,7 @@ This document records *why* the rest is safe, so the next change does not have t
 | Standalone Teams meetings | yes | yes |
 | Meeting transcripts and recordings | yes | yes |
 | Outlook mail over OAuth | yes | yes |
-| Sign in with Microsoft | yes, with Frappe 15's own OAuth state handling | yes, the OAuth state is validated server-side |
+| Sign in with Microsoft | yes; this app checks the directory and the OAuth state in its callback | yes; Frappe checks the state, and the directory is checked in the callback and in `on_social_login` |
 | SharePoint document storage | **no** — Microsoft Settings refuses the tickbox | yes |
 | Moved attachments readable by server-side code (`File.get_content()`) | n/a (needs SharePoint storage) | yes, through `extend_doctype_class` |
 | Desk scripts (`microsoft_doctor.bundle.js`, `microsoft_files.bundle.js`) | built by `bench build` | built by `bench build` |
@@ -29,10 +30,40 @@ when the site runs an older one, saying which version it needs. The reason is
 such hook (`hooks.py` declares it on both; v15 ignores it), so on v15 server-side readers would
 get no content. See [SharePoint document storage](sharepoint-files.md#frappe-v15).
 
-**Sign in with Microsoft uses Frappe's own social login.** This app creates the `Social Login
-Key`; Frappe handles the redirect and the callback. Frappe 16 stores each sign-in's OAuth `state`
-on the server and accepts it back only once. On Frappe 15, Microsoft sign-in relies on Frappe 15's
-own `state` handling, which does not validate the `state` against anything stored on the server.
+**Sign in with Microsoft uses Frappe's own social login, through this app's callback.** This app
+creates the `Social Login Key`; Frappe handles the redirect. The callback,
+`frappe.integrations.oauth2_logins.login_via_office365`, is routed to
+`frappe_microsoft365.sign_in.login_via_office365` through `override_whitelisted_methods` on both
+versions. It does what Frappe's own callback does — `get_info_via_oauth` decodes the ID token,
+`login_oauth_user` signs the user in — and in between refuses a token from any directory other
+than the one in Tenant ID (or any token at all while Tenant ID is multi-tenant).
+
+- **Frappe 16** also calls the `on_social_login` hook from `login_oauth_user`, and this app
+  registers the same rule there. The rule only reads, so running it in the callback and again
+  in the hook gives the same answer; the callback runs it first so that a refusal happens before
+  Frappe writes to the user record and is shown as a page saying why (an exception raised in the
+  hook is shown by Frappe as *Session Expired*). Frappe 16 stores each sign-in's OAuth `state` on
+  the server and accepts it back only once; the callback leaves that to Frappe.
+- **Frappe 15** has no `on_social_login` hook, so the callback is the only place the directory
+  rule runs. Frappe 15 also does not check the `state` against anything stored on the server:
+  any state with a `token` in it is accepted, which allows login CSRF (a visitor's browser being
+  signed in as someone else's account). For Microsoft sign-in this app closes that the way
+  Frappe 16 does. An `update_website_context` hook reads the `state` Frappe 15's login page puts
+  in the Microsoft button's URL and stores its token in Redis for ten minutes; the callback
+  deletes it, and accepts the sign-in only if it was there, before asking Microsoft for anything.
+  What remains:
+  - other social login providers on a Frappe 15 site (Google, GitHub, …) are not covered — the
+    doctor shows a WARN (`sso.frappe15_state`) for every Frappe 15 site with Microsoft sign-in
+    enabled;
+  - a site whose login page is not Frappe's own must still build the Microsoft button through the
+    login page's `provider_logins` context, or the state is never stored and every Microsoft
+    sign-in is refused as *invalid or expired*;
+  - as on Frappe 16, the state is single-use and short-lived but not tied to the browser that
+    started the sign-in.
+- If another installed app overrides the same callback, the last app in `apps.txt` wins. On
+  Frappe 15 that would switch both checks off, and the doctor reports it as a FAIL
+  (`sso.callback_not_checked`).
+
 Connecting a Microsoft Calendar is a different flow, and the same on both versions: this app
 issues its own `state`, stores it on the `Microsoft Calendar` with an expiry, and checks it in the
 callback.
@@ -103,6 +134,10 @@ Every place the code knows which version it runs on:
   version check in app code. `capabilities.unmet()` and `Microsoft Settings` validation use it to
   keep SharePoint storage off below v16. A new v16-only feature belongs here too: give its
   capability `min_frappe=16` rather than adding a separate version check.
+- **`sign_in.frappe_checks_login_state()`** and **`sign_in.frappe_runs_sign_in_hook()`** —
+  feature checks, not version checks: whether Frappe's OAuth module has `consume_oauth_state`,
+  and whether its `login_oauth_user` calls `on_social_login`. The sign-in callback validates the
+  state itself only when Frappe does not, and the doctor uses both for its sign-in findings.
 - **`extend_doctype_class`** in `hooks.py` (`file_extension.SharePointFile`) — a v16 hook that v15
   ignores. Only reached for files moved to SharePoint, which v15 cannot have.
 - **`frappe_microsoft365/tests/base.py`**:

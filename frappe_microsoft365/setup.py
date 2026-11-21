@@ -276,6 +276,58 @@ def create_event_custom_fields(only_definitions=False):
 				"description": "Everyone invited, with their reply. Refreshed by each sync.",
 				"depends_on": "eval:doc.custom_sync_with_microsoft_calendar",
 			},
+			{
+				"fieldname": "custom_microsoft_orphaned",
+				"fieldtype": "Check",
+				"label": "Missing From Outlook",
+				"insert_after": "custom_microsoft_attendees",
+				"read_only": 1,
+				"no_copy": 1,
+				"depends_on": "eval:doc.custom_microsoft_orphaned",
+				"description": (
+					"Outlook no longer has this event (or, for a repeating event, its series). It was "
+					"probably deleted there; check, then delete it here if it is no longer needed."
+				),
+			},
+			{
+				# The Graph series master this Event belongs to. On a repeating Event this app
+				# pushed it is its own id, once Graph has confirmed it is a series; on a mirrored
+				# occurrence changed on its own in Outlook, the series it was changed from.
+				"fieldname": "custom_microsoft_series_master_id",
+				"fieldtype": "Data",
+				"label": "Microsoft Series ID",
+				"insert_after": "custom_microsoft_sync_state",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+				# Graph ids run to ~150 characters; see custom_microsoft_event_id.
+				"length": 768,
+			},
+			{
+				# What Outlook was last sent, or last showed, for each property the push writes —
+				# fingerprints, plus the attendee addresses. A push sends only what differs from
+				# it, so an attendee or an agenda changed in Outlook is not overwritten by an
+				# unrelated edit in Frappe. Long Text: nothing queries it.
+				"fieldname": "custom_microsoft_sync_state",
+				"fieldtype": "Long Text",
+				"label": "Microsoft Sync State",
+				"insert_after": "custom_microsoft_seen_in_round",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
+			{
+				# When this mirror was last seen in a full read of its calendar's window: the key of
+				# that read. A full read that ends without having seen a mirror is how one Outlook
+				# deleted while nobody was looking (a resync, a window reset) is told apart.
+				"fieldname": "custom_microsoft_seen_in_round",
+				"fieldtype": "Datetime",
+				"label": "Seen In Calendar Read",
+				"insert_after": "custom_microsoft_orphaned",
+				"read_only": 1,
+				"hidden": 1,
+				"no_copy": 1,
+			},
 		]
 	}
 	if only_definitions:
@@ -283,7 +335,7 @@ def create_event_custom_fields(only_definitions=False):
 	create_custom_fields(custom_fields, ignore_validate=True)
 
 
-FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nFailed"
+FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nMoving\nFailed"
 
 
 def create_file_custom_fields(only_definitions=False):
@@ -319,7 +371,7 @@ def create_file_custom_fields(only_definitions=False):
 				"in_list_view": 1,
 				"in_standard_filter": 1,
 				"search_index": 1,
-				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
+				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Moving:</b> re-attached to another record; on its way to that record's folder (it still opens). Retried hourly; see Last SharePoint Error.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
 			},
 			{
 				"fieldname": "custom_microsoft_web_url",

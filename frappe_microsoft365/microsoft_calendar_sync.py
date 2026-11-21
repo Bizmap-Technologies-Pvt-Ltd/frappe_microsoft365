@@ -14,13 +14,22 @@ things a filter cannot:
   * a watermark we only advance once every page has been consumed, so a failure mid-run
     means the next run repeats the work instead of skipping it.
 
+The window is renewed about once a month so it always reaches WINDOW_FUTURE_DAYS ahead. A
+read of the whole window (a first sync, a renewal, a resync) is the one moment the full list of
+what Outlook has is known; mirrors it did not return are flagged Missing From Outlook.
+
 Origin matters
 --------------
 An Event that originated in Frappe (we pushed it) keeps
 ``custom_pulled_from_microsoft = 0`` forever. The pull never flips that flag and never
 overwrites the description of such an event, because Graph only hands back a truncated
 plain-text ``bodyPreview``. Events that originated in Microsoft are mirrors and are fully
-overwritten by the pull.
+overwritten by the pull. Either kind, once somebody unticks Sync with Microsoft Calendar on it,
+is left alone by the pull.
+
+The push sends only what changed in Frappe: every Event keeps a sync state of what Outlook was
+last sent or last showed (see "what Outlook last saw"), so changes made in Outlook survive an
+unrelated edit in Frappe, and a save the pull makes is never echoed back.
 
 Attendees
 ---------
@@ -34,18 +43,22 @@ Third-party meeting links (Zoom, Google Meet) are *not* extracted: Microsoft onl
 
 What waits for Graph, and what does not
 --------------------------------------
-Saving an Event that Microsoft has never seen calls Graph inside the save: the join link Graph
-hands back is written onto the very document the browser is waiting for, and a link that turns
-up "in a minute" is not one anybody can paste into the invitation they are writing. Every other
-Graph call a save triggers — patching an event that already exists, deleting one — is queued
-instead, because nothing on screen depends on the answer and a throttled Graph can otherwise
-hold a save open for ten seconds. The scheduled pass queues as well, one job per calendar, so
-that a slow calendar cannot spend the budget of the calendars behind it in the list.
+Saving an Event that asks for a new Teams meeting calls Graph inside the save: the join link
+Graph hands back is written onto the very document the browser is waiting for, and a link that
+turns up "in a minute" is not one anybody can paste into the invitation they are writing. If
+that save rolls back, the meeting is deleted again. Every other Graph call a save triggers —
+creating an ordinary event, patching one that exists, deleting one — is queued to run once the
+save has committed, because nothing on screen depends on the answer, a throttled Graph can
+otherwise hold a save open for ten seconds, and a save that rolls back must leave nothing in
+Outlook. The scheduled pass queues as well, one job per calendar, so that a slow calendar cannot
+spend the budget of the calendars behind it in the list; it commits event by event.
 
 All Graph calls go through ``microsoft_graph`` (auth/refresh/paging/clean errors).
 Everything is guarded so an unconfigured / unauthorized site never raises on schedule.
 """
 
+import hashlib
+import json
 import time
 
 import frappe
@@ -60,7 +73,12 @@ from frappe.utils import (
 
 from frappe_microsoft365 import background
 from frappe_microsoft365 import microsoft_graph as graph
-from frappe_microsoft365.microsoft_graph import MsGraphError, MsGraphResyncRequired
+from frappe_microsoft365.microsoft_graph import (
+	MsGraphError,
+	MsGraphNotFound,
+	MsGraphResyncRequired,
+	MsGraphThrottled,
+)
 
 EVENT_SELECT = (
 	"id,subject,bodyPreview,start,end,location,isAllDay,isCancelled,"
@@ -76,10 +94,16 @@ EVENT_SELECT = (
 )
 
 #: How much of the calendar the delta window covers. Graph fixes the window when the delta
-#: is initialised, so we re-initialise before the far edge gets close.
+#: is initialised and never moves it, so its far edge comes closer every day.
 WINDOW_PAST_DAYS = 30
+#: The look-ahead the sync promises: an event starting less than this far ahead is always
+#: inside the window. The window used to be re-initialised only 14 days before it ran out, so
+#: by then it saw two weeks ahead, and a meeting booked for next quarter was not pulled at all.
 WINDOW_FUTURE_DAYS = 180
-WINDOW_REFRESH_MARGIN_DAYS = 14
+#: How often the window is re-initialised. It is asked for this much further ahead than the
+#: look-ahead, and renewed as soon as the look-ahead would drop below WINDOW_FUTURE_DAYS, so a
+#: renewal (one full read of the window) happens about once a month.
+WINDOW_RESET_DAYS = 30
 
 #: How many Microsoft ids go into one prefetch query. A delta page can carry thousands of them,
 #: and at that size an ``IN`` clause stops behaving like a lookup: the statement grows past what
@@ -198,6 +222,71 @@ def _system_dt_to_ms(dt):
 	"""Format a Frappe datetime as a Graph dateTimeTimeZone dict in the system timezone."""
 	dt = get_datetime(dt)
 	return {"dateTime": dt.isoformat(), "timeZone": get_system_timezone()}
+
+
+# --- all-day events -------------------------------------------------------------------
+#
+# An all-day event is a run of calendar dates, not a span of time. Graph stores it as
+# midnight-to-midnight with an exclusive end (25 Dec is 25 Dec 00:00 to 26 Dec 00:00) and hands
+# it back in whatever timezone the request preferred, which for this sync is UTC. Converting
+# that midnight into the site's timezone, as a timed event is converted, moved Christmas to
+# 05:30 on a Kolkata site and to 19:00 on Christmas Eve on a New York one. So the dates are
+# read and written as they are, with no conversion in either direction.
+#
+# Frappe keeps the end inclusive: its calendar stores an all-day event as 00:00:00 on the first
+# day to 23:59:59 on the last, and draws it from those dates.
+
+
+def _graph_date(dt):
+	"""The calendar date of a Graph dateTimeTimeZone dict, read as written (no conversion)."""
+	from dateutil import parser
+
+	if not dt or not dt.get("dateTime"):
+		return None
+	return parser.parse(dt["dateTime"]).date()
+
+
+def _all_day_to_system(start, end):
+	"""Graph's all-day ``start``/``end`` dicts as Frappe's (first day 00:00, last day 23:59:59)."""
+	import datetime
+
+	first = _graph_date(start)
+	if not first:
+		return None, None
+	after = _graph_date(end)
+	# Graph's end is the midnight after the last day. An end on or before the start would be an
+	# event of no days at all, which is read as the one day it starts on.
+	last = after - datetime.timedelta(days=1) if after and after > first else first
+	return (
+		datetime.datetime.combine(first, datetime.time.min),
+		datetime.datetime.combine(last, datetime.time(23, 59, 59)),
+	)
+
+
+def _all_day_to_ms(starts_on, ends_on):
+	"""A Frappe all-day Event's dates as Graph's midnight ``start`` and exclusive midnight ``end``.
+
+	Graph refuses an all-day event whose start or end is not a midnight, so an end of 23:59:59 —
+	what Frappe's own calendar stores — is turned into the midnight after that day. An end that
+	is already a later midnight is taken as the exclusive end it looks like.
+	"""
+	import datetime
+
+	first = get_datetime(starts_on).date()
+	end = get_datetime(ends_on) if ends_on else None
+	if end and end.time() == datetime.time.min and end.date() > first:
+		after = end.date()
+	elif end:
+		after = end.date() + datetime.timedelta(days=1)
+	else:
+		after = first + datetime.timedelta(days=1)
+	if after <= first:
+		after = first + datetime.timedelta(days=1)
+	tz = get_system_timezone()
+	return (
+		{"dateTime": f"{first.isoformat()}T00:00:00", "timeZone": tz},
+		{"dateTime": f"{after.isoformat()}T00:00:00", "timeZone": tz},
+	)
 
 
 def _iso_utc(dt):
@@ -453,6 +542,10 @@ def _sync_locked(doc):
 			frappe.log_error(title=f"MS Calendar pull failed: {calendar_name}")
 		if doc.flags.pull_warning:
 			messages.append(doc.flags.pull_warning)
+		# The pull's writes are committed before the push starts. Left open, they held their row
+		# locks through every Graph call the push makes — minutes, on a busy calendar — and
+		# anybody saving one of those Events waited on the sync, or timed out.
+		frappe.db.commit()  # nosemgrep
 
 	if doc.push_to_microsoft_calendar:
 		try:
@@ -460,6 +553,8 @@ def _sync_locked(doc):
 		except Exception as e:
 			messages.append(f"Push failed: {e}")
 			frappe.log_error(title=f"MS Calendar push failed: {calendar_name}")
+		if doc.flags.push_warning:
+			messages.append(doc.flags.push_warning)
 
 	# The watermark only moves when the pull actually completed. Advancing it after a
 	# failure would silently skip every change made inside the failed window.
@@ -484,6 +579,11 @@ def _sync_locked(doc):
 	frappe.db.commit()  # nosemgrep
 
 	summary = f"Pulled {pulled}, deleted {deleted}, pushed {pushed}."
+	if doc.flags.orphans_flagged:
+		summary += " " + _(
+			"{0} events synced with this calendar are no longer in Outlook and were marked Missing "
+			"From Outlook; Microsoft Settings > Troubleshoot > Run Diagnostics lists them."
+		).format(doc.flags.orphans_flagged)
 	if doc.flags.pull_unfinished:
 		# Not an error: a large calendar is read over several runs, and this says so.
 		summary += " " + _("More changes are waiting in Microsoft; the next sync carries on from here.")
@@ -516,7 +616,7 @@ def background_reasons(doc):
 		elif not doc.delta_link:
 			reasons.append(_("This is a first sync, so the whole calendar window is read."))
 		elif _delta_window_is_stale(doc):
-			reasons.append(_("The sync window has run out, so the calendar is read again in full."))
+			reasons.append(_("The sync window is due to be renewed, so the calendar is read again in full."))
 
 	if doc.push_to_microsoft_calendar:
 		pending = _pending_push_count(doc)
@@ -560,19 +660,33 @@ def _pending_push_count(doc):
 def _initial_delta_path(now=None):
 	now = now or now_datetime()
 	start = _iso_utc(add_to_date(now, days=-WINDOW_PAST_DAYS))
-	end = _iso_utc(add_to_date(now, days=WINDOW_FUTURE_DAYS))
+	end = _iso_utc(_window_end_from(now))
 	return (
 		f"/me/calendarView/delta?startDateTime={start}&endDateTime={end}"
 		f"&$select={EVENT_SELECT}"
 	)
 
 
+def _window_end_from(now):
+	"""Where a window initialised at ``now`` ends."""
+	return add_to_date(now, days=WINDOW_FUTURE_DAYS + WINDOW_RESET_DAYS)
+
+
+def _window_start_of(window_end):
+	"""Where the window that ends at ``window_end`` started (its round's ``now`` minus the past)."""
+	return add_to_date(get_datetime(window_end), days=-(WINDOW_PAST_DAYS + WINDOW_FUTURE_DAYS + WINDOW_RESET_DAYS))
+
+
 def _window_end_is_stale(window_end):
-	"""True when a delta window ending at ``window_end`` is too close to its end to keep using."""
+	"""True once a delta window ending at ``window_end`` no longer covers the full look-ahead.
+
+	That is the schedule: a window starts WINDOW_RESET_DAYS longer than the look-ahead, so it is
+	renewed about once a month and an event up to WINDOW_FUTURE_DAYS ahead is always inside it.
+	A window from before 1.2.0 was sized to the look-ahead alone, so it is renewed on its first run.
+	"""
 	if not window_end:
 		return True
-	margin = add_to_date(now_datetime(), days=WINDOW_REFRESH_MARGIN_DAYS)
-	return get_datetime(window_end) <= margin
+	return get_datetime(window_end) < add_to_date(now_datetime(), days=WINDOW_FUTURE_DAYS)
 
 
 def _delta_window_is_stale(doc):
@@ -617,8 +731,10 @@ def _start_of_pull(doc):
 
 
 def _new_round():
+	# The window end doubles as the round's key (see _mark_seen). Datetime columns keep the
+	# microseconds, so it round-trips exactly and two rounds a moment apart still differ.
 	now = now_datetime()
-	return _initial_delta_path(now), add_to_date(now, days=WINDOW_FUTURE_DAYS)
+	return _initial_delta_path(now), _window_end_from(now)
 
 
 def _pull(doc):
@@ -628,14 +744,23 @@ def _pull(doc):
 	unfinished: the link to the next page is stored as the resume point and the next run
 	carries on from it, so a large calendar catches up over a few runs instead of re-reading
 	the same first pages forever. ``doc.flags.pull_unfinished`` tells the caller this happened.
+
+	A round that reads the whole window (a first sync, a renewal, a resync after Graph refused
+	the old link) is also the one moment the full list of what Outlook still has is known, so it
+	ends by settling the mirrors it did not see: see _settle_unseen_mirrors.
 	"""
 	path, round_window_end = _start_of_pull(doc)
+	# The watermark of the last completed round. A renewal reads the window afresh, and the
+	# changes still waiting behind this link — deletions above all — would otherwise be lost.
+	previous_link = doc.delta_link
 
 	try:
 		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 	except MsGraphResyncRequired:
 		# Token expired or the mailbox was moved: start the window again from scratch. A resume
 		# point belongs to the round Graph has just refused, so it goes with it.
+		if path == previous_link:
+			previous_link = None
 		path, round_window_end = _new_round()
 		items, delta_link, next_link = graph.graph_delta(path, doc.name, headers=UTC_PREFER)
 
@@ -659,12 +784,20 @@ def _pull(doc):
 	finally:
 		frappe.flags.in_microsoft_sync = False
 
+	if round_window_end:
+		_mark_seen(items, round_window_end)
+
 	resumable = _has_resume_point_fields()
 
 	# Only store the new watermark once every page of the round was consumed without raising.
 	# Until then the old deltaLink stays exactly as it was: a round that never finishes repeats
 	# work, but never skips any.
 	if delta_link:
+		if round_window_end:
+			# The whole window has just been read. First what the old link still had to say, then
+			# whatever Outlook no longer has that nothing said was deleted.
+			removed += _drain_previous_round(doc, previous_link)
+			removed += _settle_unseen_mirrors(doc, round_window_end)
 		updates = {"delta_link": delta_link}
 		if round_window_end:
 			updates["delta_window_end"] = round_window_end
@@ -699,11 +832,165 @@ def _pull(doc):
 			_("Microsoft ended the calendar read without a sync link, so the next run reads it again.")
 		)
 
+	removed += _settle_our_series(doc)
 	return upserted, removed
+
+
+def _has_event_field(fieldname):
+	"""Whether this site's Event already has one of the app's newer custom fields.
+
+	The sync is scheduled, so it can run between the code update and `bench migrate`, before the
+	fields exist. What needs them is skipped until then rather than failing the whole pull.
+	"""
+	return frappe.get_meta("Event").has_field(fieldname)
+
+
+def _mark_seen(items, round_key):
+	"""Record that the mirrors of these events were seen in the full read keyed ``round_key``.
+
+	One UPDATE per PREFETCH_CHUNK ids rather than a save per event: the mark is bookkeeping, it
+	must not count as an edit, and a full read touches every mirror in the window. Seeing a
+	mirror also clears its Missing From Outlook mark — it is there after all.
+	"""
+	if not (_has_event_field("custom_microsoft_seen_in_round") and _has_event_field("custom_microsoft_orphaned")):
+		return
+	ids = [ev.get("id") for ev in items if ev.get("id") and not _is_removed(ev)]
+	ids = list(dict.fromkeys(ids))
+	for start in range(0, len(ids), PREFETCH_CHUNK):
+		chunk = ids[start : start + PREFETCH_CHUNK]
+		frappe.db.sql(
+			"""
+			update `tabEvent`
+			set custom_microsoft_seen_in_round = %(round)s, custom_microsoft_orphaned = 0
+			where custom_pulled_from_microsoft = 1 and custom_microsoft_event_id in %(ids)s
+			""",
+			{"round": round_key, "ids": tuple(chunk)},
+		)
+
+
+def _drain_previous_round(doc, link):
+	"""Apply the deletions still waiting behind the link a renewal is about to replace.
+
+	Read only for its deletions: what still exists has just been read afresh with the new window.
+	Best effort — the link may have expired, or have more pages than one run reads — because
+	anything it cannot deliver is caught by _settle_unseen_mirrors straight afterwards, just
+	flagged instead of deleted. Returns how many mirrors it deleted.
+	"""
+	if not link or not graph.is_graph_url(link):
+		return 0
+	try:
+		items, _delta, _next = graph.graph_delta(link, doc.name, headers=UTC_PREFER)
+	except MsGraphError:
+		return 0
+
+	gone = [ev for ev in items if _is_removed(ev)]
+	existing_map = _existing_event_map(ev.get("id") for ev in gone)
+	removed = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for ev in gone:
+			try:
+				if _upsert_event(doc, ev, existing_map) == "deleted":
+					removed += 1
+			except Exception:
+				frappe.log_error(title=f"MS event upsert failed: {ev.get('id')}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	return removed
+
+
+def _unseen_mirrors(calendar_name, round_key):
+	"""Mirrors in the window of the full read ``round_key`` that the read did not return."""
+	return frappe.db.sql(
+		"""
+		select name from `tabEvent`
+		where custom_microsoft_calendar = %(calendar)s
+			and custom_pulled_from_microsoft = 1
+			and custom_sync_with_microsoft_calendar = 1
+			and coalesce(custom_microsoft_event_id, '') != ''
+			and starts_on >= %(start)s and starts_on < %(end)s
+			and (custom_microsoft_seen_in_round is null or custom_microsoft_seen_in_round != %(round)s)
+		order by starts_on
+		""",
+		{
+			"calendar": calendar_name,
+			"start": _window_start_of(round_key),
+			"end": round_key,
+			"round": round_key,
+		},
+		pluck=True,
+	)
+
+
+def _settle_unseen_mirrors(doc, round_key):
+	"""Mark the mirrors a full read of the window did not return as Missing From Outlook.
+
+	A full read lists everything Outlook has in the window, so a mirror it did not return is one
+	whose event was deleted without the deletion ever reaching us — in the gap a resync or a
+	window renewal leaves. They are flagged, and listed by the doctor, rather than deleted:
+	other records may link to these Events. Deleting them is the admin's choice, made with
+	Microsoft Settings' "Delete events missing from Outlook". Returns how many were deleted.
+	"""
+	if not (_has_event_field("custom_microsoft_seen_in_round") and _has_event_field("custom_microsoft_orphaned")):
+		return 0
+
+	names = _unseen_mirrors(doc.name, round_key)
+	if not names:
+		return 0
+
+	frappe.db.sql(
+		"update `tabEvent` set custom_microsoft_orphaned = 1 where name in %(names)s",
+		{"names": tuple(names)},
+	)
+	if not _delete_orphans():
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(names)
+		return 0
+
+	deleted = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for name in names:
+			# A savepoint each, so one Event that cannot go takes nothing else with it.
+			frappe.db.savepoint("m365_orphan")
+			try:
+				# Not forced: an Event another record still links to stays, flagged, rather than
+				# leaving that record pointing at nothing.
+				frappe.delete_doc("Event", name, ignore_permissions=True)
+				deleted += 1
+			except Exception:
+				frappe.db.rollback(save_point="m365_orphan")
+				frappe.log_error(title=f"MS Calendar: event missing from Outlook could not be deleted: {name}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	if deleted < len(names):
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(names) - deleted
+	return deleted
+
+
+def _delete_orphans():
+	"""The admin's choice: delete mirrors missing from Outlook, or only flag them (the default)."""
+	if not frappe.get_meta("Microsoft Settings").has_field("delete_orphaned_calendar_events"):
+		return False
+	return bool(cint(frappe.db.get_single_value("Microsoft Settings", "delete_orphaned_calendar_events")))
 
 
 def _is_removed(ev):
 	return bool(ev.get("@removed")) or bool(ev.get("isCancelled"))
+
+
+class _EventMap(dict):
+	"""Microsoft event id -> Frappe Event name, plus the names of the Events unticked for sync."""
+
+	def __init__(self):
+		super().__init__()
+		self.unticked = set()
+
+
+def _is_unticked(event_name, existing_map=None):
+	"""True when the Event has Sync with Microsoft Calendar unticked."""
+	if isinstance(existing_map, _EventMap):
+		return event_name in existing_map.unticked
+	return not cint(frappe.db.get_value("Event", event_name, "custom_sync_with_microsoft_calendar"))
 
 
 def _existing_event_map(ms_ids):
@@ -712,7 +999,7 @@ def _existing_event_map(ms_ids):
 	Chunked rather than one enormous ``IN``: see PREFETCH_CHUNK. Ids that have no Frappe Event
 	are simply absent from the map, which is the same answer the per-event lookup gave.
 	"""
-	mapping = {}
+	mapping = _EventMap()
 	# dict.fromkeys and not set(): a delta page is normally in a meaningful order, and keeping
 	# it makes the chunk boundaries reproducible when this has to be debugged against a log.
 	ids = [ms_id for ms_id in dict.fromkeys(ms_ids) if ms_id]
@@ -721,7 +1008,7 @@ def _existing_event_map(ms_ids):
 		rows = frappe.get_all(
 			"Event",
 			filters={"custom_microsoft_event_id": ["in", ids[start : start + PREFETCH_CHUNK]]},
-			fields=["name", "custom_microsoft_event_id"],
+			fields=["name", "custom_microsoft_event_id", "custom_sync_with_microsoft_calendar"],
 			# Spelled out rather than relying on get_all's default, because a page capped at 20
 			# rows would not fail: the events past the cap would read as new and be created a
 			# second time. This is the one argument here that must not be wrong.
@@ -729,6 +1016,8 @@ def _existing_event_map(ms_ids):
 		)
 		for row in rows:
 			mapping[row.custom_microsoft_event_id] = row.name
+			if not cint(row.custom_sync_with_microsoft_calendar):
+				mapping.unticked.add(row.name)
 
 	return mapping
 
@@ -824,16 +1113,21 @@ def _people_values(ev):
 	}
 
 
+def _ms_times(ev):
+	"""A Graph event's start and end as Frappe datetimes: floating dates when it is all day."""
+	if ev.get("isAllDay"):
+		return _all_day_to_system(ev.get("start"), ev.get("end"))
+	return _ms_dt_to_system(ev.get("start")), _ms_dt_to_system(ev.get("end"))
+
+
 def _target_values(doc, ev, locally_originated):
 	"""The Frappe Event field values a Microsoft event maps to."""
 	values = {
 		"subject": ev.get("subject") or "(No subject)",
 		"all_day": 1 if ev.get("isAllDay") else 0,
 		"custom_microsoft_calendar": doc.name,
-		"custom_sync_with_microsoft_calendar": 1,
 	}
-	starts_on = _ms_dt_to_system(ev.get("start"))
-	ends_on = _ms_dt_to_system(ev.get("end"))
+	starts_on, ends_on = _ms_times(ev)
 	if starts_on:
 		values["starts_on"] = starts_on
 	if ends_on:
@@ -886,8 +1180,18 @@ def _upsert_event(doc, ev, existing_map=None):
 	else:
 		existing = existing_map.get(ms_id)
 
+	series_id = ev.get("seriesMasterId")
+
+	if existing and _is_unticked(existing, existing_map):
+		# Somebody unticked Sync with Microsoft Calendar on it: it is no longer kept in step in
+		# either direction, so Outlook's changes — a deletion included — are not applied to it.
+		return "skipped"
+
 	if _is_removed(ev):
 		if existing:
+			if not series_id and _has_event_field("custom_microsoft_series_master_id"):
+				# A removal carries no seriesMasterId; a mirrored exception remembers its series.
+				series_id = frappe.db.get_value("Event", existing, "custom_microsoft_series_master_id")
 			frappe.delete_doc("Event", existing, ignore_permissions=True, force=True)
 			# The map is this page's picture of what exists, so it has to follow what the page
 			# does to it. One delta page can carry the same id twice — an event changed twice
@@ -895,7 +1199,12 @@ def _upsert_event(doc, ev, existing_map=None):
 			# that has just been deleted.
 			if existing_map is not None:
 				existing_map.pop(ms_id, None)
+			_note_series_change(doc, series_id)
 			return "deleted"
+		# A removal for an event we hold nothing for. Deleting a whole series in Outlook arrives
+		# exactly like this — calendarView only ever names the occurrences, never the master —
+		# so it is the cue to ask Graph whether the series this app pushed still exist.
+		_note_series_change(doc, series_id, unknown=True)
 		return "skipped"
 
 	# calendarView returns occurrences; a seriesMaster would duplicate all of them.
@@ -909,9 +1218,16 @@ def _upsert_event(doc, ev, existing_map=None):
 	#
 	# calendarView never returns that master, so this is the only place the relationship is
 	# visible at all.
-	series_id = ev.get("seriesMasterId")
-	if series_id and _is_ours(series_id):
-		return "skipped"
+	#
+	# An occurrence that was changed on its own in Outlook (moved, renamed: type "exception") is
+	# the one exception. The repeating Event cannot say "this one is different", so the changed
+	# occurrence is mirrored beside it, tied to its series by custom_microsoft_series_master_id.
+	if series_id and not existing:
+		series_event = _is_ours(series_id)
+		if series_event:
+			_note_series_master(series_event, series_id)
+			if ev.get("type") != "exception":
+				return "skipped"
 
 	if existing:
 		event = frappe.get_doc("Event", existing)
@@ -920,13 +1236,26 @@ def _upsert_event(doc, ev, existing_map=None):
 		event = frappe.new_doc("Event")
 		event.custom_microsoft_event_id = ms_id
 		event.custom_pulled_from_microsoft = 1
+		# Ticked once, when the mirror is made. After that the tickbox is the person's: the pull
+		# used to tick it again on every change, so unticking an Event never stuck.
+		event.custom_sync_with_microsoft_calendar = 1
 		event.event_type = "Private"
+		if series_id and _has_event_field("custom_microsoft_series_master_id"):
+			event.custom_microsoft_series_master_id = series_id
 		locally_originated = False
 
 	values = _target_values(doc, ev, locally_originated)
+	if existing and event.get("custom_microsoft_orphaned"):
+		# Outlook has just said something about it, so it is not missing after all.
+		values["custom_microsoft_orphaned"] = 0
+	# Read before the save moves it: an Event edited in Frappe since the last sync has changes
+	# of its own still to send.
+	edited_locally = locally_originated and _edited_since(event, doc.last_sync)
 	changed = _apply(event, values)
 	if not existing:
 		changed = True
+	if locally_originated:
+		_record_what_outlook_has(event, edited_locally, changed)
 	if not changed:
 		# Nothing moved. Saving anyway would bump `modified` and make the push step
 		# re-patch this event on the next run, forever.
@@ -945,6 +1274,35 @@ def _upsert_event(doc, ev, existing_map=None):
 		existing_map[ms_id] = event.name
 	_give_it_to_its_owner(event.name, doc.user)
 	return "created"
+
+
+def _edited_since(event, last_sync):
+	"""True when the Event may hold Frappe edits that have not been pushed yet."""
+	if not last_sync or not event.modified:
+		return True
+	return get_datetime(event.modified) > get_datetime(last_sync)
+
+
+def _record_what_outlook_has(event, edited_locally, changed):
+	"""Bring a Frappe-originated Event's sync state up to what the pull has just read.
+
+	The properties the pull wrote are, by definition, what Outlook has, so they are not Frappe
+	changes for the push to send back — even though the save that wrote them moves `modified`
+	past the last sync. An Event with no state yet (from before 1.2.0) gets one here, but only
+	when nothing was edited in Frappe since the last sync; otherwise it is sent in full once,
+	as before, so those edits are not lost.
+	"""
+	state = _stored_sync_state(event)
+	if state is None and edited_locally:
+		return
+	if state is not None and not changed:
+		return
+	current = _sync_state_of(_event_to_graph_body(event))
+	if state is None:
+		state = current
+	else:
+		state.update({key: current[key] for key in PULLED_STATE_KEYS})
+	_write_sync_state(event.name, state, event)
 
 
 def _give_it_to_its_owner(event_name, user):
@@ -967,14 +1325,142 @@ def _give_it_to_its_owner(event_name, user):
 
 
 def _is_ours(series_master_id):
-	"""Did this app push the series behind this occurrence?
+	"""The Frappe Event behind this series, when this app pushed it; else None.
 
 	Matched on the id Graph gave back when the series was created, which is stored on the
 	repeating Event — so this is a lookup, not a guess.
 	"""
-	return bool(
-		frappe.db.exists("Event", {"custom_microsoft_event_id": series_master_id})
+	return frappe.db.get_value(
+		"Event", {"custom_microsoft_event_id": series_master_id, "custom_pulled_from_microsoft": 0}, "name"
 	)
+
+
+# --- series this app pushed -------------------------------------------------------------
+#
+# Graph keeps a recurring event as one series master plus occurrences; calendarView, and so the
+# delta, only ever returns the occurrences. A series this app pushed is a repeating Frappe Event
+# whose custom_microsoft_event_id is that master's id, and custom_microsoft_series_master_id
+# records that Graph has confirmed it is one: set when the create returns a series master, or
+# filled in lazily the first time the pull sees one of its occurrences (series pushed before
+# 1.2.0). Only a confirmed master is ever checked, and one Outlook no longer has is flagged
+# Missing From Outlook rather than deleted (see _settle_our_series).
+
+#: How many series one run asks Graph about. Each is a GET; a calendar with more confirmed
+#: series than this checks the rest on later runs that bring removals too.
+SERIES_CHECKS_PER_RUN = 25
+
+
+def _note_series_master(event_name, series_id):
+	"""Record that ``series_id`` is a confirmed series master (see the section comment)."""
+	if not _has_event_field("custom_microsoft_series_master_id"):
+		return
+	if frappe.db.get_value("Event", event_name, "custom_microsoft_series_master_id") != series_id:
+		frappe.db.set_value(
+			"Event", event_name, "custom_microsoft_series_master_id", series_id, update_modified=False
+		)
+
+
+def _note_series_change(doc, series_id, unknown=False):
+	"""Collect, on the calendar doc, which of our series this pull has to ask Graph about."""
+	pending = doc.flags.series_to_check
+	if pending is None:
+		pending = doc.flags.series_to_check = set()
+	if series_id and _is_ours(series_id):
+		pending.add(series_id)
+	elif unknown:
+		doc.flags.unknown_removals = True
+
+
+def _settle_our_series(doc):
+	"""Flag the Frappe series whose master Outlook no longer has. Returns how many were deleted.
+
+	Asked only when this pull brought a removal that may have been one of their occurrences. A
+	GET of the master answering 404 most likely means the series was deleted in Outlook — but
+	it is also what every old series answers once the connection has been re-authorised as a
+	different Microsoft account, so it is not proof enough to delete somebody's Events. Such a
+	series is marked Missing From Outlook, like a mirror a full read did not find, and listed by
+	Run Diagnostics; it is deleted (with its mirrored occurrences) only when the admin has ticked
+	Delete events missing from Outlook. A master that answers again clears the mark; anything
+	else (throttling, an outage) leaves it as it is for another run.
+	"""
+	if not _has_event_field("custom_microsoft_series_master_id"):
+		return 0
+	masters = set(doc.flags.series_to_check or ())
+	if doc.flags.unknown_removals:
+		masters.update(
+			frappe.get_all(
+				"Event",
+				filters={
+					"custom_microsoft_calendar": doc.name,
+					"custom_pulled_from_microsoft": 0,
+					"custom_sync_with_microsoft_calendar": 1,
+					"custom_microsoft_series_master_id": ["is", "set"],
+				},
+				pluck="custom_microsoft_series_master_id",
+				order_by="modified desc",
+				limit=SERIES_CHECKS_PER_RUN,
+			)
+		)
+	doc.flags.series_to_check = None
+	doc.flags.unknown_removals = False
+	can_flag = _has_event_field("custom_microsoft_orphaned")
+
+	missing = []
+	for master in sorted(masters)[:SERIES_CHECKS_PER_RUN]:
+		name = frappe.db.get_value(
+			"Event",
+			{
+				"custom_microsoft_event_id": master,
+				"custom_microsoft_series_master_id": master,
+				"custom_pulled_from_microsoft": 0,
+				"custom_microsoft_calendar": doc.name,
+			},
+			"name",
+		)
+		if not name:
+			continue
+		try:
+			graph.graph_request("GET", f"/me/events/{master}?$select=id", doc.name)
+			if can_flag:
+				frappe.db.set_value("Event", name, "custom_microsoft_orphaned", 0, update_modified=False)
+			continue
+		except MsGraphNotFound:
+			missing.append((name, master))
+		except MsGraphError:
+			continue
+
+	if not missing or not can_flag:
+		return 0
+	for name, _master in missing:
+		frappe.db.set_value("Event", name, "custom_microsoft_orphaned", 1, update_modified=False)
+	if not _delete_orphans():
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(missing)
+		return 0
+
+	deleted = 0
+	frappe.flags.in_microsoft_sync = True
+	try:
+		for name, master in missing:
+			frappe.db.savepoint("m365_orphan_series")
+			try:
+				for exception in frappe.get_all(
+					"Event",
+					filters={"custom_microsoft_series_master_id": master, "custom_pulled_from_microsoft": 1},
+					pluck="name",
+				):
+					frappe.delete_doc("Event", exception, ignore_permissions=True, force=True)
+				# Not forced, as for any Event missing from Outlook: one another record links to
+				# stays, flagged.
+				frappe.delete_doc("Event", name, ignore_permissions=True)
+				deleted += 1
+			except Exception:
+				frappe.db.rollback(save_point="m365_orphan_series")
+				frappe.log_error(title=f"MS Calendar: series missing from Outlook could not be deleted: {name}")
+	finally:
+		frappe.flags.in_microsoft_sync = False
+	if deleted < len(missing):
+		doc.flags.orphans_flagged = (doc.flags.orphans_flagged or 0) + len(missing) - deleted
+	return deleted
 
 
 def _apply(doc, values):
@@ -1012,57 +1498,258 @@ def _push_filters(doc):
 
 
 def _push(doc):
-	"""Create new Frappe events in Microsoft and patch ones edited while offline."""
+	"""Create new Frappe events in Microsoft and patch ones edited while offline.
+
+	Committed one event at a time. Each Graph call can take a second or more, and a transaction
+	left open across all of them held every row the push had touched until the last one was
+	done; worse, an id Graph had handed back sat uncommitted the whole time, so a worker killed
+	part-way lost it and the next run created the meeting a second time.
+
+	When Microsoft throttles the mailbox the push stops: every further call this run would be
+	refused, and what was pushed before that is already committed. The sync reports it.
+	"""
 	if not doc.user:
 		# A connection with no user has no owner whose Events it could send.
 		return 0
 	base_filters = _push_filters(doc)
 
 	count = 0
-	new_events = frappe.get_all(
-		"Event",
-		filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
-		pluck="name",
-	)
-	for name in new_events:
-		try:
-			event = frappe.get_doc("Event", name)
-			created = _create_graph_event(doc.name, event)
-			if _store_graph_response(name, created, doc.name):
-				count += 1
-		except Exception:
-			frappe.log_error(title=f"MS event push failed: {name}")
-
-	# Edits made while the connection was down never reached doc_events; catch them up.
-	if doc.last_sync:
-		edited = frappe.get_all(
+	throttled = None
+	# Nothing this push writes is a person's edit, so none of it may bounce back as another push.
+	previous = frappe.flags.in_microsoft_sync
+	frappe.flags.in_microsoft_sync = True
+	try:
+		new_events = frappe.get_all(
 			"Event",
-			filters={
-				**base_filters,
-				# NOT IN with NULL never matches in SQL; "is set" is the NULL-safe form.
-				"custom_microsoft_event_id": ["is", "set"],
-				"modified": [">", doc.last_sync],
-			},
+			filters={**base_filters, "custom_microsoft_event_id": ["is", "not set"]},
 			pluck="name",
 		)
-		for name in edited:
+		for name in new_events:
 			try:
-				event = frappe.get_doc("Event", name)
-				patched = graph.graph_request(
-					"PATCH",
-					f"/me/events/{event.custom_microsoft_event_id}",
-					doc.name,
-					json=_event_to_graph_body(event),
-				)
-				_store_graph_response(name, patched or {}, doc.name)
-				count += 1
+				if _create_in_graph(doc.name, name):
+					count += 1
+			except MsGraphThrottled as e:
+				throttled = e
+				break
 			except Exception:
-				frappe.log_error(title=f"MS event patch failed: {name}")
+				frappe.log_error(title=f"MS event push failed: {name}")
+			frappe.db.commit()  # nosemgrep
 
-	# The ids of events already created in Graph must survive a later failure in this job;
-	# losing them would create duplicates in Outlook on the next run.
-	frappe.db.commit()  # nosemgrep
+		# Edits made while the connection was down never reached doc_events; catch them up.
+		if doc.last_sync and not throttled:
+			edited = frappe.get_all(
+				"Event",
+				filters={
+					**base_filters,
+					# NOT IN with NULL never matches in SQL; "is set" is the NULL-safe form.
+					"custom_microsoft_event_id": ["is", "set"],
+					"modified": [">", doc.last_sync],
+				},
+				pluck="name",
+			)
+			for name in edited:
+				if name in new_events:
+					# Created a moment ago from exactly what it holds now.
+					continue
+				try:
+					if _patch_in_graph(doc.name, frappe.get_doc("Event", name)):
+						count += 1
+				except MsGraphThrottled as e:
+					throttled = e
+					break
+				except Exception:
+					frappe.log_error(title=f"MS event patch failed: {name}")
+				frappe.db.commit()  # nosemgrep
+	finally:
+		frappe.flags.in_microsoft_sync = previous
+
+	if throttled:
+		doc.flags.push_warning = str(throttled)
 	return count
+
+
+def _create_in_graph(calendar_name, event_name, live_doc=None):
+	"""Create one Frappe Event in Microsoft, unless it has been created there already.
+
+	The row is locked and its id read afresh before the POST. The scheduled push and a person
+	saving the same Event both decide "this has no id yet, create it", and without the lock both
+	did: two meetings in Outlook, two invitations to every attendee, and only one of them linked.
+	With it, the second one waits for the first to commit and then finds the id. Returns True
+	when an event was created and linked.
+	"""
+	row = frappe.db.get_value(
+		"Event", event_name, ["name", "custom_microsoft_event_id"], as_dict=True, for_update=True
+	)
+	if not row:
+		return False
+	if row.custom_microsoft_event_id:
+		if live_doc is not None:
+			live_doc.custom_microsoft_event_id = row.custom_microsoft_event_id
+		return False
+
+	event = live_doc if live_doc is not None else frappe.get_doc("Event", event_name)
+	body = _event_to_graph_body(event)
+	created = graph.graph_request("POST", "/me/events", calendar_name, json=body)
+	if not _store_graph_response(event_name, created, calendar_name, live_doc=live_doc):
+		return False
+	_write_sync_state(event_name, _sync_state_of(body), live_doc)
+	if (created or {}).get("type") == "seriesMaster":
+		_note_series_master(event_name, created["id"])
+		if live_doc is not None:
+			live_doc.set("custom_microsoft_series_master_id", created["id"])
+	return True
+
+
+def _patch_in_graph(calendar_name, event):
+	"""Send Graph what changed in a Frappe Event since Outlook last saw it. True when sent.
+
+	Only the properties that differ from the Event's sync state go out. Sending the whole Event
+	every time — Frappe's participants as the complete attendee list, Frappe's description as
+	the body — undid whatever had been changed in Outlook, on every edit and even on a save the
+	pull itself made because somebody replied to the invitation.
+	"""
+	state = _stored_sync_state(event)
+	full = _event_to_graph_body(event)
+	current = _sync_state_of(full)
+	body = _changed_properties(full, current, state or {})
+
+	if "attendees" in body:
+		merged = _merged_attendees(calendar_name, event.custom_microsoft_event_id, full, state)
+		if merged is None:
+			body.pop("attendees")
+		else:
+			body["attendees"] = merged
+
+	if not body:
+		if state is None:
+			# Nothing differs from what Outlook has, so this is what Outlook has.
+			_write_sync_state(event.name, current, event)
+		return False
+
+	patched = graph.graph_request(
+		"PATCH",
+		f"/me/events/{event.custom_microsoft_event_id}",
+		calendar_name,
+		json=body,
+	)
+	_store_graph_response(event.name, patched or {}, calendar_name)
+	_write_sync_state(event.name, current, event)
+	return True
+
+
+# --- what Outlook last saw (sync state) ---------------------------------------------------
+#
+# A push can only send "what changed" if it knows what Outlook already has. The sync state is
+# that knowledge: per property a fingerprint of the value last sent to Outlook or last read from
+# it, and for attendees the addresses themselves, because merging needs to know who Frappe
+# removed. Written by every create, patch and pull; an Event from before 1.2.0 has none until
+# its first sync, and is then sent in full one last time.
+
+#: The properties the push writes, in the form _sync_state_of keys them.
+SYNC_STATE_KEYS = ("subject", "body", "start", "end", "isAllDay", "location", "recurrence", "attendees")
+
+#: What the pull writes onto an Event that originated in Frappe, as sync-state keys: these come
+#: from Outlook, so after a pull they are what Outlook has and are not Frappe's changes to send.
+PULLED_STATE_KEYS = ("subject", "start", "end", "isAllDay", "location")
+
+
+def _fingerprint(value):
+	if value is None:
+		return None
+	return hashlib.sha1(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _attendee_address(attendee):
+	return ((attendee.get("emailAddress") or {}).get("address") or "").strip().lower()
+
+
+def _sync_state_of(body):
+	"""The sync state of a full Graph body, as _event_to_graph_body builds it."""
+	state = {key: _fingerprint(body.get(key)) for key in ("subject", "body", "start", "end", "location", "recurrence")}
+	state["isAllDay"] = bool(body.get("isAllDay"))
+	state["attendees"] = sorted({_attendee_address(a) for a in body.get("attendees") or []} - {""})
+	return state
+
+
+def _stored_sync_state(event):
+	"""The Event's sync state, or None when it has none (or the field is not migrated yet)."""
+	raw = event.get("custom_microsoft_sync_state")
+	if not raw:
+		return None
+	try:
+		state = json.loads(raw)
+	except ValueError:
+		return None
+	return state if isinstance(state, dict) else None
+
+
+def _write_sync_state(event_name, state, live_doc=None):
+	if not _has_event_field("custom_microsoft_sync_state"):
+		return
+	raw = json.dumps(state, sort_keys=True)
+	frappe.db.set_value("Event", event_name, "custom_microsoft_sync_state", raw, update_modified=False)
+	if live_doc is not None:
+		live_doc.set("custom_microsoft_sync_state", raw)
+
+
+def _changed_properties(full, current, state):
+	"""The part of ``full`` that differs from ``state``: what a PATCH has to send.
+
+	A key missing from ``state`` counts as changed, so an Event with no sync state at all is
+	sent in full — except attendees, which are always merged, never replaced (_merged_attendees).
+	"""
+	body = {}
+	for key in ("subject", "body"):
+		if current[key] != state.get(key, "?"):
+			body[key] = full[key]
+	# Start, end and all-day travel together: Graph checks them against each other, and moving
+	# a start past the old end on its own would be refused.
+	if any(current[key] != state.get(key, "?") for key in ("start", "end", "isAllDay")):
+		body["start"], body["end"] = full["start"], full["end"]
+		body["isAllDay"] = current["isAllDay"]
+	if current["location"] != state.get("location", "?"):
+		body["location"] = full.get("location") or {"displayName": ""}
+	# Re-sending a recurrence can reset the exceptions made to single occurrences in Outlook, so
+	# it goes only when the series itself changed. Turning a series back into a one-off is not
+	# something Graph does with a PATCH, so a removed recurrence is not sent at all.
+	if current["recurrence"] != state.get("recurrence", "?") and full.get("recurrence"):
+		body["recurrence"] = full["recurrence"]
+	if current["attendees"] != state.get("attendees"):
+		body["attendees"] = full.get("attendees") or []
+	if full.get("isOnlineMeeting"):
+		body["isOnlineMeeting"] = full["isOnlineMeeting"]
+		body["onlineMeetingProvider"] = full["onlineMeetingProvider"]
+	return body
+
+
+def _merged_attendees(calendar_name, ms_id, full, state):
+	"""Outlook's attendees with Frappe's additions and removals applied, or None for no change.
+
+	Graph replaces the whole attendee list on a PATCH, so sending Frappe's participants removed
+	everybody who had been invited from Outlook. The list is read from Outlook first; Frappe then
+	adds whom it added and removes only whom it removed — relative to the sync state. With no
+	state there is no knowing whom Frappe removed, so nobody is.
+	"""
+	wanted = full.get("attendees") or []
+	wanted_addresses = {_attendee_address(a) for a in wanted}
+	removed = set((state or {}).get("attendees") or []) - wanted_addresses
+
+	current = graph.graph_request("GET", f"/me/events/{ms_id}?$select=attendees", calendar_name) or {}
+	in_outlook = current.get("attendees") or []
+
+	merged = []
+	seen = set()
+	for attendee in in_outlook:
+		address = _attendee_address(attendee)
+		if not address or address in removed or address in seen:
+			continue
+		seen.add(address)
+		# Only what may be written back: the response status belongs to the attendee.
+		merged.append({"emailAddress": attendee.get("emailAddress"), "type": attendee.get("type") or "required"})
+	added = [a for a in wanted if _attendee_address(a) not in seen]
+	if not added and len(merged) == len([a for a in in_outlook if _attendee_address(a)]):
+		return None
+	return merged + added
 
 
 def _email_fields(doctype):
@@ -1231,11 +1918,13 @@ def _event_to_graph_body(event):
 	body = {
 		"subject": event.subject or "(No subject)",
 		"body": {"contentType": "HTML", "content": event.description or ""},
-		"start": _system_dt_to_ms(starts_on),
-		"end": _system_dt_to_ms(_end_after_start(starts_on, event.ends_on)),
 	}
 	if getattr(event, "all_day", 0):
+		body["start"], body["end"] = _all_day_to_ms(starts_on, event.ends_on)
 		body["isAllDay"] = True
+	else:
+		body["start"] = _system_dt_to_ms(starts_on)
+		body["end"] = _system_dt_to_ms(_end_after_start(starts_on, event.ends_on))
 	if getattr(event, "location", None):
 		body["location"] = {"displayName": event.location}
 
@@ -1352,12 +2041,6 @@ def _undo_orphaned_graph_event(calendar_name, ms_id, event_name):
 		frappe.log_error(title=f"MS orphaned event could not be removed: {event_name}")
 
 
-def _create_graph_event(calendar_name, event):
-	return graph.graph_request(
-		"POST", "/me/events", calendar_name, json=_event_to_graph_body(event)
-	)
-
-
 # --- whose calendar is it? -------------------------------------------------------------
 
 def _calendar_user(calendar_name):
@@ -1411,6 +2094,7 @@ def event_validate(doc, method=None):
 	# This is a guard on what a person types into Frappe, nothing else.
 	if frappe.flags.in_microsoft_sync:
 		return
+	_keep_server_managed_fields(doc)
 	if not getattr(doc, "custom_sync_with_microsoft_calendar", 0):
 		return
 
@@ -1426,6 +2110,40 @@ def event_validate(doc, method=None):
 			),
 			title=_("Check the times"),
 		)
+
+
+#: Event fields only the sync writes. The form shows them read-only, but Frappe does not enforce
+#: read_only on a save, and a form opened before the sync filled them in sends them back empty.
+EVENT_SERVER_MANAGED_FIELDS = (
+	"custom_microsoft_event_id",
+	"custom_pulled_from_microsoft",
+	"custom_teams_join_url",
+	"custom_microsoft_web_link",
+	"custom_microsoft_sync_state",
+	"custom_microsoft_series_master_id",
+	"custom_microsoft_seen_in_round",
+	"custom_microsoft_orphaned",
+)
+
+
+def _keep_server_managed_fields(doc):
+	"""Put the link to Microsoft back to what is stored, whatever the save carried.
+
+	Creating an event in Outlook mostly happens just after the save that asked for it, so the
+	form that made the save does not have the id yet. Its next save sent the id back empty; the
+	link was gone, and the following push created the meeting in Outlook a second time. Restored
+	rather than refused, as with the calendar's own sync state: a stale form is no reason to fail
+	a save. A new Event keeps what it was created with.
+	"""
+	if doc.is_new():
+		return
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before:
+		return
+	meta = frappe.get_meta("Event")
+	for fieldname in EVENT_SERVER_MANAGED_FIELDS:
+		if meta.has_field(fieldname):
+			doc.set(fieldname, before.get(fieldname))
 
 
 def _validate_calendar_owner(doc):
@@ -1455,14 +2173,17 @@ def _validate_calendar_owner(doc):
 
 
 def event_on_update(doc, method=None):
-	"""Create in Graph inside the save; queue the patch for an event that already exists.
+	"""Send a saved Event to its owner's Microsoft calendar, mostly after the save commits.
 
-	A creation is the one Graph call somebody is genuinely waiting for: the id and the Teams
-	join link come back in its response and are written onto the document the browser is about
-	to be handed, so doing it later would mean saving a Teams meeting whose link is not there
-	yet. A patch answers with nothing anyone can see, and paying 300-900 milliseconds of Graph
-	latency for it on every save — up to ten seconds when Microsoft throttles and the retry
-	sleeps — is a cost with no buyer.
+	Only a new Teams meeting is created inside the save: its join link comes back in Graph's
+	response and is written onto the very document the browser is about to be handed, and a link
+	that turns up after a reload is not one anybody can paste into the invitation they are
+	writing. If that save then rolls back, the meeting is deleted again (_undo_if_rolled_back).
+
+	Everything else — creating an ordinary event, patching one that exists, deleting one — is
+	done once the save has committed, because nothing on screen waits for it. Doing it inside the
+	save cost 300-900 milliseconds of Graph latency per save, and when the save rolled back
+	afterwards the meeting stayed in Outlook with its invitations already sent.
 	"""
 	if frappe.flags.in_microsoft_sync:
 		return
@@ -1478,11 +2199,13 @@ def event_on_update(doc, method=None):
 		return
 
 	try:
+		_move_out_of_previous_calendar(doc)
 		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
 		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
 			return
 
 		if doc.custom_microsoft_event_id:
+			_remember_state_before_this_edit(doc, cal)
 			_queue_or_do_it_after_commit(
 				"frappe_microsoft365.microsoft_calendar_sync.patch_event_in_graph",
 				queue="short",
@@ -1495,10 +2218,142 @@ def event_on_update(doc, method=None):
 				# find it at all — and would then patch Outlook back to the old text.
 				event_name=doc.name,
 			)
+		elif _wants_new_teams_meeting(doc):
+			if _create_in_graph(cal.name, doc.name, live_doc=doc):
+				_undo_if_rolled_back(cal.name, doc.custom_microsoft_event_id, doc.name)
 		else:
-			_store_graph_response(doc.name, _create_graph_event(cal.name, doc), cal.name, live_doc=doc)
+			_queue_or_do_it_after_commit(
+				"frappe_microsoft365.microsoft_calendar_sync.create_event_in_graph",
+				queue="short",
+				job_id=f"m365-event-create-{doc.name}",
+				event_name=doc.name,
+			)
 	except Exception:
 		frappe.log_error(title=f"MS Event on_update sync failed: {doc.name}")
+
+
+#: What ties an Event to one particular Outlook event. Moving it to another calendar clears all of
+#: it: the new mailbox gets an event — and, when it is a Teams meeting, a meeting — of its own.
+LINK_FIELDS_CLEARED_ON_MOVE = (
+	"custom_microsoft_event_id",
+	"custom_microsoft_web_link",
+	"custom_teams_join_url",
+	"custom_microsoft_online_meeting_id",
+	"custom_microsoft_sync_state",
+	"custom_microsoft_series_master_id",
+)
+
+
+def _move_out_of_previous_calendar(doc):
+	"""When an Event is moved to another Microsoft Calendar, take it out of the old one.
+
+	It kept the old mailbox's event id, so every patch went to the new mailbox with an id that
+	mailbox has never heard of — 404, forever — and the event never appeared there. Now the link
+	is cleared, so the event is created in the new calendar, and the old one is deleted from the
+	old mailbox once the save commits, under the same rules as deleting the Event would.
+	Attendees get a cancellation from the old event and an invitation from the new one.
+	"""
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before:
+		return
+	old_calendar = before.get("custom_microsoft_calendar")
+	old_id = before.get("custom_microsoft_event_id")
+	if not old_calendar or not old_id or old_calendar == doc.custom_microsoft_calendar:
+		return
+
+	meta = frappe.get_meta("Event")
+	cleared = {field: None for field in LINK_FIELDS_CLEARED_ON_MOVE if meta.has_field(field)}
+	frappe.db.set_value("Event", doc.name, cleared, update_modified=False)
+	doc.update(cleared)
+
+	_queue_or_do_it_after_commit(
+		"frappe_microsoft365.microsoft_calendar_sync.delete_event_in_graph",
+		queue="short",
+		job_id=f"m365-event-delete-{old_id}",
+		calendar_name=old_calendar,
+		ms_event_id=old_id,
+		event_owner=_event_owner(doc),
+	)
+
+
+def _remember_state_before_this_edit(doc, cal):
+	"""Give an Event from before 1.2.0 a sync state from how it stood before this save.
+
+	Without one, the queued patch would send the whole Event and overwrite whatever had been
+	changed in Outlook; with it, only this edit goes out. Taken from before the save only when
+	that version had itself been synced, so earlier unsent edits still go out with this one.
+	"""
+	if _stored_sync_state(doc) is not None or not _has_event_field("custom_microsoft_sync_state"):
+		return
+	before = doc.get_doc_before_save() if hasattr(doc, "get_doc_before_save") else None
+	if not before or _edited_since(before, cal.last_sync):
+		return
+	_write_sync_state(doc.name, _sync_state_of(_event_to_graph_body(before)), doc)
+
+
+def _wants_new_teams_meeting(doc):
+	"""True when this save asks Microsoft for a Teams meeting that does not exist yet."""
+	return bool(getattr(doc, "custom_add_teams_meeting", 0)) and not getattr(doc, "custom_teams_join_url", None)
+
+
+def _undo_if_rolled_back(calendar_name, ms_id, event_name):
+	"""Delete the Outlook event this save created if the save itself does not survive.
+
+	Graph cannot take part in the transaction, so the next best thing: when the transaction
+	rolls back, the event is deleted again; and since a rollback to a savepoint runs no callbacks
+	at all, the commit checks as well that the Event it was created for still carries its id.
+	"""
+	if not ms_id:
+		return
+
+	def undo():
+		try:
+			graph.graph_request("DELETE", f"/me/events/{ms_id}", calendar_name)
+		except Exception:
+			frappe.log_error(
+				title=f"MS event left in Outlook after its save was rolled back: {event_name}",
+				message=f"Created in Microsoft as {ms_id}; delete it in Outlook by hand.",
+			)
+
+	def undo_unless_kept():
+		if not frappe.db.exists("Event", {"custom_microsoft_event_id": ms_id}):
+			undo()
+
+	frappe.db.after_rollback.add(undo)
+	frappe.db.after_commit.add(undo_unless_kept)
+
+
+def create_event_in_graph(event_name):
+	"""Create a Frappe Event in its owner's Microsoft calendar. Runs once its save has committed.
+
+	Everything is read here rather than carried in the job's arguments, for the same reasons as
+	``patch_event_in_graph``. The id is committed straight away: it is the only link between the
+	two sides, and a job that died after the POST without it would leave the next push to create
+	the meeting again.
+	"""
+	if not frappe.db.exists("Event", event_name):
+		return
+
+	doc = frappe.get_doc("Event", event_name)
+	if not doc.custom_sync_with_microsoft_calendar or not doc.custom_microsoft_calendar:
+		return
+	if doc.custom_pulled_from_microsoft or doc.custom_microsoft_event_id:
+		return
+	if not _is_owners_calendar(doc.owner, doc.custom_microsoft_calendar):
+		return
+
+	previous = frappe.flags.in_microsoft_sync
+	frappe.flags.in_microsoft_sync = True
+	try:
+		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
+		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
+			return
+		_create_in_graph(cal.name, event_name)
+		frappe.db.commit()  # nosemgrep
+	except Exception:
+		frappe.log_error(title=f"MS Event create failed: {event_name}")
+	finally:
+		frappe.flags.in_microsoft_sync = previous
 
 
 def patch_event_in_graph(event_name):
@@ -1532,13 +2387,7 @@ def patch_event_in_graph(event_name):
 		cal = frappe.get_cached_doc("Microsoft Calendar", doc.custom_microsoft_calendar)
 		if not cal.enabled or not cal.authorized or not cal.push_to_microsoft_calendar:
 			return
-		patched = graph.graph_request(
-			"PATCH",
-			f"/me/events/{doc.custom_microsoft_event_id}",
-			cal.name,
-			json=_event_to_graph_body(doc),
-		)
-		_store_graph_response(doc.name, patched or {}, cal.name)
+		_patch_in_graph(cal.name, doc)
 	except Exception:
 		frappe.log_error(title=f"MS Event patch failed: {event_name}")
 	finally:
@@ -1638,12 +2487,13 @@ def fetch_events(calendar_name: str, start_datetime: str | None = None, end_date
 	out = []
 	for ev in items:
 		online = ev.get("onlineMeeting") or {}
+		start, end = _ms_times(ev)
 		out.append(
 			{
 				"id": ev.get("id"),
 				"subject": ev.get("subject"),
-				"start": _ms_dt_to_system(ev.get("start")),
-				"end": _ms_dt_to_system(ev.get("end")),
+				"start": start,
+				"end": end,
 				"is_all_day": bool(ev.get("isAllDay")),
 				"location": (ev.get("location") or {}).get("displayName"),
 				"join_url": online.get("joinUrl"),
@@ -1715,6 +2565,69 @@ def upgrade_check_event_owners():
 			)
 		)
 	return findings
+
+
+def orphaned_event_findings(check="calendar.orphaned_events"):
+	"""Doctor findings: Events flagged Missing From Outlook, per calendar.
+
+	Mirrors a full read no longer found (_settle_unseen_mirrors) and series pushed from Frappe
+	whose master Outlook answers 404 for (_settle_our_series).
+
+	Read-only. The sync only flags these (see _settle_unseen_mirrors); this is where an admin
+	finds them, decides, and learns about the setting that deletes them instead.
+	"""
+	from frappe_microsoft365 import doctor
+
+	if not frappe.db.has_column("Event", "custom_microsoft_orphaned"):
+		return []
+
+	rows = frappe.get_all(
+		"Event",
+		filters={"custom_microsoft_orphaned": 1},
+		fields=["name", "subject", "starts_on", "custom_microsoft_calendar as calendar"],
+		order_by="custom_microsoft_calendar, starts_on",
+		limit_page_length=0,
+	)
+	by_calendar = {}
+	for row in rows:
+		by_calendar.setdefault(row.calendar or _("no calendar"), []).append(row)
+
+	findings = []
+	for calendar, events in by_calendar.items():
+		sample = ", ".join(f"{row.name} ({row.subject})" for row in events[:UPGRADE_SAMPLE_SIZE])
+		more = len(events) - UPGRADE_SAMPLE_SIZE
+		if more > 0:
+			sample += " " + _("and {0} more").format(more)
+		findings.append(
+			doctor.finding(
+				check,
+				doctor.WARN,
+				_("{0} events synced with Microsoft Calendar {1} are no longer in Outlook").format(len(events), calendar),
+				_(
+					"Outlook no longer has these: a full read of the calendar did not find them, or, for a "
+					"repeating event, Outlook no longer knows its series. They were most likely deleted "
+					"there: {0}. They are marked Missing From Outlook and were not deleted, because other "
+					"records may link to them — and because a connection re-authorised as a different "
+					"Microsoft account sees none of the old account's events."
+				).format(sample),
+				_(
+					"Check them in Outlook and delete the ones that are gone. To have the sync delete "
+					"such events itself, tick Delete events missing from Outlook in Microsoft Settings."
+				),
+				target=calendar,
+			)
+		)
+	return findings
+
+
+def upgrade_check_orphaned_events():
+	"""Upgrade report: Events flagged Missing From Outlook.
+
+	Events only get flagged by a full read of their calendar, which the first sync after
+	upgrading to 1.2.0 does, so right after `bench migrate` this normally has nothing to say;
+	Run Diagnostics shows the same list from then on.
+	"""
+	return orphaned_event_findings("upgrade.calendar_orphaned_events")
 
 
 def _events_of_others(calendar=None):

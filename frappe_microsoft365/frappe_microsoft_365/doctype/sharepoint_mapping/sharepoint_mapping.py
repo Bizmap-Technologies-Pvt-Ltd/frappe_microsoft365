@@ -46,6 +46,11 @@ class SharePointMapping(Document):
 
 		if self.site_url:
 			validate_site_url(self.site_url)
+			# SharePoint refuses a file whose whole path passes 400 characters; a base folder that
+			# leaves no room is refused here rather than failing every upload later.
+			from frappe_microsoft365.microsoft_files import assert_base_path_fits
+
+			assert_base_path_fits(self)
 
 		# The resolved ids are a cache of the URL and the library name; editing either has to
 		# drop them, or files keep flowing to the old library with nothing on screen saying so.

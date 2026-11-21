@@ -95,7 +95,9 @@ def handle_files(dry_run=False):
 	from frappe_microsoft365 import microsoft_files as files
 
 	stored = frappe.get_all(
-		"File", filters={"custom_microsoft_status": files.STORED}, fields=["name", "file_size"]
+		"File",
+		filters={"custom_microsoft_status": ["in", [files.STORED, files.MOVING]]},
+		fields=["name", "file_size"],
 	)
 	if not stored:
 		return

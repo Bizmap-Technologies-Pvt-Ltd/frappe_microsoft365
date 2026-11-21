@@ -210,7 +210,10 @@ def check_scopes(settings):
 			)
 		)
 
-	missing = [s for s in graph.derive_scopes(settings) if s not in override]
+	# The override itself counts as granted: one that lists OnlineMeetings.ReadWrite already
+	# covers the OnlineMeetings.Read transcripts derive, and calling Read missing would be wrong.
+	needed = graph.derive_scopes(settings, override)
+	missing = [s for s in needed if s not in override]
 	if missing:
 		out.append(
 			finding(
@@ -220,7 +223,7 @@ def check_scopes(settings):
 				_(
 					"The capabilities ticked in Microsoft Settings need {0}, but the override asks "
 					"only for {1}. Whatever is missing fails with a 403 the first time it is used."
-				).format(", ".join(graph.derive_scopes(settings)), ", ".join(override)),
+				).format(", ".join(needed), ", ".join(override)),
 				_(
 					"Add the missing scope to the override, or clear the override entirely and let "
 					"the capabilities decide."
@@ -268,6 +271,110 @@ def check_authorized_scopes(requested, authorized, connections):
 				"Open each Microsoft Calendar and click Re-authorize. Existing tokens keep the "
 				"permissions they were issued with, so they will not pick this up on their own."
 			),
+		)
+	]
+
+
+def check_connection_scopes(requested, connections):
+	"""Per connection: does its token carry what sign-in asks for now, and is it still accepted?
+
+	``requested`` is what sign-in asks for now. ``connections`` is a list of dicts with
+	``name``, ``authorized``, ``authorized_scopes`` (what that connection asked for when it last
+	signed in) and ``authorization_error``. Pure, so it is testable without a site.
+
+	One finding per connection, because the fix is per connection: whoever owns it has to open
+	it and sign in again. A connection that never recorded its scopes is left out rather than
+	guessed at. A connection Microsoft has stopped accepting is reported whatever its scopes.
+	"""
+	requested = _norm_scopes(requested)
+	out = []
+	for conn in connections or []:
+		name = conn.get("name")
+		if not conn.get("authorized"):
+			if conn.get("authorization_error"):
+				out.append(
+					finding(
+						"calendar.authorization_lost",
+						WARN,
+						_("{0} has to be authorised again").format(name),
+						_("Microsoft stopped accepting its sign-in: {0}").format(conn.get("authorization_error")),
+						_(
+							"Its user (or a System Manager) opens the connection and clicks Authorize "
+							"Microsoft Access. Sync, Teams meetings and transcripts for it are paused "
+							"until then."
+						),
+						target=name,
+					)
+				)
+			continue
+		granted = _norm_scopes((conn.get("authorized_scopes") or "").replace(",", " ").split())
+		if not granted:
+			continue
+		missing = [s for s in requested if s not in granted]
+		if not missing:
+			continue
+		out.append(
+			finding(
+				"scopes.connection_missing",
+				WARN,
+				_("{0} was authorised without {1}").format(name, ", ".join(missing)),
+				_("It last signed in asking for {0}; sign-in now asks for {1} as well.").format(
+					", ".join(granted), ", ".join(missing)
+				),
+				_(
+					"Open this Microsoft Calendar and click Re-authorize. A token keeps the "
+					"permissions it was issued with, so the new capability fails with a 403 for "
+					"this connection until it signs in again."
+				),
+				target=name,
+			)
+		)
+	return out
+
+
+def _connection_scope_rows():
+	"""What check_connection_scopes needs, read from the site. None before the migration."""
+	meta = frappe.get_meta("Microsoft Calendar")
+	if not meta.has_field("authorized_scopes"):
+		return None
+	fields = ["name", "authorized", "authorized_scopes"]
+	if meta.has_field("authorization_error"):
+		fields.append("authorization_error")
+	return frappe.get_all("Microsoft Calendar", filters={"enabled": 1}, fields=fields, limit_page_length=0)
+
+
+def check_meeting_lookup_scope(settings, requested):
+	"""Which OnlineMeetings permission transcripts rely on here, said out loud.
+
+	Two sites with the same tickboxes can ask for different ones: a new setup asks for
+	OnlineMeetings.Read, the least Microsoft allows for finding a meeting from its join link,
+	while a site already granted OnlineMeetings.ReadWrite keeps asking for that so nobody is
+	sent through consent again. The admin looking at Entra has to know which row to look for.
+	"""
+	if not settings.get("use_transcripts"):
+		return []
+	from frappe_microsoft365.capabilities import MEETINGS_READ
+
+	scope = graph.meeting_lookup_scope(requested)
+	if scope not in requested:
+		# Only an override can leave both out, and check_scopes already reports it as missing.
+		return []
+	if scope == MEETINGS_READ:
+		why = _("It is the least privilege Microsoft allows for finding a meeting from its join link.")
+	elif settings.get("use_teams"):
+		why = _("Standalone Teams meetings need it, and it covers finding a meeting as well.")
+	else:
+		why = _(
+			"This site was already granted it, so it is still requested instead of {0} and nobody "
+			"is asked to consent again."
+		).format(MEETINGS_READ)
+	return [
+		finding(
+			"scopes.meeting_lookup",
+			PASS,
+			_("Transcripts find their meeting with {0}").format(scope),
+			why,
+			_("It is the row to look for under Entra ID > App registrations > your app > API permissions."),
 		)
 	]
 
@@ -764,8 +871,8 @@ def check_sign_in_tenant(key, settings=None):
 				_(
 					"Tenant ID is '{0}', which does not name your directory, so an account in "
 					"another organisation's directory with the same email address as one of your "
-					"users could sign in as them. Sign-in keeps working for now; from version 1.2.0 "
-					"it is refused until this is fixed."
+					"users could sign in as them. Every Microsoft sign-in is refused until this is "
+					"fixed."
 				).format(tenant or "common"),
 				_(
 					"Set Tenant ID in Microsoft Settings to the Directory (tenant) ID from the app "
@@ -794,6 +901,96 @@ def check_sign_in_tenant(key, settings=None):
 			)
 		)
 
+	return out
+
+
+def check_sign_in_callback(frappe_checks_state, runs_hook, callback_is_ours):
+	"""Does the sign-in callback on this Frappe do the checks Frappe 16 would? Pure.
+
+	``frappe_checks_state``: Frappe accepts a sign-in state once, from a server-side store
+	(Frappe 16). ``runs_hook``: Frappe calls ``on_social_login`` (Frappe 16).
+	``callback_is_ours``: the Microsoft callback is routed to this app's wrapper, not to another
+	app's override of the same method.
+	"""
+	out = []
+	if not callback_is_ours and not runs_hook:
+		out.append(
+			finding(
+				"sso.callback_not_checked",
+				FAIL,
+				_("Microsoft sign-in is handled by another app, without this app's checks"),
+				_(
+					"Another installed app overrides Frappe's Microsoft sign-in callback, and this "
+					"version of Frappe has no on_social_login hook, so nothing checks that an "
+					"account comes from your directory, or that the sign-in was started on this site."
+				),
+				_(
+					"Remove the other override of frappe.integrations.oauth2_logins.login_via_office365, "
+					"or switch Microsoft sign-in off (untick Enable Social Login on the Social Login Key)."
+				),
+			)
+		)
+
+	if not frappe_checks_state:
+		if callback_is_ours:
+			detail = _(
+				"Frappe 15 does not check the sign-in state it gets back against anything it stored. "
+				"For Microsoft sign-in this app does: the login page's state is kept for ten minutes "
+				"and accepted once, as on Frappe 16. Other sign-in providers on this site (Google, "
+				"GitHub and so on) are not covered, and a site whose login page is not Frappe's own "
+				"must build the Microsoft button through Frappe's login page context or its sign-ins "
+				"are refused."
+			)
+		else:
+			detail = _(
+				"Frappe 15 does not check the sign-in state it gets back against anything it stored, "
+				"so someone can make a visitor's browser sign in to the visitor's site as the "
+				"attacker's own account (login CSRF)."
+			)
+		out.append(
+			finding(
+				"sso.frappe15_state",
+				WARN,
+				_("Frappe 15 does not protect social sign-in against login CSRF"),
+				detail,
+				_("Frappe 16 checks the state for every provider. Upgrade Frappe when you can."),
+				"https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365/blob/main/docs/compatibility.md",
+			)
+		)
+	return out
+
+
+def check_secret_copies(copies):
+	"""Has the client secret in a copy drifted from Microsoft Settings? Pure.
+
+	``copies``: dicts of doctype, name, uses ("mail" or "sign-in") and same (bool), worked out by
+	``_secret_copies`` on the server. No secret is ever part of a finding.
+	"""
+	out = []
+	for copy in copies:
+		if copy.get("same"):
+			continue
+		out.append(
+			finding(
+				"secret.drift",
+				WARN,
+				_("The client secret in {0} '{1}' differs from Microsoft Settings").format(
+					_(copy["doctype"]), copy["name"]
+				),
+				_(
+					"{0} uses this copy, which Set Up made when it created the record. After a secret "
+					"is rotated in Azure the old one stops working, and Microsoft answers "
+					"AADSTS7000215 (invalid client secret)."
+				).format(copy.get("uses") or _("Microsoft 365")),
+				_(
+					"If Microsoft Settings holds the current secret, click Set Up on Microsoft Settings "
+					"and then Sync Secret, which copies it here. Otherwise paste the current secret "
+					"Value into Microsoft Settings first."
+				),
+				ENTRA_ERROR_DOC,
+				copy["name"],
+			)
+		)
 	return out
 
 
@@ -997,13 +1194,14 @@ def error_patterns():
 		# The permission people miss. They grant the transcript one and stop, but a transcript is
 		# addressed by meeting id, and getting that id from a join link is a different call with
 		# a different permission — a key to a door you cannot walk to.
-		r"OnlineMeetings\.ReadWrite|JoinWebUrl[^\n]{0,400}\b403\b|/me/onlineMeetings[^\n]{0,200}\b403\b",
+		r"OnlineMeetings\.Read|JoinWebUrl[^\n]{0,400}\b403\b|/me/onlineMeetings[^\n]{0,200}\b403\b",
 		_("Microsoft refused to look up the meeting behind this link"),
 		_(
-			"Mapping a join link to a meeting needs OnlineMeetings.ReadWrite, which the transcript "
-			"permission does not include. Tick Standalone Teams meetings in Microsoft Settings, "
-			"consent to it under Entra ID > App registrations > your app > API permissions, then "
-			"Re-authorize the Microsoft Calendar."
+			"Mapping a join link to a meeting needs OnlineMeetings.Read (sites set up before 1.2.0 "
+			"keep using OnlineMeetings.ReadWrite, which covers it), and the transcript permission "
+			"includes neither. Consent to the one this site requests — Run Diagnostics says which — "
+			"under Entra ID > App registrations > your app > API permissions, then Re-authorize "
+			"the Microsoft Calendar."
 		),
 	),
 	(
@@ -1656,6 +1854,61 @@ def _settings_config():
 	}
 
 
+def _decrypted(doctype, name, field="client_secret"):
+	try:
+		return get_decrypted_password(doctype, name, field, raise_exception=False) or ""
+	except Exception:
+		# A copy encrypted with another site's key cannot be compared; nothing to report.
+		return None
+
+
+def _secret_copies(settings=None):
+	"""Each copy of a Microsoft Settings secret, and whether it still matches. Server-side only.
+
+	A Connected App or Microsoft Social Login Key holds a copy when its client id is the one in
+	Microsoft Settings (or, for a Connected App, the application-access one). A record made for
+	another app registration has its own secret and is not compared. Returns only whether each
+	copy matches, never a secret.
+	"""
+	settings = settings or _settings_config()
+	pairs = []
+	client_id = (settings.get("client_id") or "").strip()
+	if client_id and settings.get("client_secret"):
+		pairs.append((client_id, settings.get("client_secret")))
+	app_client_id = (settings.get("app_client_id") or "").strip()
+	if app_client_id and app_client_id != client_id and settings.get("app_client_secret"):
+		pairs.append((app_client_id, settings.get("app_client_secret")))
+	if not pairs:
+		return []
+
+	copies = []
+	for record_client_id, secret in pairs:
+		for name in frappe.get_all("Connected App", filters={"client_id": record_client_id}, pluck="name"):
+			current = _decrypted("Connected App", name)
+			if current is not None:
+				copies.append(
+					{"doctype": "Connected App", "name": name, "uses": _("Mail"), "same": current == secret}
+				)
+		if record_client_id != client_id:
+			continue
+		for name in frappe.get_all(
+			"Social Login Key",
+			filters={"social_login_provider": "Office 365", "client_id": record_client_id},
+			pluck="name",
+		):
+			current = _decrypted("Social Login Key", name)
+			if current is not None:
+				copies.append(
+					{
+						"doctype": "Social Login Key",
+						"name": name,
+						"uses": _("Sign in with Microsoft"),
+						"same": current == secret,
+					}
+				)
+	return copies
+
+
 def _files_mappings():
 	if not frappe.db.table_exists("SharePoint Mapping"):
 		return []
@@ -1703,6 +1956,14 @@ def _email_account_configs():
 	return accounts
 
 
+def _sign_in_callback_findings():
+	from frappe_microsoft365 import sign_in
+
+	return check_sign_in_callback(
+		sign_in.frappe_checks_login_state(), sign_in.frappe_runs_sign_in_hook(), sign_in.callback_is_ours()
+	)
+
+
 @frappe.whitelist()
 def run_diagnostics():
 	"""Inspect the Microsoft 365 mail/identity configuration. Read-only. System Manager only."""
@@ -1713,13 +1974,21 @@ def run_diagnostics():
 
 	if any(settings.get(field) for field, _scope in graph.CAPABILITY_SCOPES):
 		findings += check_scopes(settings)
-		findings += check_authorized_scopes(
-			graph.get_scopes(settings),
-			graph.parse_scopes(settings.get("authorized_scopes")),
-			# Only authorised connections hold a token; an unauthorised one picks up the new
-			# scopes the first time it signs in, so it is not a problem to report.
-			frappe.db.count("Microsoft Calendar", {"authorized": 1}),
-		)
+		connections = _connection_scope_rows()
+		if connections is None:
+			# Not migrated yet: only the site-wide record of the last sign-in exists.
+			findings += check_authorized_scopes(
+				graph.get_scopes(settings),
+				graph.parse_scopes(settings.get("authorized_scopes")),
+				# Only authorised connections hold a token; an unauthorised one picks up the new
+				# scopes the first time it signs in, so it is not a problem to report.
+				frappe.db.count("Microsoft Calendar", {"authorized": 1}),
+			)
+		else:
+			# Each connection against its own sign-in: the site-wide value only says what the
+			# last person to authorise asked for, and vouched for everybody else's token.
+			findings += check_connection_scopes(graph.get_scopes(settings), connections)
+		findings += check_meeting_lookup_scope(settings, graph.get_scopes(settings))
 		# The half of the setup that lives in Microsoft's portals. Reported here because this is
 		# the button people press when something is wrong, and the fault that cost a real tenant
 		# an hour — a tenant switch shipped off — is on this list and invisible to every check
@@ -1739,6 +2008,9 @@ def run_diagnostics():
 		findings += check_event_custom_fields(
 			[f for f in EVENT_CUSTOM_FIELDS if not frappe.db.has_column("Event", f)]
 		)
+		from frappe_microsoft365.microsoft_calendar_sync import orphaned_event_findings
+
+		findings += orphaned_event_findings()
 
 	# Only where something actually depends on the queue. refresh=True because this is the one
 	# place a person looks *after* starting a worker to find out whether it worked, and a
@@ -1774,6 +2046,8 @@ def run_diagnostics():
 				as_dict=True,
 			)
 			findings += check_social_login_key(key, settings)
+			if key.enable_social_login:
+				findings += _sign_in_callback_findings()
 		else:
 			findings.append(
 				finding(
@@ -1790,10 +2064,15 @@ def run_diagnostics():
 		key = frappe.db.get_value(
 			"Social Login Key",
 			{"social_login_provider": "Office 365"},
-			["name", "authorize_url", "access_token_url"],
+			["name", "enable_social_login", "authorize_url", "access_token_url"],
 			as_dict=True,
 		)
 		findings += check_sign_in_tenant(key, settings)
+		if key.enable_social_login:
+			findings += _sign_in_callback_findings()
+
+	# A rotated secret updated in one place only: mail or sign-in fails while Set Up looks fine.
+	findings += check_secret_copies(_secret_copies(settings))
 
 	if wants_mail and not oauth_accounts:
 		findings.append(

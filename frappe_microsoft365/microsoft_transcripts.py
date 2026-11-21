@@ -23,7 +23,8 @@ all three with "grant transcript consent" is what sent a real tenant round a loo
 * **recordings**  -> OnlineMeetingRecording.Read.All, which Microsoft consents to separately
   from the transcript permission. A tenant happy to let an app read words frequently refuses
   to let it read video, so this one is missing on its own more often than not.
-* **the join-link lookup** -> OnlineMeetings.ReadWrite, which neither of the above includes.
+* **the join-link lookup** -> OnlineMeetings.Read, which neither of the above includes (or
+  OnlineMeetings.ReadWrite on a site that already had it; see derive_scopes).
 
 So each has its own hint, and none of them mentions the others.
 """
@@ -56,11 +57,13 @@ def _recording_perm_hint():
 
 
 def _online_meetings_hint():
+	"""Names the permission this site actually requests for the lookup, since that is the row
+	the admin has to find: OnlineMeetings.Read on a new setup, ReadWrite on one that kept it."""
 	return _(
-		"Finding a meeting from its join link needs OnlineMeetings.ReadWrite, which the transcript "
-		"permission does not include: tick Standalone Teams meetings in Microsoft Settings, consent "
-		"to it in Entra ID > App registrations, then Re-authorize this Microsoft Calendar."
-	)
+		"Finding a meeting from its join link needs {0}, which the transcript permission does not "
+		"include: consent to it in Entra ID > App registrations > your app > API permissions, then "
+		"Re-authorize this Microsoft Calendar."
+	).format(graph.meeting_lookup_scope())
 
 
 #: Microsoft added a tenant switch for this in 2026 and shipped it OFF. Every tenant now has

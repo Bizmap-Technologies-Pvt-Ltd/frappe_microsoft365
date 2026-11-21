@@ -1,5 +1,184 @@
 # Changelog
 
+## 1.2.0 — 2026-11-21
+
+Every bug found in the November audit, fixed and verified against the audit's reproductions:
+two-way calendar sync that keeps Outlook's edits, all-day and recurring events, connections that
+recover or say why they can't, Teams transcripts per meeting occurrence, SharePoint storage
+hardening, and sign-in that only admits your own directory on Frappe 15 and 16. **If Sign in with
+Microsoft is enabled, read the first manual step before updating.** After updating, run
+`bench --site <site> migrate` and `bench build --app frappe_microsoft365` (`bench update` does
+both), and read the `Microsoft 365 1.2.0:` line at the end of the migrate output.
+
+### Security
+
+- **Sign in with Microsoft on Frappe 15** accepts a sign-in only with a state this site's login
+  page issued in the last ten minutes, and only once, as Frappe 16 already does.
+- A Teams recording can only be downloaded from an Event it is stored on, including one with no
+  recordings stored yet.
+- SharePoint storage: archived links are downloaded from the address that was checked (no
+  second name lookup, every redirect checked the same way).
+- SharePoint storage: a moved file's kept local copy follows its File's privacy and is removed
+  with the File when no other File uses it.
+
+### Fixed
+
+**Calendar**
+- Changes made in Outlook are no longer overwritten: a push sends only the fields changed in
+  Frappe, and attendees are merged into Outlook's list instead of replacing it. A reply pulled
+  from Outlook no longer causes a push. (#19)
+- All-day events keep their dates in both directions; they were stored hours off when pulled and
+  refused by Microsoft when pushed. (#20)
+- The sync always looks the full 180 days ahead; its window used to shrink to 14 days. (#21)
+- Events deleted in Outlook while the sync reset no longer stay in Frappe unnoticed: after a full
+  read, events Outlook no longer has are marked *Missing From Outlook* and listed by Run
+  Diagnostics. (#22)
+- Repeating Events pushed from Frappe: an occurrence moved or renamed in Outlook appears in
+  Frappe, a series deleted in Outlook is marked *Missing From Outlook*, and the recurrence is only
+  re-sent when it changes. (#23)
+- A connection whose sign-in Microsoft no longer accepts (`invalid_grant`,
+  `interaction_required`) is marked *not authorised* with Microsoft's reason, its user gets one
+  notification, and it is no longer retried every 15 minutes. Timeouts and server errors never
+  mark a connection. (#24)
+- The pull no longer fails with `TimestampMismatchError: ... (Microsoft Calendar) has been
+  modified after you have opened it`: tokens are stored without saving the connection, concurrent
+  refreshes are serialised, and a long sync commits as it goes instead of holding row locks. (#25)
+- Throttling is handled as Microsoft asks: 429 and 503 are retried per `Retry-After` (seconds or
+  an HTTP date), 504 for requests safe to repeat, and a mailbox that stays throttled is left alone
+  for the rest of the run. (#26)
+- One Frappe Event creates exactly one Outlook event: the scheduled push and a person's save can
+  no longer both create it, and a save that rolls back leaves no meeting behind. (#27)
+- Moving an Event to another Microsoft Calendar creates it there and deletes it from the old one;
+  unticking *Sync with Microsoft Calendar* sticks. (#28)
+- Re-authorising a connection with a different Microsoft account starts a clean sync. (#29)
+- Authorised scopes are tracked per connection, and the doctor checks each one. (#30)
+
+**Teams transcripts and recordings**
+- A temporary error no longer stops the catch-up job for good; only permanent answers end the
+  schedule, and every stop leaves a status saying why. (#32)
+- Each occurrence of a recurring meeting gets only its own transcripts and recordings, and a
+  repeating Frappe Event is checked for every occurrence. (#33)
+- The catch-up job selects only Events that are due, commits after each, and keeps checking for
+  later recording parts until the schedule ends. (#34)
+- Join links containing `&`, `+` or `#` reach Microsoft whole; other links are sent exactly as
+  before. When a link matches nothing, the Outlook event's own link is tried. (#35)
+
+**SharePoint storage**
+- Public attachments moved to SharePoint open for visitors again, including ones moved before
+  1.2.0. (#37)
+- Old `/files` links redirect with *Keep Local Copy* on, and to a row the user may read. (#39)
+- A library or site recreated under the same address is looked up again instead of breaking every
+  new folder. (#40)
+- Paths are checked against SharePoint's 400-character limit up front; record folders and file
+  names leave room, and files more than 10 folders deep open again. (#41)
+- A worker that died after uploading no longer leaves a duplicate: the retry adopts the upload.
+  (#42)
+- A moved File re-attached to another record takes its SharePoint file with it, in a background
+  job after the save commits; meanwhile its status is *Moving*. (#43)
+- `File.get_content()` streams and refuses a file over the limit instead of reading any size into
+  memory. (#47)
+- Large uploads resume instead of starting again from byte 0. (#60)
+
+**Sign-in and setup**
+- Sign in with Microsoft on Frappe 15 refuses accounts from another organisation's directory, as
+  Frappe 16 already did. (#64)
+- Rotating the client secret no longer breaks mail or sign-in unnoticed: the doctor and Set Up
+  report a stale copy, compared on the server and never shown. (#44)
+- Upgrading from before 1.0.0 no longer switches Teams meetings and transcripts off. (#46)
+
+### Changed
+
+- **Sign in with Microsoft is refused while Tenant ID is `common`, `organizations`, `consumers`
+  or empty**, as announced in 1.1.1. A refused sign-in shows a page saying why. (#65)
+- The Microsoft sign-in callback is routed through this app on Frappe 15 and 16; the Social Login
+  Key's redirect URL does not change.
+- Transcripts look up their meeting with `OnlineMeetings.Read` on new setups and no longer need
+  *Standalone Teams meetings*; a site already granted `OnlineMeetings.ReadWrite` keeps requesting
+  it. Run Diagnostics says which one is in use. (#58)
+- A new Event without a Teams meeting is created in Outlook just after its save commits; its
+  Outlook link appears after a reload. A new Teams meeting is still created in the save, so its
+  join link shows at once.
+- A record's SharePoint folder is never renamed (it never actually was); the docs no longer say
+  it is. (#38)
+- On Frappe 15 the doctor warns while Microsoft sign-in is enabled, since Frappe 15 does not
+  protect other social login providers against login CSRF.
+
+### Added
+
+- **Delete events missing from Outlook** in Microsoft Settings (off by default), and the *Missing
+  From Outlook* marker on Events.
+- **Remove Other Meetings' Transcripts** on the Event form (System Managers), for Events holding
+  transcripts dated outside their own meeting.
+- **Sync Secret** in the Set Up dialog (System Managers).
+- Server-managed fields: *Microsoft Account ID*, *Authorization Lost* and *Authorized Scopes* on
+  Microsoft Calendar; SharePoint Status *Moving* on File.
+
+### Upgrade notes
+
+- **Manual steps**
+  - **If Sign in with Microsoft is enabled and Tenant ID is still `common`, `organizations`,
+    `consumers` or empty, set Tenant ID before updating.** From 1.2.0 every Microsoft sign-in on
+    such a site is refused (password sign-in is not affected). Put the *Directory (tenant) ID* from
+    the app registration's Overview page into Microsoft Settings > Tenant ID, and point the Social
+    Login Key's Authorize URL and Access Token URL at
+    `https://login.microsoftonline.com/<tenant id>/oauth2/v2.0/...`. The upgrade report fails with
+    `upgrade.sign_in_refused` on any site still in this state. Sites without Microsoft sign-in
+    see nothing.
+  - If the report lists `upgrade.meeting_capability_off` (sites that upgraded from before 1.0.0):
+    tick *Standalone Teams meetings* and *Meeting transcripts and recordings* again, save, and have
+    each user authorise their Microsoft Calendar again.
+  - Coming from 1.1.0 or 1.1.1: if the report lists `upgrade.calendar_event_owner` for events made
+    for the calendar's own user, use *Microsoft > Give Linked Events to <user>* on that Microsoft
+    Calendar (added in 1.1.2).
+- **Behaviour changes**
+  - **First sync after updating re-reads each calendar once** (30 days back to 210 ahead, about a
+    first sync's work); after that the window renews about monthly.
+  - Connections whose refresh token Microsoft already rejects are marked and their users notified
+    the first time anything refreshes them; live connections are not affected.
+  - *Missing From Outlook* appears after that first sync, not at migrate. Nothing is deleted
+    unless *Delete events missing from Outlook* is ticked.
+  - A token refresh is now a commit point, and a sync may sit out up to 60 seconds of Microsoft's
+    requested wait in a background job.
+  - Moving an Event between calendars cancels it in the old mailbox and invites again from the
+    new one.
+  - Frappe 15: Microsoft sign-in needs the state Frappe's own login page issues. Anyone with the
+    login page open during the update signs in again once. A site that replaced the login page
+    must build the Microsoft button through the login page's `provider_logins` context (see
+    docs/compatibility.md).
+  - Server-side readers of a moved SharePoint file read at most Frappe's upload limit (System
+    Settings > Max File Size); set `microsoft365_max_content_bytes` in `site_config.json` for
+    another limit. Opening a file from the form is unaffected.
+  - Link archiving no longer goes through an HTTP(S) proxy set in the worker's environment.
+  - Re-attaching a moved file with *Remove from SharePoint* off (the default) never sends
+    anything to the recycle bin: the old file stays and a copy is made where it needs to go.
+- **Patches that run on migrate** (none calls Microsoft; each is safe to run again)
+  - `copy_authorized_scopes_to_calendars`: copies the site-wide authorised scopes onto every
+    authorised Microsoft Calendar, so nobody is asked to re-authorise because of the update.
+  - `correct_pulled_all_day_events`: puts pulled all-day events stored with shifted times back on
+    their own date, only where the stored times are exactly a converted UTC midnight. All-day
+    events created in Frappe are never touched.
+  - `reopen_artifact_fetches_stopped_by_an_error`: meetings that 1.1.x stopped checking after one
+    error are reopened if they ended in the last 7 days; older ones get a status saying to use
+    *Get Transcript & Recording*.
+  - `move_public_kept_copies_of_private_files`: moves kept local copies of private Files out of
+    `public/files`. Nothing is deleted or fetched.
+  - `clear_legacy_default_scopes` (changed): on a site that has not run it yet, it now keeps Teams
+    meetings and transcripts on.
+- **Warnings to expect** in the upgrade report
+  - `upgrade.sign_in_refused` (FAIL): see the first manual step.
+  - `upgrade.transcripts_outside_occurrence`: Events holding transcripts from other occurrences of
+    the same meeting. Nothing is removed; use *Remove Other Meetings' Transcripts* on each.
+  - `upgrade.meeting_capability_off`: Teams or transcript data exists while the matching
+    capability is off.
+  - `upgrade.calendar_orphaned_events`: normally empty at migrate; see *Missing From Outlook*.
+  - `upgrade.sharepoint_orphaned_kept_copies`: kept local copies of Files deleted before 1.2.0,
+    for you to delete from the site's files folders.
+  - `upgrade.sharepoint_long_paths`: mappings whose base folder already uses more than 300 of
+    SharePoint's 400 path characters; such a mapping cannot be saved again until shortened.
+  - The doctor may report `secret.drift` on sites that rotated their client secret in Microsoft
+    Settings only; use *Set Up > Sync Secret*. Frappe 15 sites with Microsoft sign-in see
+    `sso.frappe15_state` (WARN).
+
 ## 1.1.2 — 2026-11-21
 
 A fix for a regression in 1.1.1 that stopped Teams transcripts from being found for new

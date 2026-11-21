@@ -7,6 +7,7 @@ for) and it is never destructive (an existing record is reported, never rewritte
 """
 
 import json
+from unittest.mock import patch
 
 import frappe
 
@@ -256,6 +257,13 @@ class TestScopeOverride(BaseTestCase):
 class TestCapabilityAzurePermissions(BaseTestCase):
 	"""The Set Up dialog renders capability["azure"], so it has to be what is really requested."""
 
+	def setUp(self):
+		super().setUp()
+		# A new setup: nothing granted yet, whatever this site's own connections hold.
+		patcher = patch.object(graph, "granted_scopes", return_value=[])
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
 	def _capability(self, capability_id):
 		return next(c for c in provisioning.capabilities() if c["id"] == capability_id)
 
@@ -276,7 +284,12 @@ class TestCapabilityAzurePermissions(BaseTestCase):
 		for capability_id in provisioning.GRAPH_CAPABILITY_FIELDS:
 			listed |= set(self._capability(capability_id)["azure"])
 
-		self.assertEqual(listed - {OFFLINE_ACCESS}, set(graph.derive_scopes(everything)))
+		derived = set(graph.derive_scopes(everything))
+		self.assertEqual(listed - {OFFLINE_ACCESS} - {"OnlineMeetings.Read"}, derived)
+		# Transcripts alone list OnlineMeetings.Read; with standalone meetings ticked too,
+		# ReadWrite covers it and the combined request carries only ReadWrite.
+		self.assertIn("OnlineMeetings.ReadWrite", derived)
+		self.assertNotIn("OnlineMeetings.Read", derived)
 
 	def test_graph_capabilities_do_not_advertise_openid_or_profile(self):
 		"""Those are sign-in scopes, requested automatically; only offline_access is consented."""

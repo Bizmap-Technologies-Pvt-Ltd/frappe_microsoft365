@@ -11,13 +11,16 @@
   "user",
   "column_break_1",
   "microsoft_user_email",
+  "microsoft_account_id",
   "authorized",
+  "authorization_error",
   "auth_section",
   "oauth_state",
   "oauth_state_expiry",
   "access_token",
   "refresh_token",
   "token_expiry",
+  "authorized_scopes",
   "calendar_section",
   "ms_calendar_id",
   "ms_calendar_name",
@@ -71,11 +74,26 @@
    "in_list_view": 1
   },
   {
+   "fieldname": "microsoft_account_id",
+   "fieldtype": "Data",
+   "label": "Microsoft Account ID",
+   "read_only": 1,
+   "description": "The Microsoft account (object id) this connection signed in as. Signing in as a different account starts the sync afresh."
+  },
+  {
    "fieldname": "authorized",
    "fieldtype": "Check",
    "label": "Authorized",
    "read_only": 1,
    "in_list_view": 1
+  },
+  {
+   "depends_on": "authorization_error",
+   "fieldname": "authorization_error",
+   "fieldtype": "Small Text",
+   "label": "Authorization Lost",
+   "read_only": 1,
+   "description": "Why Microsoft stopped accepting this connection's sign-in. Click Authorize to sign in again."
   },
   {
    "fieldname": "auth_section",
@@ -117,6 +135,13 @@
    "fieldtype": "Datetime",
    "label": "Token Expiry",
    "read_only": 1
+  },
+  {
+   "fieldname": "authorized_scopes",
+   "fieldtype": "Small Text",
+   "label": "Authorized Scopes",
+   "read_only": 1,
+   "description": "The permissions this connection asked for when it last signed in. A capability ticked later needs a fresh sign-in."
   },
   {
    "fieldname": "calendar_section",
@@ -224,7 +249,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-21 00:00:00",
+ "modified": "2026-11-21 14:00:00",
  "module": "Frappe Microsoft 365",
  "name": "Microsoft Calendar",
  "naming_rule": "By fieldname",

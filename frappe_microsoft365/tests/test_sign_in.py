@@ -202,10 +202,15 @@ class TestTokenDirectoryCheck(BaseTestCase):
 	def test_a_domain_tenant_on_a_multi_tenant_endpoint_is_refused(self):
 		self.assertIsNotNone(sign_in.refusal({"tid": TENANT}, "contoso.com", COMMON_TOKEN))
 
-	def test_multi_tenant_keeps_signing_people_in_during_1_1_1(self):
-		"""Nobody is locked out by the upgrade; enforcement starts in 1.2.0."""
-		for tenant in ("common", "organizations", "", None):
-			self.assertIsNone(sign_in.refusal({"tid": OTHER}, tenant, COMMON_TOKEN), tenant)
+	def test_multi_tenant_refuses_every_sign_in_from_1_2_0(self):
+		"""1.1.1 let these through so nobody was locked out by that upgrade; 1.2.0 refuses."""
+		for tenant in ("common", "organizations", "consumers", "", None):
+			for tid in (OTHER, TENANT, None):
+				problem = sign_in.refusal({"tid": tid}, tenant, COMMON_TOKEN)
+				self.assertIsNotNone(problem, (tenant, tid))
+				# The person signing in is told whom to ask, and the administrator what to set.
+				self.assertIn("administrator", problem)
+				self.assertIn("Tenant ID", problem)
 
 
 class TestSignInHook(SignInTestCase):
@@ -389,3 +394,335 @@ class TestFillTenantPatch(SignInTestCase):
 		self.assertEqual(
 			frappe.db.get_value("Social Login Key", sign_in.PROVIDER, "authorize_url"), COMMON_AUTHORIZE
 		)
+
+
+SINGLE_AUTHORIZE = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize"
+SINGLE_TOKEN = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+
+
+def frappe15_state(token="t0k3n"):
+	"""A state as Frappe 15's login page writes it: base64 JSON with a random token."""
+	return base64.b64encode(
+		json.dumps({"site": "http://x", "token": token, "redirect_to": "/app"}).encode()
+	).decode()
+
+
+def login_page_context(state):
+	"""The part of Frappe 15's login page context the state hook reads."""
+	from urllib.parse import urlencode
+
+	return frappe._dict(
+		provider_logins=[
+			{
+				"name": "google",
+				"auth_url": "https://accounts.google.com/o/oauth2/auth?" + urlencode({"state": "x"}),
+			},
+			{
+				"name": "office_365",
+				"auth_url": SINGLE_AUTHORIZE
+				+ "?"
+				+ urlencode({"state": state.encode(), "client_id": CLIENT}),
+			},
+		]
+	)
+
+
+class TestMultiTenantRefusedFrom120(SignInTestCase):
+	"""#65: a multi-tenant Tenant ID refuses Microsoft sign-in, and the upgrade report says so first."""
+
+	def test_the_hook_refuses_a_multi_tenant_site(self):
+		set_settings(tenant_id="common")
+
+		with self.assertRaises(frappe.AuthenticationError):
+			sign_in.on_social_login(user="a@example.com", provider="office_365", claims={"tid": TENANT})
+
+	def test_upgrade_check_fails_loudly_on_an_enabled_multi_tenant_sign_in(self):
+		self._key(enabled=1)
+		for tenant in ("common", "organizations", "consumers", ""):
+			set_settings(tenant_id=tenant)
+
+			found = sign_in.upgrade_check_multi_tenant_refused()
+
+			self.assertEqual(
+				[(f["check"], f["status"]) for f in found], [("upgrade.sign_in_refused", doctor.FAIL)]
+			)
+			self.assertIn("Tenant ID", found[0]["fix"])
+
+	def test_upgrade_check_is_quiet_without_an_enabled_sign_in_or_on_one_directory(self):
+		set_settings(tenant_id="common")
+		# Production: no Social Login Key at all.
+		self.assertEqual(sign_in.upgrade_check_multi_tenant_refused(), [])
+		# A record that is switched off refuses nobody.
+		self._key(enabled=0)
+		self.assertEqual(sign_in.upgrade_check_multi_tenant_refused(), [])
+		self._drop_key()
+		self._key(authorize=SINGLE_AUTHORIZE, token=SINGLE_TOKEN, enabled=1)
+		set_settings(tenant_id=TENANT)
+		self.assertEqual(sign_in.upgrade_check_multi_tenant_refused(), [])
+
+	def test_the_1_2_0_check_is_registered(self):
+		from frappe_microsoft365.upgrade import registered_checks
+
+		paths = [path for _version, group in registered_checks("1.1.2", "1.2.0") for path in group]
+
+		self.assertIn("frappe_microsoft365.sign_in.upgrade_check_multi_tenant_refused", paths)
+
+
+class TestCallbackWrapper(SignInTestCase):
+	"""#64: the Microsoft callback applies the directory rule itself, on any Frappe version.
+
+	Only Microsoft is faked: ``get_info_via_oauth`` is the call that exchanges the code over the
+	network. Everything after it, Frappe's ``login_oauth_user`` included, is the real code unless
+	a test says otherwise.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		self._key(authorize=SINGLE_AUTHORIZE, token=SINGLE_TOKEN, enabled=1)
+		set_settings(tenant_id=TENANT)
+		frappe.local.response = frappe._dict()
+		# The state check has its own tests below; here every state is one the login page issued,
+		# so these run the same on Frappe 15 (where the callback checks it) and 16 (where Frappe does).
+		issued = patch.object(sign_in, "consume_login_state", return_value=True)
+		issued.start()
+		self.addCleanup(issued.stop)
+
+	def _claims(self, tid):
+		return {"email": "administrator@example.com", "sub": "s", "tid": tid, "given_name": "A"}
+
+	def _call(self, claims, state="state", login=None):
+		from frappe.utils import oauth
+
+		login = login or MagicMock()
+		with (
+			patch.object(oauth, "get_info_via_oauth", return_value=claims) as exchange,
+			patch.object(oauth, "login_oauth_user", login),
+		):
+			sign_in.login_via_office365(code="the-code", state=state)
+		return exchange, login
+
+	def test_the_callback_is_routed_here_and_open_to_guests(self):
+		self.assertEqual(
+			frappe.get_hooks("override_whitelisted_methods")[sign_in.FRAPPE_CALLBACK][-1], sign_in.CALLBACK
+		)
+		self.assertTrue(sign_in.callback_is_ours())
+		self.assertIn(sign_in.login_via_office365, frappe.guest_methods)
+
+	def test_a_foreign_directory_is_refused_before_frappe_sees_the_account(self):
+		exchange, login = self._call(self._claims(OTHER))
+
+		exchange.assert_called_once()
+		self.assertEqual(exchange.call_args.args[:2], ("office_365", "the-code"))
+		self.assertTrue(exchange.call_args.kwargs.get("id_token"))
+		login.assert_not_called()
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+
+	def test_a_multi_tenant_site_refuses_with_the_fix_named(self):
+		set_settings(tenant_id="organizations")
+
+		_exchange, login = self._call(self._claims(TENANT))
+
+		login.assert_not_called()
+		self.assertEqual(frappe.local.response.get("http_status_code"), 403)
+		message = str(getattr(frappe.local, "message", "") or "")
+		self.assertIn("administrator", message)
+
+	def test_own_directory_is_handed_to_frappe_unchanged(self):
+		claims = self._claims(TENANT)
+
+		_exchange, login = self._call(claims, state="the-state")
+
+		login.assert_called_once_with(claims, provider="office_365", state="the-state")
+
+	def test_on_frappe_16_the_real_login_runs_and_its_hook_agrees(self):
+		"""Through Frappe 16's login_oauth_user: its state check and the hook still run once each."""
+		from frappe.utils import oauth
+
+		if not (sign_in.frappe_checks_login_state() and sign_in.frappe_runs_sign_in_hook()):
+			self.skipTest("this Frappe keeps neither the state nor the hook (Frappe 15)")
+
+		login_manager = MagicMock()
+		with (
+			patch.object(frappe.local, "login_manager", login_manager, create=True),
+			patch("frappe.utils.oauth.update_oauth_user", return_value=None),
+			patch("frappe.utils.oauth.redirect_post_login"),
+			patch.object(oauth, "get_info_via_oauth", return_value=self._claims(TENANT)),
+			patch.object(sign_in, "check_claims", wraps=sign_in.check_claims) as rule,
+		):
+			state = oauth.create_oauth_state(None)
+			sign_in.login_via_office365(code="c", state=state)
+			login_manager.login_as.assert_called_once_with("administrator@example.com")
+			# The callback, then the hook: same rule, same answer.
+			self.assertEqual(rule.call_count, 2)
+
+			# Frappe 16 consumed the state; a replay is refused by Frappe, not by this app.
+			login_manager.reset_mock()
+			sign_in.login_via_office365(code="c", state=state)
+			login_manager.login_as.assert_not_called()
+			self.assertEqual(frappe.local.response.get("http_status_code"), 417)
+
+
+class TestFrappe15State(SignInTestCase):
+	"""S11: where Frappe keeps no server-side state (Frappe 15), the callback keeps it instead."""
+
+	def setUp(self):
+		super().setUp()
+		self._key(authorize=SINGLE_AUTHORIZE, token=SINGLE_TOKEN, enabled=1)
+		set_settings(tenant_id=TENANT)
+		frappe.local.response = frappe._dict()
+		frappe15 = patch.object(sign_in, "frappe_checks_login_state", return_value=False)
+		frappe15.start()
+		self.addCleanup(frappe15.stop)
+
+	def _call(self, state):
+		from frappe.utils import oauth
+
+		claims = {"email": "administrator@example.com", "tid": TENANT}
+		with (
+			patch.object(oauth, "get_info_via_oauth", return_value=claims) as exchange,
+			patch.object(oauth, "login_oauth_user") as login,
+		):
+			sign_in.login_via_office365(code="c", state=state)
+		return exchange, login
+
+	def test_a_state_the_login_page_never_issued_is_refused_before_microsoft_is_asked(self):
+		exchange, login = self._call(frappe15_state("forged"))
+
+		exchange.assert_not_called()
+		login.assert_not_called()
+		self.assertEqual(frappe.local.response.get("http_status_code"), 417)
+
+	def test_garbage_state_is_refused(self):
+		for state in (
+			"",
+			"not base64!",
+			base64.b64encode(b"[1,2]").decode(),
+			base64.b64encode(b'{"token": ""}').decode(),
+		):
+			_exchange, login = self._call(state)
+			login.assert_not_called()
+
+	def test_an_issued_state_is_accepted_once(self):
+		state = frappe15_state(frappe.generate_hash())
+		sign_in.remember_login_state(login_page_context(state))
+
+		_exchange, login = self._call(state)
+		login.assert_called_once()
+
+		frappe.local.response = frappe._dict()
+		exchange, login = self._call(state)
+		exchange.assert_not_called()
+		login.assert_not_called()
+		self.assertEqual(frappe.local.response.get("http_status_code"), 417)
+
+	def test_only_the_microsoft_button_state_is_remembered(self):
+		sign_in.remember_login_state(login_page_context(frappe15_state("ms-token")))
+
+		self.assertFalse(sign_in.consume_login_state(frappe15_state("x")))
+		self.assertTrue(sign_in.consume_login_state(frappe15_state("ms-token")))
+
+	def test_the_state_expires(self):
+		sign_in.remember_login_state(login_page_context(frappe15_state("ttl-token")))
+
+		ttl = frappe.cache.ttl(sign_in._state_key("ttl-token"))
+
+		self.assertTrue(0 < ttl <= sign_in.STATE_TTL, ttl)
+		frappe.cache.delete(sign_in._state_key("ttl-token"))
+
+	def test_other_pages_are_left_alone(self):
+		with patch.object(frappe.cache, "set") as store:
+			sign_in.remember_login_state(frappe._dict(title="About"))
+			sign_in.remember_login_state(frappe._dict(provider_logins=[]))
+		store.assert_not_called()
+
+	def test_the_frappe_15_flow_end_to_end_with_frappe_15_login(self):
+		"""Frappe 15's login_oauth_user only checks that the state has a token; ours runs first."""
+		from frappe.utils import oauth
+
+		def frappe15_login(data, *, provider=None, state=None, generate_login_token=False):
+			decoded = json.loads(base64.b64decode(state).decode("utf-8"))
+			if not decoded.get("token"):
+				raise AssertionError("Frappe 15 would refuse")
+			frappe.local.login_manager.login_as(oauth.get_email(data))
+
+		login_manager = MagicMock()
+		state = frappe15_state(frappe.generate_hash())
+		sign_in.remember_login_state(login_page_context(state))
+		with (
+			patch.object(frappe.local, "login_manager", login_manager, create=True),
+			patch.object(oauth, "login_oauth_user", frappe15_login),
+			patch.object(
+				oauth, "get_info_via_oauth", return_value={"email": "administrator@example.com", "tid": OTHER}
+			),
+		):
+			sign_in.login_via_office365(code="c", state=state)
+			login_manager.login_as.assert_not_called()
+
+			state = frappe15_state(frappe.generate_hash())
+			sign_in.remember_login_state(login_page_context(state))
+			with patch.object(
+				oauth,
+				"get_info_via_oauth",
+				return_value={"email": "administrator@example.com", "tid": TENANT},
+			):
+				sign_in.login_via_office365(code="c", state=state)
+			login_manager.login_as.assert_called_once_with("administrator@example.com")
+
+
+class TestFrappe16LeavesStateToFrappe(SignInTestCase):
+	def test_no_state_is_stored_or_consumed_by_this_app(self):
+		if not sign_in.frappe_checks_login_state():
+			self.skipTest("Frappe 15")
+		with patch.object(frappe.cache, "set") as store:
+			sign_in.remember_login_state(login_page_context(frappe15_state("x")))
+		store.assert_not_called()
+
+
+class TestDoctorSignInCallback(SignInTestCase):
+	def test_frappe_15_with_our_callback_warns(self):
+		found = doctor.check_sign_in_callback(False, False, True)
+
+		self.assertEqual([(f["check"], f["status"]) for f in found], [("sso.frappe15_state", doctor.WARN)])
+
+	def test_frappe_15_with_another_apps_callback_fails(self):
+		found = {(f["check"], f["status"]) for f in doctor.check_sign_in_callback(False, False, False)}
+
+		self.assertEqual(
+			found, {("sso.callback_not_checked", doctor.FAIL), ("sso.frappe15_state", doctor.WARN)}
+		)
+
+	def test_frappe_16_is_clean_even_without_our_callback(self):
+		self.assertEqual(doctor.check_sign_in_callback(True, True, True), [])
+		self.assertEqual(doctor.check_sign_in_callback(True, True, False), [])
+
+	def test_run_diagnostics_warns_on_frappe_15_when_sign_in_is_enabled(self):
+		self._key(authorize=SINGLE_AUTHORIZE, token=SINGLE_TOKEN, enabled=1)
+		set_settings(tenant_id=TENANT, client_id=CLIENT, use_sso=1)
+
+		with (
+			patch.object(sign_in, "frappe_checks_login_state", return_value=False),
+			patch.object(sign_in, "frappe_runs_sign_in_hook", return_value=False),
+		):
+			checks = {f["check"] for f in doctor.run_diagnostics()["findings"]}
+		self.assertIn("sso.frappe15_state", checks)
+
+		real = {f["check"] for f in doctor.run_diagnostics()["findings"]}
+		self.assertEqual("sso.frappe15_state" in real, not sign_in.frappe_checks_login_state())
+
+	def test_run_diagnostics_is_quiet_about_sign_in_without_a_key(self):
+		"""Production: sign-in off and no Social Login Key, on either Frappe."""
+		set_settings(tenant_id=TENANT, client_id=CLIENT, use_sso=0)
+
+		with patch.object(sign_in, "frappe_checks_login_state", return_value=False):
+			checks = {f["check"] for f in doctor.run_diagnostics()["findings"]}
+
+		self.assertFalse({c for c in checks if c.startswith("sso.")}, checks)
+
+	def test_a_disabled_key_is_not_warned_about(self):
+		self._key(authorize=SINGLE_AUTHORIZE, token=SINGLE_TOKEN, enabled=0)
+		set_settings(tenant_id=TENANT, client_id=CLIENT, use_sso=0)
+
+		with patch.object(sign_in, "frappe_checks_login_state", return_value=False):
+			checks = {f["check"] for f in doctor.run_diagnostics()["findings"]}
+
+		self.assertNotIn("sso.frappe15_state", checks)

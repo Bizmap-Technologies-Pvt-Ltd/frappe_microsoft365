@@ -66,11 +66,25 @@ DEAD_QUEUE = {
 
 
 class ArtifactsTestCase(BaseTestCase):
+	#: Most tests here are about what happens to a transcript, not when it was made, and their
+	#: fixtures carry fixed Graph dates against meetings timed relative to now. The occurrence
+	#: filter would rightly drop those, so it is off unless a test class is about it.
+	filter_by_occurrence = False
+
 	def setUp(self):
 		super().setUp()
 		queue = patch.object(artifacts.background, "health", return_value=HEALTHY_QUEUE)
 		queue.start()
 		self.addCleanup(queue.stop)
+		# The catch-up job commits after every Event. Inside a test that would make each fixture
+		# permanent and leak it into every later test, so commits are counted, not made.
+		commit = patch.object(frappe.db, "commit")
+		self.commits = commit.start()
+		self.addCleanup(commit.stop)
+		if not self.filter_by_occurrence:
+			unbounded = patch.object(artifacts, "_occurrence_window", return_value=(None, None))
+			unbounded.start()
+			self.addCleanup(unbounded.stop)
 		if not frappe.db.exists("Microsoft Calendar", CALENDAR):
 			frappe.get_doc(
 				{
@@ -450,7 +464,10 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 
 		self.assertIn(event.name, artifacts._due_events([CALENDAR]))
 
-	def test_a_meeting_with_both_artifacts_is_never_asked_about_again(self):
+	def test_a_meeting_with_both_artifacts_is_still_asked_about_for_later_parts(self):
+		"""A meeting past four hours comes back as several recordings, and the later parts
+		appear later; stopping at the first one lost them. It waits behind meetings still
+		missing something, though."""
 		event = self._finished_meeting()
 		event.db_set(
 			{
@@ -459,8 +476,13 @@ class TestTheCatchUpJob(ArtifactsTestCase):
 			},
 			update_modified=False,
 		)
+		waiting = self._finished_meeting()
+		waiting.db_set("ends_on", add_to_date(now_datetime(), minutes=-20), update_modified=False)
 
-		self.assertNotIn(event.name, artifacts._due_events([CALENDAR]))
+		due = artifacts._due_events([CALENDAR])
+
+		self.assertIn(event.name, due)
+		self.assertLess(due.index(waiting.name), due.index(event.name))
 
 	def test_the_job_gives_up_after_the_last_step(self):
 		event = self._finished_meeting(ended_hours_ago=48)
@@ -693,6 +715,40 @@ class TestDownloadingARecording(ArtifactsTestCase):
 
 		requested.assert_not_called()
 
+	def test_an_id_is_refused_when_nothing_is_stored_yet(self):
+		"""An empty list means no recording belongs to this Event, not that every one does.
+
+		Only the network is faked here, so the refusal is shown to happen before graph_request
+		builds a URL or looks up a token, not merely before a mocked graph_request."""
+		event = self._finished_meeting()
+
+		with patch.object(graph, "_http_request") as sent, patch.object(
+			graph, "get_valid_access_token", return_value="token"
+		):
+			with self.assertRaises(frappe.PermissionError):
+				artifacts.download_recording(event.name, recording_id="never-attached")
+
+		sent.assert_not_called()
+
+	def test_a_stored_id_is_still_streamed(self):
+		"""The guard must not refuse the recordings it is there to serve: the request that goes
+		out is the content URL of the stored id, through the real graph_request."""
+		event = self._recorded("r1")
+		fake = UnbufferableResponse(headers={"Content-Type": "video/mp4"})
+		fake.status_code = 200
+
+		with patch.object(graph, "_http_request", return_value=fake) as sent, patch.object(
+			graph, "get_valid_access_token", return_value="token"
+		):
+			artifacts.download_recording(event.name, recording_id="r1")
+
+		method, url = sent.call_args.args
+		self.assertEqual(method, "GET")
+		self.assertEqual(
+			url, "https://graph.microsoft.com/v1.0/me/onlineMeetings/meeting-1/recordings/r1/content"
+		)
+		self.assertIsNone(sent.call_args.kwargs.get("json"))
+
 	def test_a_meeting_with_no_recording_says_so_instead_of_asking(self):
 		event = self._finished_meeting()
 
@@ -833,7 +889,7 @@ class TestWhichPermissionIsMissing(ArtifactsTestCase):
 
 	def test_a_403_resolving_the_join_link_names_the_meetings_permission(self):
 		"""Mapping a join link to a meeting id is /me/onlineMeetings, which needs
-		OnlineMeetings.ReadWrite — a permission neither transcript nor recording consent
+		OnlineMeetings.Read — a permission neither transcript nor recording consent
 		includes. People tick transcripts, grant that, and stop, so this is the step that fails
 		for them; it used to surface as a raw Graph 403 against a path nobody recognises."""
 		event = self._finished_meeting(custom_microsoft_online_meeting_id=None)
@@ -847,8 +903,8 @@ class TestWhichPermissionIsMissing(ArtifactsTestCase):
 				artifacts.fetch_meeting_artifacts(event.name)
 
 		said = str(ctx.exception)
-		self.assertIn("OnlineMeetings.ReadWrite", said)
-		self.assertIn("Standalone Teams meetings", said, "name the tickbox that asks for it")
+		self.assertIn(graph.meeting_lookup_scope(), said, "name the permission this site requests")
+		self.assertIn("OnlineMeetings.Read", said)
 		self.assertNotIn("OnlineMeetingTranscript.Read.All", said)
 
 	def test_a_join_link_that_matches_nothing_is_not_called_a_permission_problem(self):

@@ -77,8 +77,10 @@ class MicrosoftSettings(Document):
 				self.set(field, frappe.db.get_single_value(self.doctype, field, cache=False))
 
 	def _drop_capabilities_that_lost_their_prerequisite(self):
-		"""A capability that builds on another cannot work without it — transcripts, for one,
-		are reached through the meeting behind a join URL, so they need standalone meetings.
+		"""A capability that builds on another (``requires`` in capabilities.py) cannot work
+		without it. None does today — transcripts used to build on standalone meetings, until
+		they learnt to find their meeting with OnlineMeetings.Read — but the rule stays for the
+		next one that does.
 
 		The field is hidden when its prerequisite is off, and a hidden Check keeps whatever value
 		it had — which would leave sign-in quietly asking Azure for transcript and recording

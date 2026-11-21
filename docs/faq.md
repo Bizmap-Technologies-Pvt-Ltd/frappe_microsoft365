@@ -189,7 +189,11 @@ Azure and what sign-in requests cannot drift apart.
 | --- | --- |
 | Outlook calendar (covers Teams meetings on an Event, and RSVP) | `User.Read` `Calendars.ReadWrite` |
 | Standalone Teams meetings | `User.Read` `OnlineMeetings.ReadWrite` |
-| Meeting transcripts and recordings | the row above, **plus** `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+| Meeting transcripts and recordings | `User.Read` `OnlineMeetings.Read` `OnlineMeetingTranscript.Read.All` `OnlineMeetingRecording.Read.All` |
+
+A site set up before 1.2.0, when transcripts were built on standalone meetings, was granted
+`OnlineMeetings.ReadWrite` and keeps requesting it instead of `OnlineMeetings.Read`, so nobody is
+asked to consent again. **Run Diagnostics** says which of the two this site uses.
 
 `offline_access`, `openid` and `profile` are requested automatically at sign-in, but
 `offline_access` still has to be **granted** in Azure like any other permission — without it
@@ -202,7 +206,7 @@ Mail and sign-in are not Graph permissions; their lists are in
 Because Microsoft consents to them separately, and tenants routinely grant one and refuse
 another. `OnlineMeetingTranscript.Read.All` reads a transcript you can already address by
 meeting id — but you start from a join URL, and turning that into a meeting id is
-`OnlineMeetings.ReadWrite`. Reading the video is a third permission again. That split is why a
+`OnlineMeetings.Read`. Reading the video is a third permission again. That split is why a
 calendar-only setup never has to ask for any of them.
 
 ## Do I need to be a Global Administrator?
@@ -250,7 +254,13 @@ A weekly series always includes the day it starts on, because Graph rejects one 
 
 The occurrences Microsoft generates from that series are not mirrored back as separate Frappe
 Events; the repeating Event already stands for them, in the same way one Graph series master
-stands for its own occurrences.
+stands for its own occurrences. One occurrence moved or renamed in Outlook is mirrored as its
+own Event beside the series (Frappe's repeat rule still shows the original slot, since Frappe
+has no way to mark one occurrence as changed). When the series is deleted in Outlook, the
+repeating Event in Frappe is marked **Missing From Outlook** and listed by **Run Diagnostics**;
+it is deleted only if **Delete events missing from Outlook** is ticked in Microsoft Settings.
+It is not deleted outright because a connection re-authorised as a different Microsoft account
+cannot see the old account's series either, and that must not wipe them.
 
 In the other direction a recurring series organised **in Outlook** arrives as individual
 occurrences, one Frappe Event each, since Frappe has nothing else to attach them to.
