@@ -290,3 +290,37 @@ class TestKeptCopyPatchAndCheck(KeptCopyTestCase):
 		self.assertIn(
 			"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies", upgrade_checks()
 		)
+
+
+# --- B20: public attachments stay public after the move -------------------------------------
+
+
+class TestPublicFilesStayPublic(FilesTestCase):
+	def moved(self, is_private):
+		f = self.attach(name=f"logo-{frappe.generate_hash(length=6)}.png", is_private=is_private)
+		files.upload_file(f.name)
+		self.assertEqual(frappe.db.get_value("File", f.name, "custom_microsoft_status"), files.STORED)
+		return f
+
+	def as_guest(self):
+		frappe.set_user("Guest")
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def test_a_guest_can_open_a_moved_public_file(self):
+		f = self.moved(is_private=0)
+		self.as_guest()
+		with patch.object(files, "_stream", return_value="STREAM") as stream:
+			self.assertEqual(files.open_file(f.name), "STREAM")
+		stream.assert_called_once_with("DRIVE", "ITEM-" + f.file_name, f.file_name, download=0)
+
+	def test_a_guest_still_cannot_open_a_moved_private_file(self):
+		f = self.moved(is_private=1)
+		self.as_guest()
+		with patch.object(files, "_stream") as stream:
+			with self.assertRaises(frappe.PermissionError):
+				files.open_file(f.name)
+		stream.assert_not_called()
+
+	def test_open_file_is_reachable_without_signing_in(self):
+		# Without allow_guest Frappe answers a guest with 403 before open_file runs.
+		self.assertIn(files.open_file, frappe.guest_methods)

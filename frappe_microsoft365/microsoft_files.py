@@ -1844,20 +1844,23 @@ def own_local_copy(file_doc, url):
 	return not frappe.db.exists("File", {**others, "custom_microsoft_local_url": url})
 
 
-@frappe.whitelist(methods=["GET"])
+@frappe.whitelist(methods=["GET"], allow_guest=True)
 def open_file(file: str, download: int = 0):
 	"""Open a File that was moved to SharePoint. The file_url of every moved File points here.
 
-	Permission is the File's own, exactly as for /private/files: any File row carrying this URL
-	that the user may read will do, because attachment copies share one URL.
+	Permission is the File's own, exactly as for /files and /private/files: any File row carrying
+	this URL that the user may read will do, because attachment copies share one URL. A public
+	File (is_private=0) was readable by anyone at /files before it moved — an image on a web
+	page, a link in a customer email — so it still is, signed in or not; a private one needs a
+	signed-in user who may read it.
 	"""
 	from frappe.core.doctype.access_log.access_log import make_access_log
 	from frappe.core.doctype.file.utils import find_file_by_url
 
-	if frappe.session.user == "Guest":
-		raise frappe.PermissionError(_("You must be logged in to open this file."))
-
+	guest = frappe.session.user == "Guest"
 	file_doc = find_file_by_url(stored_url(file))
+	if guest and (not file_doc or cint(file_doc.is_private)):
+		raise frappe.PermissionError(_("You must be logged in to open this file."))
 	if not file_doc:
 		raise frappe.PermissionError(_("You don't have permission to access this file"))
 	if file_doc.get("custom_microsoft_status") != STORED:

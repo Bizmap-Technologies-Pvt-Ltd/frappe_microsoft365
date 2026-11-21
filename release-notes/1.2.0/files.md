@@ -3,6 +3,10 @@
 - Archived links are downloaded from the address that was checked: the server no longer looks the name up a second time to connect, and every redirect is checked the same way.
 - A moved file's kept local copy now follows the File's privacy (a File made private takes its copy out of public files) and is removed when the File is deleted and no other File uses it.
 
+### Fixed
+
+- Public attachments moved to SharePoint open for visitors who are not signed in again, as they did from `/files` before the move: images on web pages, links in customer emails. Private ones still need a signed-in user who may read them. This also fixes public files that were moved before 1.2.0. (#37)
+
 ### Upgrade notes
 
 - **Kept local copies (Keep Local Copy on).** Migrate moves the kept copy of every moved File that is private but whose copy is still in `public/files` to `private/files`. Nothing is deleted and nothing is fetched from SharePoint. Copies of Files that were deleted before 1.2.0 are not touched: the upgrade report lists them (`upgrade.sharepoint_orphaned_kept_copies`) so you can delete them from the site's files folders yourself. On a site that never switched SharePoint storage on, the patch and the check do nothing.
