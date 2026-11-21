@@ -1,5 +1,160 @@
 # Changelog
 
+## 1.1.1 — 2026-11-21
+
+Security fixes across calendar sync, SharePoint storage, sign-in and the generated setup
+scripts, plus fixes found in an audit of 1.1.0 and the first release with an upgrade report.
+Every site running 1.1.0 or earlier should update. After updating, run
+`bench --site <site> migrate` and `bench build --app frappe_microsoft365` (`bench update` does
+both), then read the `Microsoft 365 1.1.1:` line at the end of the migrate output.
+
+### Security
+
+- **Calendar:** an Event is only created, updated or deleted in its owner's own Microsoft
+  calendar. Linking an Event to someone else's Microsoft Calendar is refused on save, for System
+  Managers too.
+- **Calendar:** Microsoft access tokens are only ever sent to Microsoft Graph
+  (`https://graph.microsoft.com`); plain HTTP and any other host are refused. A calendar's sync
+  state (delta link and sync window) can no longer be changed from the form or the API.
+- **Sign in with Microsoft** only accepts accounts from the directory named in Microsoft
+  Settings. Set Up refuses to create the sign-in record while Tenant ID is `common`,
+  `organizations` or `consumers`, the doctor reports such a record as a failure, and on Frappe 16
+  a sign-in from any other directory is refused.
+- **SharePoint storage:** only the app decides where a File is stored. The Microsoft 365 fields on
+  File and the `open_file` address are refused from the form and the API, and opening, reading
+  (`File.get_content`) or deleting a moved file requires it to be stored by the app inside a
+  known record folder.
+- **SharePoint storage:** every record gets a folder of its own; an existing folder with the same
+  name is never reused, and a folder that already belongs to one record cannot be linked to
+  another.
+- **SharePoint storage:** when a moved file's SharePoint copy is gone, a local copy is served (or
+  restored on uninstall) only if it is still that file's own bytes.
+- **Setup scripts:** values written into the generated Site Grant and Exchange PowerShell scripts
+  are always literal text. They are validated (client ids as GUIDs, mailboxes as addresses,
+  SharePoint sites on `*.sharepoint.com`) when saved and again when a script is generated, and
+  written as single-quoted strings.
+
+### Fixed
+
+- Calendar sync no longer gets stuck on large calendars. A first sync or a backlog of more than
+  about 2,500 changes used to re-read the same first items on every run and never reach the
+  rest, without reporting anything. The sync now continues from where the last run stopped; if
+  Microsoft stops returning a link that moves it forward, the reason is shown in *Last Sync
+  Error*. (#18)
+- Transcripts on tenants with speaker attribution switched off no longer fail with
+  `403 SpeakerAttributionNotAllowed`: the app asks again for Microsoft's plain-text format and
+  attaches it as a `.txt` without speaker names. (#31)
+- The Site Grant Script grants the *Application Access* registration when one is set — the one
+  SharePoint calls are actually made as — instead of the main one, which left every upload at
+  403. (#36)
+- The Exchange Setup Script runs as pasted: it connects to Microsoft Graph
+  (`Connect-MgGraph -Scopes Application.Read.All`) before looking up the service principal, no
+  longer suggests the retired AzureAD module, finds the app by AppId rather than by a display
+  name every site in the tenant shares, and can be run twice. (#45)
+- `docs/setup.md`: the transcript setup PowerShell used `true` for two Boolean parameters and
+  failed as pasted; it uses `$true` and says to update the MicrosoftTeams module first. (#49)
+- `docs/compatibility.md`, the FAQ and the README now state what differs between Frappe 15 and
+  16 — SharePoint storage needs 16 — with a feature table. (#50)
+
+### Changed
+
+- Deleting an Event in Frappe deletes the Outlook event only when the Event's owner deletes it.
+  When anyone else deletes it (a Public Event, a System Manager tidying up), the Frappe record is
+  removed and the Outlook event stays.
+- New SharePoint record folders are created with SharePoint's rename rule: when
+  `Projects/PRJ-0001` already exists, the new record's folder is `Projects/PRJ-0001 1`. Base
+  folders are shared as before. A record's folder is recorded as soon as it is created, and
+  parallel uploads for one record wait for each other, so no second folder is left behind.
+- The folder of a SharePoint Mapping *Folders* row can no longer be edited: delete the row and add
+  a new one (with *Existing Folder*) to point a record elsewhere.
+- Microsoft Settings refuses a Client ID or Application Client ID that is not a GUID, and
+  SharePoint Mapping refuses a site address outside `<tenant>.sharepoint.com` or a site name
+  with characters a SharePoint address cannot have.
+- The doctor checks the Application Access registration (a client id with no secret, a secret
+  that is the Secret ID, a client id that is not a GUID), recognises the speaker-attribution
+  refusal from Microsoft's message text, and Graph errors keep Microsoft's nested error code.
+- `get_transcript_content` returns the format Microsoft actually sent in `format`, and
+  `get_transcripts_for_join_url` adds `latest_format` next to `latest_vtt`.
+
+### Added
+
+- **Upgrade report.** After `bench migrate` the app checks the site, once per release, for
+  anything the new release changes or that an admin should look at. Findings are printed at the
+  end of the migrate output, shown at the top of Microsoft Settings > Troubleshoot > *Run
+  Diagnostics* as *After upgrading to X.Y.Z* until a System Manager dismisses them, and sent to
+  each System Manager as one notification. A site with nothing to report gets no notification,
+  and a new install reports nothing. (#53)
+- CI upgrades a site running the previous release, seeded with calendars, Events and (on Frappe
+  16) SharePoint data, to every change before it is merged, on Frappe 15 and 16. (#54)
+- Every release ends with *Upgrade notes*, and pull requests say whether they change anything for
+  existing sites. (#55)
+- Hidden, server-managed fields: *Delta Resume Link* and *Delta Resume Window End* on Microsoft
+  Calendar; *Folder ID* and *Content Hash Before Move* on File (storage-enabled sites only); the
+  upgrade report's state on Microsoft Settings.
+
+### Upgrade notes
+
+- **Manual steps**
+  - **Sign-in on a multi-tenant Tenant ID.** If the upgrade report or the doctor shows an
+    `sso.tenant_*` or `upgrade.sign_in_tenant` failure: set Tenant ID in Microsoft Settings to
+    your Directory (tenant) ID, make the app registration single-tenant, and point the Social
+    Login Key's URLs at `https://login.microsoftonline.com/<tenant id>/oauth2/v2.0/...`.
+    Sign-in keeps working in 1.1.1 until you do; **from 1.2.0, Microsoft sign-in on a
+    multi-tenant Tenant ID is refused.** Partner users who need access should be invited into
+    your directory as guests.
+  - **Separate Application Access registration for SharePoint:** run the corrected Site Grant
+    Script once (SharePoint Settings or each mapping).
+  - **Delete jobs queued before the upgrade:** an Outlook delete queued by 1.1.0 that had not run
+    yet does nothing after the upgrade, because it cannot be checked against the Event's owner.
+    Delete that Outlook event by hand if needed.
+- **Behaviour changes**
+  - Events linked to someone else's Microsoft Calendar stop syncing, and cannot be saved with
+    *Sync with Microsoft Calendar* ticked until they are linked to the owner's own calendar or
+    sync is unticked. Events pulled from Outlook already belong to the calendar's user and are not
+    affected.
+  - On Frappe 16, accounts from directories other than the configured one can no longer sign in.
+    Frappe 15 has no sign-in hook, so there the protection is the tenant-specific URLs on the
+    Social Login Key: make sure the doctor shows no `sso.tenant_*` failure.
+  - Calendars that were stuck catch up: on calendars with more than about 2,500 events or changes
+    in their window, the first syncs after the upgrade may pull many events and take longer,
+    over several 15-minute runs.
+  - On tenants that keep speaker attribution off, transcripts arrive as
+    `teams-transcript-<date>.txt` (no speaker names). Meetings from the last day are picked up
+    by the catch-up job; for older ones press *Get Transcript & Recording* on the Event. For
+    names, turn on *Include speaker attribution* in the Teams admin center, delete the `.txt` and
+    fetch again.
+  - Files moved to SharePoint before 1.1.1 have no recorded folder or content hash: opening or
+    deleting one costs one extra Graph request to confirm where it is; one that SharePoint places
+    outside every record folder no longer opens and is not deleted with its attachment (the event
+    is logged); and if its SharePoint copy disappears, the local fallback is refused whenever
+    another File now owns the old disk path.
+  - Code that set the Microsoft 365 File fields with `doc.save()`/`insert()` now fails; the app
+    writes them with `frappe.db.set_value`. Attachment copies still work when they repeat the
+    original's fields unchanged. `microsoft_files.ensure_folder` now commits when it creates a
+    folder.
+- **Patches that run on migrate**
+  - `clear_non_graph_delta_links` clears any stored delta link that is not an
+    `https://graph.microsoft.com` URL; that calendar then does a fresh full sync. Normal installs
+    have none, so nothing changes.
+  - `fill_sign_in_tenant_id`, on sites whose Tenant ID is `common`/`organizations` and that have a
+    Microsoft Social Login Key: fills Tenant ID from the authorised Microsoft Calendars when every
+    stored token names the same work or school directory, and points the key's multi-tenant URLs
+    at it when the key uses the Client ID from Microsoft Settings. Nothing is sent to Microsoft;
+    when it cannot decide, it changes nothing.
+  - Migrate adds the new fields listed under *Added*; no other data changes.
+- **Warnings to expect** in the upgrade report
+  - `upgrade.calendar_event_owner`: Events whose owner is not the user of their linked Microsoft
+    Calendar, with a count per calendar.
+  - `upgrade.sign_in_tenant`: sign-in still on a multi-tenant Tenant ID (see *Manual steps*).
+  - `upgrade.script_values`: saved Client IDs or SharePoint Mapping site addresses that would now
+    be refused, so they can be corrected before the form is next saved.
+  - `upgrade.sharepoint_file_items`: File rows whose SharePoint item does not look like the app's
+    own work. For files moved before 1.1.1 it compares recorded addresses, so a folder renamed
+    since the move also appears here.
+  - `upgrade.sharepoint_shared_folders`: records that share one SharePoint folder. They are not
+    split automatically: delete the *Folders* rows of the records that should not have it, and
+    their next attachment gets a new folder.
+
 ## 1.1.0 — 2026-10-24
 
 SharePoint document storage, built by David Eleben (@eleben) in his fork
