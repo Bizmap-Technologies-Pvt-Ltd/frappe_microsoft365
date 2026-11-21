@@ -154,7 +154,9 @@ def _event_for_artifacts(event_name, resolve=True):
 		from frappe_microsoft365 import microsoft_transcripts as ms
 
 		try:
-			meeting_id = _resolve_online_meeting_id(calendar_name, join_url)
+			meeting_id = _resolve_online_meeting_id(
+				calendar_name, join_url, event_id=doc.get("custom_microsoft_event_id")
+			)
 		except MsGraphError as e:
 			# This step needs OnlineMeetings.ReadWrite, which the transcript permission does not
 			# include — so it is the one that fails for people who granted transcript consent and
