@@ -262,9 +262,42 @@ function show_plan(frm) {
 				},
 			});
 			if (blocked) dialog.get_primary_btn().prop("disabled", true);
+
+			// A rotated secret pasted into Microsoft Settings only: the copies Set Up made for mail
+			// and sign-in still hold the old one. The server compares them; no secret reaches here.
+			const drift = plan.secret_drift || [];
+			if (drift.length) {
+				dialog.set_secondary_action_label(__("Sync Secret"));
+				dialog.set_secondary_action(() => sync_secret(dialog, drift));
+			}
 			dialog.show();
 		},
 	});
+}
+
+function sync_secret(dialog, drift) {
+	const names = drift.map((d) => `${__(d.doctype)} '${d.name}'`).join(", ");
+	frappe.confirm(
+		frappe.utils.escape_html(
+			__(
+				"Copy the client secret in Microsoft Settings to {0}? Do this only if Microsoft Settings holds the current secret.",
+				[names]
+			)
+		),
+		() =>
+			frappe.call({
+				method: "frappe_microsoft365.provisioning.sync_client_secret",
+				freeze: true,
+				callback: (r) => {
+					const updated = (r.message || {}).updated || [];
+					frappe.show_alert({
+						message: __("Updated the secret in {0} record(s).", [updated.length]),
+						indicator: "green",
+					});
+					dialog.hide();
+				},
+			})
+	);
 }
 
 function apply(frm) {

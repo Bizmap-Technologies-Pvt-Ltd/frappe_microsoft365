@@ -832,8 +832,8 @@ def check_sign_in_tenant(key, settings=None):
 				_(
 					"Tenant ID is '{0}', which does not name your directory, so an account in "
 					"another organisation's directory with the same email address as one of your "
-					"users could sign in as them. Sign-in keeps working for now; from version 1.2.0 "
-					"it is refused until this is fixed."
+					"users could sign in as them. Every Microsoft sign-in is refused until this is "
+					"fixed."
 				).format(tenant or "common"),
 				_(
 					"Set Tenant ID in Microsoft Settings to the Directory (tenant) ID from the app "
@@ -862,6 +862,96 @@ def check_sign_in_tenant(key, settings=None):
 			)
 		)
 
+	return out
+
+
+def check_sign_in_callback(frappe_checks_state, runs_hook, callback_is_ours):
+	"""Does the sign-in callback on this Frappe do the checks Frappe 16 would? Pure.
+
+	``frappe_checks_state``: Frappe accepts a sign-in state once, from a server-side store
+	(Frappe 16). ``runs_hook``: Frappe calls ``on_social_login`` (Frappe 16).
+	``callback_is_ours``: the Microsoft callback is routed to this app's wrapper, not to another
+	app's override of the same method.
+	"""
+	out = []
+	if not callback_is_ours and not runs_hook:
+		out.append(
+			finding(
+				"sso.callback_not_checked",
+				FAIL,
+				_("Microsoft sign-in is handled by another app, without this app's checks"),
+				_(
+					"Another installed app overrides Frappe's Microsoft sign-in callback, and this "
+					"version of Frappe has no on_social_login hook, so nothing checks that an "
+					"account comes from your directory, or that the sign-in was started on this site."
+				),
+				_(
+					"Remove the other override of frappe.integrations.oauth2_logins.login_via_office365, "
+					"or switch Microsoft sign-in off (untick Enable Social Login on the Social Login Key)."
+				),
+			)
+		)
+
+	if not frappe_checks_state:
+		if callback_is_ours:
+			detail = _(
+				"Frappe 15 does not check the sign-in state it gets back against anything it stored. "
+				"For Microsoft sign-in this app does: the login page's state is kept for ten minutes "
+				"and accepted once, as on Frappe 16. Other sign-in providers on this site (Google, "
+				"GitHub and so on) are not covered, and a site whose login page is not Frappe's own "
+				"must build the Microsoft button through Frappe's login page context or its sign-ins "
+				"are refused."
+			)
+		else:
+			detail = _(
+				"Frappe 15 does not check the sign-in state it gets back against anything it stored, "
+				"so someone can make a visitor's browser sign in to the visitor's site as the "
+				"attacker's own account (login CSRF)."
+			)
+		out.append(
+			finding(
+				"sso.frappe15_state",
+				WARN,
+				_("Frappe 15 does not protect social sign-in against login CSRF"),
+				detail,
+				_("Frappe 16 checks the state for every provider. Upgrade Frappe when you can."),
+				"https://github.com/Bizmap-Technologies-Pvt-Ltd/frappe_microsoft365/blob/main/docs/compatibility.md",
+			)
+		)
+	return out
+
+
+def check_secret_copies(copies):
+	"""Has the client secret in a copy drifted from Microsoft Settings? Pure.
+
+	``copies``: dicts of doctype, name, uses ("mail" or "sign-in") and same (bool), worked out by
+	``_secret_copies`` on the server. No secret is ever part of a finding.
+	"""
+	out = []
+	for copy in copies:
+		if copy.get("same"):
+			continue
+		out.append(
+			finding(
+				"secret.drift",
+				WARN,
+				_("The client secret in {0} '{1}' differs from Microsoft Settings").format(
+					_(copy["doctype"]), copy["name"]
+				),
+				_(
+					"{0} uses this copy, which Set Up made when it created the record. After a secret "
+					"is rotated in Azure the old one stops working, and Microsoft answers "
+					"AADSTS7000215 (invalid client secret)."
+				).format(copy.get("uses") or _("Microsoft 365")),
+				_(
+					"If Microsoft Settings holds the current secret, click Set Up on Microsoft Settings "
+					"and then Sync Secret, which copies it here. Otherwise paste the current secret "
+					"Value into Microsoft Settings first."
+				),
+				ENTRA_ERROR_DOC,
+				copy["name"],
+			)
+		)
 	return out
 
 
@@ -1724,6 +1814,61 @@ def _settings_config():
 	}
 
 
+def _decrypted(doctype, name, field="client_secret"):
+	try:
+		return get_decrypted_password(doctype, name, field, raise_exception=False) or ""
+	except Exception:
+		# A copy encrypted with another site's key cannot be compared; nothing to report.
+		return None
+
+
+def _secret_copies(settings=None):
+	"""Each copy of a Microsoft Settings secret, and whether it still matches. Server-side only.
+
+	A Connected App or Microsoft Social Login Key holds a copy when its client id is the one in
+	Microsoft Settings (or, for a Connected App, the application-access one). A record made for
+	another app registration has its own secret and is not compared. Returns only whether each
+	copy matches, never a secret.
+	"""
+	settings = settings or _settings_config()
+	pairs = []
+	client_id = (settings.get("client_id") or "").strip()
+	if client_id and settings.get("client_secret"):
+		pairs.append((client_id, settings.get("client_secret")))
+	app_client_id = (settings.get("app_client_id") or "").strip()
+	if app_client_id and app_client_id != client_id and settings.get("app_client_secret"):
+		pairs.append((app_client_id, settings.get("app_client_secret")))
+	if not pairs:
+		return []
+
+	copies = []
+	for record_client_id, secret in pairs:
+		for name in frappe.get_all("Connected App", filters={"client_id": record_client_id}, pluck="name"):
+			current = _decrypted("Connected App", name)
+			if current is not None:
+				copies.append(
+					{"doctype": "Connected App", "name": name, "uses": _("Mail"), "same": current == secret}
+				)
+		if record_client_id != client_id:
+			continue
+		for name in frappe.get_all(
+			"Social Login Key",
+			filters={"social_login_provider": "Office 365", "client_id": record_client_id},
+			pluck="name",
+		):
+			current = _decrypted("Social Login Key", name)
+			if current is not None:
+				copies.append(
+					{
+						"doctype": "Social Login Key",
+						"name": name,
+						"uses": _("Sign in with Microsoft"),
+						"same": current == secret,
+					}
+				)
+	return copies
+
+
 def _files_mappings():
 	if not frappe.db.table_exists("SharePoint Mapping"):
 		return []
@@ -1769,6 +1914,14 @@ def _email_account_configs():
 	for account in accounts:
 		account["imap_folder"] = frappe.db.count("IMAP Folder", {"parent": account["name"]})
 	return accounts
+
+
+def _sign_in_callback_findings():
+	from frappe_microsoft365 import sign_in
+
+	return check_sign_in_callback(
+		sign_in.frappe_checks_login_state(), sign_in.frappe_runs_sign_in_hook(), sign_in.callback_is_ours()
+	)
 
 
 @frappe.whitelist()
@@ -1849,6 +2002,8 @@ def run_diagnostics():
 				as_dict=True,
 			)
 			findings += check_social_login_key(key, settings)
+			if key.enable_social_login:
+				findings += _sign_in_callback_findings()
 		else:
 			findings.append(
 				finding(
@@ -1865,10 +2020,15 @@ def run_diagnostics():
 		key = frappe.db.get_value(
 			"Social Login Key",
 			{"social_login_provider": "Office 365"},
-			["name", "authorize_url", "access_token_url"],
+			["name", "enable_social_login", "authorize_url", "access_token_url"],
 			as_dict=True,
 		)
 		findings += check_sign_in_tenant(key, settings)
+		if key.enable_social_login:
+			findings += _sign_in_callback_findings()
+
+	# A rotated secret updated in one place only: mail or sign-in fails while Set Up looks fine.
+	findings += check_secret_copies(_secret_copies(settings))
 
 	if wants_mail and not oauth_accounts:
 		findings.append(

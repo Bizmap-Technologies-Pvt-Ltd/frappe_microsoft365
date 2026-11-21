@@ -34,6 +34,10 @@ microsoft365_upgrade_checks = {
 	"1.1.2": [
 		"frappe_microsoft365.microsoft_files.upgrade_check_files_in_other_records_folders",
 	],
+	"1.2.0": [
+		"frappe_microsoft365.sign_in.upgrade_check_multi_tenant_refused",
+		"frappe_microsoft365.patches.clear_legacy_default_scopes.upgrade_check_meeting_capabilities_off",
+	],
 }
 
 doc_events = {
@@ -73,6 +77,19 @@ before_request = ["frappe_microsoft365.microsoft_files.redirect_moved_file"]
 # Sign in with Microsoft accepts only accounts from the directory in Microsoft Settings. Frappe 16
 # calls this before the session is created; Frappe 15 has no such hook and never calls it.
 on_social_login = ["frappe_microsoft365.sign_in.on_social_login"]
+
+# The Microsoft sign-in callback runs through this app on both versions: it is the only place the
+# directory rule can run on Frappe 15, and on Frappe 16 it refuses before Frappe writes to the user
+# record and shows the reason (the hook above can only raise, which Frappe renders as "Session
+# Expired"). It ends in Frappe's own login_oauth_user, so Frappe 16 still checks its state and runs
+# the hook, whose answer is the same. See sign_in.login_via_office365.
+override_whitelisted_methods = {
+	"frappe.integrations.oauth2_logins.login_via_office365": "frappe_microsoft365.sign_in.login_via_office365",
+}
+
+# Frappe 15 only: remembers the Microsoft sign-in state the login page hands out, so the callback
+# can accept it once. Does nothing on Frappe 16, which keeps the state itself, or on other pages.
+update_website_context = ["frappe_microsoft365.sign_in.remember_login_state"]
 
 
 scheduler_events = {
