@@ -127,12 +127,17 @@ asks for `Sites.ReadWrite.All`.
      SharePoint*. Paste the address; anything after `/sites/<name>` is ignored.
    - **Document Library**: `Documents` for Teams.
    - **Base Folder**: the channel name, e.g. `Projects`. Nested paths like `Projects/2026` work.
-     The folder is created if it is missing.
+     The folder is created if it is missing. SharePoint allows 400 characters for a file's whole
+     path, counted from the site address (`sites/Sales/Shared Documents/Projects/…`), so a base
+     path that leaves fewer than 100 for record folders and file names is refused. A record
+     folder's name is shortened to leave 50 for file names, and a file name that would pass the
+     limit is shortened, keeping its extension.
    - **Folder Name Pattern**: `{name}` by default. `{title}` is the record's title (its DocType's
      Title Field, or the name when there is none), and `{fieldname}` any field, e.g.
      `{name} - {title}` gives `DEV-00042 - Scan-Line 920B`, or `{name} - {customer}`.
-     The name is set when the folder is created and follows a rename of the record, not later
-     edits to the title or other fields.
+     The name is set once, when the folder is created. The app never renames a folder: not
+     when the record is renamed (the folder stays linked, by its id), and not when the title or
+     other fields change.
 4. Save the mapping, then click **Site Grant Script** on it. A SharePoint or Global administrator
    runs the script in Microsoft Graph PowerShell. (The *Site Grant Script* section of
    *SharePoint Settings* gives one script for every mapped site.) For each site it runs:
@@ -223,6 +228,12 @@ reads a moved attachment's bytes (`File.get_content()`, used for example to atta
 outgoing email) is answered from SharePoint through v16's `extend_doctype_class` hook; v15 has no
 such hook, so those readers would get no content. The other capabilities work on v15 as before.
 
+`File.get_content()` returns the whole file at once, so it reads at most Frappe's upload limit
+(*System Settings → Max File Size*) from SharePoint; a bigger file is refused
+with a message saying so, before any of it is downloaded. Set `microsoft365_max_content_bytes` in
+`site_config.json` to choose another limit. Opening a file from the form streams it and has no
+such limit.
+
 ## Graph endpoints used
 
 All Graph v1.0, application permission `Sites.Selected`:
@@ -237,5 +248,5 @@ All Graph v1.0, application permission `Sites.Selected`:
 | Upload > 4 MB | `POST …:/{name}:/createUploadSession`, then `PUT {uploadUrl}` in 320 KiB-multiple ranges, without a bearer token |
 | Download | `GET /drives/{drive-id}/items/{item-id}/content` (302 to a pre-authenticated URL) |
 | List | `GET /drives/{drive-id}/items/{item-id}/children` |
-| Rename (record renamed) | `PATCH /drives/{drive-id}/items/{item-id}` |
+| Move (attachment re-attached to another record) | `PATCH /drives/{drive-id}/items/{item-id}` with `parentReference` (`conflictBehavior=rename`); between libraries, a download and an upload. Run by a background job, never inside the user's save |
 | Remove (opt-in) | `DELETE /drives/{drive-id}/items/{item-id}`, which goes to the site recycle bin |

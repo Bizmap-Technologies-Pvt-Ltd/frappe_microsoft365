@@ -3,7 +3,8 @@
 A moved File's file_url is ``/api/method/...open_file``, which the browser follows happily but
 server-side code cannot: anything that reads an attachment's bytes — attaching it to an email,
 a print, an import — calls ``File.get_content()``, which opens a path on disk. This mixin answers
-that call from SharePoint instead, decoding text the same way Frappe does for a file on disk.
+that call from SharePoint instead, decoding text the same way Frappe does for a file on disk. It
+returns the whole file at once, so files over microsoft_files.max_content_bytes are refused.
 
 Frappe v15 has no extend_doctype_class hook, so there the moved File opens from the form as
 usual but server-side readers see no content; docs/sharepoint-files.md says so.
@@ -20,7 +21,7 @@ OLE_FILE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 class SharePointFile:
 	def _stored_in_sharepoint(self):
 		return (
-			self.get("custom_microsoft_status") == microsoft_files.STORED
+			self.get("custom_microsoft_status") in (microsoft_files.STORED, microsoft_files.MOVING)
 			and self.get("custom_microsoft_item_id")
 			and self.get("custom_microsoft_drive_id")
 			and (self.file_url or "").startswith("/api/method/" + microsoft_files.OPEN_METHOD)

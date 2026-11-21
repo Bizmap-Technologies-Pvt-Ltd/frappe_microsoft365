@@ -39,6 +39,8 @@ microsoft365_upgrade_checks = {
 		"frappe_microsoft365.patches.clear_legacy_default_scopes.upgrade_check_meeting_capabilities_off",
 		"frappe_microsoft365.microsoft_meeting_artifacts.upgrade_check_misplaced_transcripts",
 		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events",
+		"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies",
+		"frappe_microsoft365.microsoft_files.upgrade_check_long_paths",
 	],
 }
 
@@ -55,7 +57,9 @@ doc_events = {
 		# switched off, so their fields stay protected too.
 		"validate": "frappe_microsoft365.microsoft_files.on_file_validate",
 		"after_insert": "frappe_microsoft365.microsoft_files.on_file_insert",
+		"on_update": "frappe_microsoft365.microsoft_files.on_file_update",
 		"on_trash": "frappe_microsoft365.microsoft_files.on_file_trash",
+		"after_delete": "frappe_microsoft365.microsoft_files.on_file_delete",
 	},
 	"*": {
 		"on_trash": "frappe_microsoft365.microsoft_files.on_doc_trash",
