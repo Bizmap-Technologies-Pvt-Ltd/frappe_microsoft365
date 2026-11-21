@@ -119,6 +119,16 @@ def expect_tenant_filled(manifest):
 		frappe.db.get_single_value("Microsoft Settings", "tenant_id") == manifest["tenant"],
 		"Tenant ID was filled from the calendar tokens' tid",
 	)
+	key = frappe.db.get_value(
+		"Social Login Key", {"social_login_provider": "Office 365"}, ["authorize_url", "access_token_url"], as_dict=True
+	)
+	check(bool(key), "the seeded Microsoft sign-in key still exists")
+	if key:
+		for field in ("authorize_url", "access_token_url"):
+			check(
+				f"/{manifest['tenant']}/" in (key.get(field) or "") and "/common/" not in key.get(field),
+				f"the sign-in key's {field} now names the tenant",
+			)
 
 
 #: patches.txt fragment -> what the patch must have done to the seeded data.

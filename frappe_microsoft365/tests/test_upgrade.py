@@ -378,10 +378,13 @@ class TestDisplay(UpgradeTestCase):
 	def test_dismiss_is_for_system_managers_only(self):
 		self._report()
 		frappe.set_user("Guest")
+		# Frappe 15's only_for lets everyone through while tests run; real requests are checked.
+		in_test, frappe.flags.in_test = frappe.flags.in_test, False
 		try:
 			with self.assertRaises(frappe.PermissionError):
 				upgrade.dismiss_report()
 		finally:
+			frappe.flags.in_test = in_test
 			frappe.set_user("Administrator")
 		self.assertTrue(upgrade.get_report())
 

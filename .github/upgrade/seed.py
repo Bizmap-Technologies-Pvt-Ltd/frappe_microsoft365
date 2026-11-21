@@ -80,6 +80,21 @@ def seed_settings():
 	set_encrypted_password("Microsoft Settings", "Microsoft Settings", "seeded-secret", "client_secret")
 
 
+def seed_sign_in_key():
+	"""The Social Login Key Set Up made on the previous release, with its multi-tenant URLs.
+
+	Built by that release's own provisioning code, so the record is exactly what a site that
+	signs in with Microsoft has; the 1.1.1 tenant patch only acts on sites that have one.
+	"""
+	from frappe_microsoft365 import provisioning
+
+	if frappe.db.exists("Social Login Key", {"social_login_provider": "Office 365"}):
+		return
+	settings = frappe.get_single("Microsoft Settings")
+	settings.client_secret = settings.get_password("client_secret", raise_exception=False)
+	frappe.get_doc(provisioning.social_login_key_values(settings)).insert(ignore_permissions=True)
+
+
 def seed_calendar(name, user, delta_link):
 	if not frappe.db.exists("Microsoft Calendar", name):
 		doc = frappe.get_doc(
@@ -321,6 +336,7 @@ def main(site, manifest_path):
 
 		seed_users()
 		seed_settings()
+		seed_sign_in_key()
 		seed_calendar("Alice Calendar", USERS[0], GRAPH_DELTA)
 		seed_calendar("Bob Calendar", USERS[1], FOREIGN_DELTA)
 		events = seed_events()
