@@ -168,6 +168,7 @@ The record's attachments still on the server then move into the folder. Each rec
 | Pending | Waiting for the background job; normally clears within seconds |
 | Stored | Moved to SharePoint; opens from there through the ERP |
 | Archived | A web link whose target was copied into SharePoint; the link itself is unchanged |
+| Moving | Re-attached to another record; a background job is moving its SharePoint file to that record's folder. It still opens meanwhile. A failed move stays Moving, with **Last SharePoint Error** saying why, and is retried hourly, up to 5 times |
 | Failed | Still on the server and still opens; **Last SharePoint Error** says why. Retried hourly, up to 5 times |
 
 The File list shows each file's SharePoint Status in its own column (empty for files that never went to SharePoint). To list problem files, filter it on *SharePoint Status = Failed*. SharePoint Settings shows counts by status, as does the line under the tickbox on Microsoft Settings.
@@ -178,7 +179,7 @@ The File list shows each file's SharePoint Status in its own column (empty for f
 | --- | --- |
 | An attachment is deleted in the ERP | SharePoint keeps the file, unless *Remove from SharePoint when the attachment is deleted* is on for that record type, in SharePoint Settings or on its mapping (then it goes to the recycle bin) |
 | A record is deleted | Its SharePoint folder and files stay; only the ERP's link to the folder is removed |
-| An attachment is re-attached to another record | Its SharePoint file moves into that record's folder, so readers of the first record no longer see it there. If it shares the file with attachment copies, it gets a copy of its own instead; if the new record has no SharePoint folder (its DocType is not mapped, or it is On demand without one), the file comes back to this server and the SharePoint copy goes to the recycle bin |
+| An attachment is re-attached to another record | It shows *Moving* while a background job moves its SharePoint file into that record's folder, so readers of the first record no longer see it there. If it shares the file with attachment copies, it gets a copy of its own. If the new record is in another library, or has no SharePoint folder (its DocType is not mapped, or it is On demand without one), the file is copied there or back to this server; the old SharePoint copy goes to the recycle bin only when *Remove from SharePoint when the attachment is deleted* is on, and otherwise stays where it was |
 | A record is renamed | Its folder stays linked to it under the new name. The folder keeps its name in SharePoint: it is never renamed, so a folder linked by hand (a Teams channel's, say) is never touched. Rename it in SharePoint yourself if you want the names to match |
 | A record's title or another field in the pattern changes | The folder keeps its name |
 | The folder is renamed or moved in Teams | The link keeps working; the ERP tracks the folder by its id, not its path |

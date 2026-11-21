@@ -283,7 +283,7 @@ def create_event_custom_fields(only_definitions=False):
 	create_custom_fields(custom_fields, ignore_validate=True)
 
 
-FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nFailed"
+FILE_STATUS_OPTIONS = "\nPending\nStored\nArchived\nMoving\nFailed"
 
 
 def create_file_custom_fields(only_definitions=False):
@@ -319,7 +319,7 @@ def create_file_custom_fields(only_definitions=False):
 				"in_list_view": 1,
 				"in_standard_filter": 1,
 				"search_index": 1,
-				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
+				"description": "<b>Pending:</b> waiting to move.<br><b>Stored:</b> moved to SharePoint and opened from there.<br><b>Archived:</b> a link whose target was copied to SharePoint.<br><b>Moving:</b> re-attached to another record; on its way to that record's folder (it still opens). Retried hourly; see Last SharePoint Error.<br><b>Failed:</b> still on this server; see Last SharePoint Error. Retried hourly.",
 			},
 			{
 				"fieldname": "custom_microsoft_web_url",

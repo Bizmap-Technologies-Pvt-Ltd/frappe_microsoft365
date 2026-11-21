@@ -101,6 +101,10 @@ PENDING = "Pending"
 STORED = "Stored"  # moved: the file now lives in SharePoint and file_url points at open_file
 ARCHIVED = "Archived"  # a link attachment whose target was copied; the link itself is unchanged
 FAILED = "Failed"
+#: A moved File re-attached to another record, whose SharePoint item a background job is moving
+#: to that record's folder (follow_attachment). It still opens from where it is meanwhile, and a
+#: failed move stays Moving, with the error recorded, and is retried hourly.
+MOVING = "Moving"
 
 #: Characters SharePoint and OneDrive refuse in a name, plus # and % which it accepts but which
 #: break more tools than they are worth.
@@ -962,6 +966,13 @@ def is_open_url(url):
 	return OPEN_METHOD in unquote(url or "").lower()
 
 
+def is_moved(file_doc):
+	"""Whether a File is a moved attachment, opened through open_file from SharePoint: Stored, or
+	Moving (re-attached, its item on the way to the new record's folder) with that address."""
+	status = file_doc.get("custom_microsoft_status")
+	return status == STORED or (status == MOVING and is_open_url(file_doc.get("file_url")))
+
+
 def _same(a, b):
 	return str(a or "") == str(b or "")
 
@@ -1058,7 +1069,7 @@ def upload_file(file_name):
 	if not frappe.db.exists("File", file_name):
 		return
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED) or not _eligible(file_doc):
+	if file_doc.get("custom_microsoft_status") in (STORED, ARCHIVED, MOVING) or not _eligible(file_doc):
 		return
 
 	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
@@ -1295,7 +1306,7 @@ def redirect_moved_file():
 		return
 	moved = frappe.get_all(
 		"File",
-		filters={"custom_microsoft_local_url": path, "custom_microsoft_status": STORED},
+		filters={"custom_microsoft_local_url": path, "custom_microsoft_status": ["in", [STORED, MOVING]]},
 		pluck="name",
 		order_by="creation asc",
 	)
@@ -1798,7 +1809,7 @@ def follow_privacy(file_doc):
 	Returns the kept copy's new URL, or None when there was nothing to move.
 	"""
 	local = file_doc.get("custom_microsoft_local_url")
-	if file_doc.get("custom_microsoft_status") != STORED or not local or ".." in local.split("/"):
+	if not is_moved(file_doc) or not local or ".." in local.split("/"):
 		return None
 	prefix = _privacy_prefix(file_doc)
 	if local.startswith(prefix) or not own_local_copy(file_doc, local):
@@ -1824,7 +1835,7 @@ def follow_privacy(file_doc):
 def _drop_kept_copy(file_doc):
 	"""Remove a moved File's kept local copy, unless another File still uses those bytes."""
 	local = file_doc.get("custom_microsoft_local_url")
-	if file_doc.get("custom_microsoft_status") != STORED or not local:
+	if not is_moved(file_doc) or not local:
 		return
 	if _blob_users(local, file_doc.name) or not own_local_copy(file_doc, local):
 		return
@@ -1848,7 +1859,7 @@ def on_file_trash(doc, method=None):
 	item_id = doc.get("custom_microsoft_item_id")
 	if not item_id or not doc.get("custom_microsoft_drive_id"):
 		return
-	if doc.get("custom_microsoft_status") not in (STORED, ARCHIVED):
+	if doc.get("custom_microsoft_status") not in (STORED, ARCHIVED, MOVING):
 		return
 	settings = _settings()
 	if not (files_enabled(settings) and storage_option("files_delete_remote", doc.attached_to_doctype)):
@@ -1888,7 +1899,7 @@ def on_file_update(doc, method=None):
 	if doc.flags.in_insert or not before:
 		return
 	status = doc.get("custom_microsoft_status")
-	if status == STORED and doc.has_value_changed("is_private"):
+	if is_moved(doc) and doc.has_value_changed("is_private"):
 		try:
 			follow_privacy(doc)
 		except Exception:
@@ -1897,74 +1908,139 @@ def on_file_update(doc, method=None):
 				# A copy that could not follow the File into private/files must not stay public.
 				# SharePoint holds the file; the kept copy is only a spare.
 				_drop_kept_copy(doc)
-	if status in (STORED, ARCHIVED) and (
+	if status in (STORED, ARCHIVED, MOVING) and (
 		doc.has_value_changed("attached_to_doctype") or doc.has_value_changed("attached_to_name")
 	):
+		queue_follow_attachment(doc, before)
+
+
+def queue_follow_attachment(doc, before):
+	"""Mark a re-attached File Moving and queue the job that moves its item (follow_attachment).
+
+	Nothing here talks to SharePoint or commits: the user's save stays one transaction, and the
+	job is queued to run once it has committed. Only an item in the folder of the record the File
+	was attached to before is this File's to move (see assert_app_item). Where the File records
+	that folder (every move since 1.1.1) that is checked here, from the database; a File moved
+	before has no such record, so the job asks SharePoint, given the previous record to compare.
+	"""
+	old = None
+	if doc.get("custom_microsoft_status") != MOVING:
 		old = (before.get("attached_to_doctype"), before.get("attached_to_name"))
-		try:
-			follow_attachment(doc.name, *old)
-		except Exception:
-			frappe.log_error(title=_("Microsoft 365: could not move a re-attached file"), message=doc.name)
-			enqueue_follow_attachment(doc.name, *old)
+		folder_id = doc.get("custom_microsoft_folder_id")
+		if folder_id:
+			holder = frappe.db.get_value(
+				"SharePoint Folder",
+				{"drive_id": doc.get("custom_microsoft_drive_id"), "item_id": folder_id},
+				["reference_doctype", "reference_name"],
+			)
+			if tuple(holder or ()) != old:
+				# An attachment copy (its item is the original's) or a row pointed elsewhere
+				# before 1.1.1: not this File's item to move.
+				return
+	doc.db_set(
+		{"custom_microsoft_status": MOVING, "custom_microsoft_error": None, "custom_microsoft_attempts": 0},
+		update_modified=False,
+	)
+	enqueue_follow_attachment(doc.name, *(old or (None, None)))
 
 
-def enqueue_follow_attachment(file_name, old_doctype, old_name):
+def enqueue_follow_attachment(file_name, old_doctype=None, old_name=None):
 	frappe.enqueue(
 		"frappe_microsoft365.microsoft_files.follow_attachment",
 		queue="long",
 		file_name=file_name,
 		old_doctype=old_doctype,
 		old_name=old_name,
-		in_job=True,
 		job_id=f"microsoft365-follow-{file_name}",
 		deduplicate=True,
 		enqueue_after_commit=True,
 	)
 
 
-def follow_attachment(file_name, old_doctype, old_name, in_job=False):
-	"""Move a stored File's SharePoint item to the folder of the record it is attached to now.
+def _settled_status(file_doc):
+	"""What a Moving File is once its move is done: Stored, or Archived for a link."""
+	return STORED if is_open_url(file_doc.file_url) else ARCHIVED
+
+
+def follow_attachment(file_name, old_doctype=None, old_name=None):
+	"""Background job: move a re-attached File's SharePoint item to its new record's folder.
 
 	Whoever can read a record sees and opens everything in its folder, so a File re-attached to
-	another record must not stay in the first record's folder for that record's readers. Only an
-	item that is in the folder of the record the File was attached to before is moved: anything
-	else is not this File's to move (see assert_app_item).
-
-	Within one library the item is moved in place, at once. Copying it between libraries, giving
-	a File its own copy of an item it shares with attachment copies (they stay with the original),
-	and bringing it back to this server when its new record has no SharePoint folder to go to all
-	transfer the bytes, so they run as a background job (in_job).
+	another record must not stay in the first record's folder for that record's readers.
+	Idempotent; counted, recorded and retried like an upload (MAX_ATTEMPTS, retry_pending).
+	``old_doctype``/``old_name``, the record it was attached to before, are given when the File
+	does not record its folder yet; see queue_follow_attachment.
 	"""
-	if not files_enabled():
-		# Storage switched off: nothing moves or comes back until it is on again; the 1.1.2
-		# check (assert_app_item) still keeps the item to readers of the folder's record.
+	if not files_enabled() or not frappe.db.exists("File", file_name):
+		# With storage switched off the File stays Moving and still opens from where it is; the
+		# hourly retry carries on once storage is on again.
 		return
 	file_doc = frappe.get_doc("File", file_name)
+	if file_doc.get("custom_microsoft_status") != MOVING:
+		return
+	attempts = cint(file_doc.get("custom_microsoft_attempts")) + 1
+	frappe.db.set_value("File", file_name, "custom_microsoft_attempts", attempts, update_modified=False)
+	frappe.db.commit()  # nosemgrep
+	try:
+		_follow(file_doc, (old_doctype, old_name) if old_doctype else None)
+		frappe.db.commit()  # nosemgrep
+	except Exception as e:
+		frappe.db.rollback()
+		frappe.db.set_value(
+			"File",
+			file_name,
+			{"custom_microsoft_error": str(e)[:1000], "custom_microsoft_attempts": attempts},
+			update_modified=False,
+		)
+		frappe.db.commit()  # nosemgrep
+		if attempts >= MAX_ATTEMPTS:
+			frappe.log_error(
+				title=_("Microsoft 365: re-attached file not moved"), message=f"File {file_name}: {e}"
+			)
+
+
+def _settle(file_doc, status=None, error=None):
+	frappe.db.set_value(
+		"File",
+		file_doc.name,
+		{"custom_microsoft_status": status or _settled_status(file_doc), "custom_microsoft_error": error},
+		update_modified=False,
+	)
+
+
+def _follow(file_doc, old):
+	"""The move itself; see follow_attachment. Raises on failure, for the job to record."""
 	drive_id = file_doc.get("custom_microsoft_drive_id")
 	item_id = file_doc.get("custom_microsoft_item_id")
-	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
-		return
-	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
-	if (doctype, name) == (old_doctype, old_name):
-		return
-
+	if not (drive_id and item_id):
+		return _settle(file_doc)
 	holder = _holder_of(file_doc)
-	if not holder:
-		return
-	if (holder.reference_doctype, holder.reference_name) == (doctype, name):
-		return  # already in the new record's folder
-	if (holder.reference_doctype, holder.reference_name) != (old_doctype, old_name):
-		frappe.log_error(
-			title=_("Microsoft 365: re-attached file not moved"),
-			message=_(
-				"File {0} names an item in the folder of {1} {2}, not of the record it was attached to."
-			).format(file_name, holder.reference_doctype, holder.reference_name),
+	if not file_doc.get("custom_microsoft_folder_id"):
+		if not (holder and old) or (holder.reference_doctype, holder.reference_name) != old:
+			return _settle(
+				file_doc,
+				error=_(
+					"Not moved: its SharePoint item is not in the folder of the record it was attached to."
+				),
+			)
+		# Checked against the previous record; recorded, so a retry need not know that record.
+		frappe.db.set_value(
+			"File", file_doc.name, "custom_microsoft_folder_id", holder.item_id, update_modified=False
 		)
-		return
+	elif not holder:
+		return _settle(file_doc, error=_("Not moved: its SharePoint item is not in a record's folder."))
 
-	shared = frappe.db.exists("File", {"custom_microsoft_item_id": item_id, "name": ["!=", file_name]})
+	doctype, name = file_doc.attached_to_doctype, file_doc.attached_to_name
+	if (holder.reference_doctype, holder.reference_name) == (doctype, name):
+		return _settle(file_doc)  # already in the new record's folder (re-attached back, say)
+
+	shared = frappe.db.exists("File", {"custom_microsoft_item_id": item_id, "name": ["!=", file_doc.name]})
+	# The old item is removed only where the site has asked for SharePoint copies to be removed
+	# with their attachments; otherwise the File gets a copy and the old item stays put.
+	remove_old = not shared and bool(storage_option("files_delete_remote", holder.reference_doctype))
 	target = _folder_to_follow_into(file_doc)
 	if target and not shared and target.drive_id == drive_id:
+		# Within one library a move is one request and removes nothing.
 		item = graph.graph_request(
 			"PATCH",
 			f"/drives/{drive_id}/items/{item_id}",
@@ -1972,26 +2048,29 @@ def follow_attachment(file_name, old_doctype, old_name, in_job=False):
 			json={"parentReference": {"id": target.item_id}},
 			params={"@microsoft.graph.conflictBehavior": "rename"},
 		)
-		_record_location(file_name, item, target)
-		return
-	if not in_job:
-		enqueue_follow_attachment(file_name, old_doctype, old_name)
-		return
+		_record_location(file_doc.name, item, target)
+		return _settle(file_doc)
 	if target:
 		_copy_into(file_doc, target)
-	elif file_doc.get("custom_microsoft_status") == STORED:
-		# Nowhere in SharePoint to go: the record's DocType is not mapped (or storage is off), so
-		# the file comes back to this server like any other attachment of that DocType.
-		bring_back(file_name)
+		_settle(file_doc)
+	elif is_open_url(file_doc.file_url):
+		# Nowhere in SharePoint to go: the new record's DocType is not mapped (or it is On demand
+		# with no folder), so the file comes back to this server like any of its attachments.
+		_settle(file_doc)
+		bring_back(file_doc.name)
 	else:
-		# An archived link: the link itself never moved, so only the copy has to leave.
+		# An archived link: the link itself never moved, so only the copy is let go.
 		frappe.db.set_value(
 			"File",
-			file_name,
-			{"custom_microsoft_status": None, "custom_microsoft_item_id": None},
+			file_doc.name,
+			{
+				"custom_microsoft_status": None,
+				"custom_microsoft_item_id": None,
+				"custom_microsoft_error": None,
+			},
 			update_modified=False,
 		)
-	if not shared:
+	if remove_old:
 		try:
 			graph.graph_request("DELETE", f"/drives/{drive_id}/items/{item_id}", APP)
 		except MsGraphNotFound:
@@ -2147,6 +2226,18 @@ def retry_pending():
 	)
 	for name in names:
 		enqueue_upload(name)
+	# Re-attached files whose move to the new record's folder has not finished (follow_attachment).
+	for name in frappe.get_all(
+		"File",
+		filters={
+			"custom_microsoft_status": MOVING,
+			"custom_microsoft_attempts": ["<", MAX_ATTEMPTS],
+			"modified": ["<", cutoff],
+		},
+		pluck="name",
+		limit=200,
+	):
+		enqueue_follow_attachment(name)
 
 
 @frappe.whitelist()
@@ -2194,7 +2285,7 @@ def storage_summary():
 	# One count per status rather than a GROUP BY: newer Frappe refuses SQL functions written as
 	# strings in fields, and the dict form it wants instead does not exist on v15.
 	counts = {}
-	for status in (STORED, ARCHIVED, PENDING, FAILED):
+	for status in (STORED, ARCHIVED, MOVING, PENDING, FAILED):
 		count = frappe.db.count("File", {"custom_microsoft_status": status})
 		if count:
 			counts[status] = count
@@ -2285,7 +2376,9 @@ def assert_app_item(file_doc, for_delete=False):
 	"""
 	drive_id = file_doc.get("custom_microsoft_drive_id")
 	item_id = file_doc.get("custom_microsoft_item_id")
-	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED) or not (drive_id and item_id):
+	if file_doc.get("custom_microsoft_status") not in (STORED, ARCHIVED, MOVING) or not (
+		drive_id and item_id
+	):
 		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
 	folders = {
@@ -2399,7 +2492,7 @@ def open_file(file: str, download: int = 0):
 		raise frappe.PermissionError(_("You must be logged in to open this file."))
 	if not file_doc:
 		raise frappe.PermissionError(_("You don't have permission to access this file"))
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		raise frappe.PermissionError(_("{0} is not stored in SharePoint.").format(file_doc.file_name))
 
 	local = file_doc.get("custom_microsoft_local_url")
@@ -2826,7 +2919,7 @@ def bring_back(file_name):
 	SharePoint copy is left where it is. Returns the local URL the file now has.
 	"""
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		return file_doc.file_url
 
 	old_url = file_doc.file_url
@@ -2904,7 +2997,7 @@ def leave_in_sharepoint(file_name):
 	whoever has access to the site. Returns the URL the attachment now has.
 	"""
 	file_doc = frappe.get_doc("File", file_name)
-	if file_doc.get("custom_microsoft_status") != STORED:
+	if not is_moved(file_doc):
 		return file_doc.file_url
 	old_url = file_doc.file_url
 	web_url = file_doc.get("custom_microsoft_web_url")
@@ -3017,7 +3110,10 @@ def upgrade_check_files_in_other_records_folders():
 		"custom_microsoft_web_url",
 	] + (["custom_microsoft_folder_id"] if has_folder_id else [])
 	rows = frappe.get_all(
-		"File", filters={"custom_microsoft_status": ["in", [STORED, ARCHIVED]]}, fields=fields, order_by="name asc"
+		"File",
+		filters={"custom_microsoft_status": ["in", [STORED, ARCHIVED, MOVING]]},
+		fields=fields,
+		order_by="name asc",
 	)
 	if not rows:
 		return []
@@ -3102,7 +3198,7 @@ def upgrade_check_file_items():
 		for r in frappe.get_all(
 			"File",
 			or_filters={
-				"custom_microsoft_status": ["in", [STORED, ARCHIVED]],
+				"custom_microsoft_status": ["in", [STORED, ARCHIVED, MOVING]],
 				"file_url": ["like", f"%{OPEN_METHOD}%"],
 			},
 			fields=fields,
@@ -3130,9 +3226,9 @@ def upgrade_check_file_items():
 	for row in rows:
 		if (row.drive_id, row.item_id) in folder_ids:
 			is_folder.append(row)
-		elif row.status not in (STORED, ARCHIVED) or not (row.drive_id and row.item_id):
+		elif row.status not in (STORED, ARCHIVED, MOVING) or not (row.drive_id and row.item_id):
 			odd_status.append(row)
-		elif row.status == STORED and not is_open_url(row.file_url):
+		elif row.status in (STORED,) and not is_open_url(row.file_url):
 			odd_status.append(row)
 		elif not under_known_folder(row):
 			outside.append(row)
@@ -3205,7 +3301,7 @@ def upgrade_check_orphaned_kept_copies():
 		except ValueError:
 			continue
 		local = data.get("custom_microsoft_local_url") or ""
-		if data.get("custom_microsoft_status") != STORED or local in left:
+		if data.get("custom_microsoft_status") not in (STORED, MOVING) or local in left:
 			continue
 		if ".." in local.split("/") or not local.startswith(("/files/", "/private/files/")):
 			continue

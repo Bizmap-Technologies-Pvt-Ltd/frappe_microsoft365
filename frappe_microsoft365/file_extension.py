@@ -21,7 +21,7 @@ OLE_FILE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 class SharePointFile:
 	def _stored_in_sharepoint(self):
 		return (
-			self.get("custom_microsoft_status") == microsoft_files.STORED
+			self.get("custom_microsoft_status") in (microsoft_files.STORED, microsoft_files.MOVING)
 			and self.get("custom_microsoft_item_id")
 			and self.get("custom_microsoft_drive_id")
 			and (self.file_url or "").startswith("/api/method/" + microsoft_files.OPEN_METHOD)

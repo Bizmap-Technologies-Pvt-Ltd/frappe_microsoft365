@@ -22,7 +22,7 @@ def execute():
 	for name in frappe.get_all(
 		"File",
 		filters={
-			"custom_microsoft_status": files.STORED,
+			"custom_microsoft_status": ["in", [files.STORED, files.MOVING]],
 			"is_private": 1,
 			"custom_microsoft_local_url": ["like", "/files/%"],
 		},

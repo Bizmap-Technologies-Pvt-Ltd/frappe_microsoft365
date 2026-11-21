@@ -317,7 +317,7 @@ frappe.provide("frappe_microsoft365.files");
 			method: `${METHOD}.storage_summary`,
 			callback: (r) => {
 				const c = r.message || {};
-				const parts = ["Stored", "Archived", "Pending", "Failed"]
+				const parts = ["Stored", "Archived", "Moving", "Pending", "Failed"]
 					.filter((k) => c[k])
 					.map((k) => `${__(k)}: <b>${c[k]}</b>`);
 				if (c.Failed) {

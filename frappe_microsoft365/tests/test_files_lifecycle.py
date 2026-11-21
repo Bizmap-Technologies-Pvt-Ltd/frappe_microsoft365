@@ -679,7 +679,7 @@ class TestRetryAfterALostCommit(FilesTestCase):
 		self.assertEqual([m for m, _u, _k in fake.calls], ["PUT"])
 
 
-# --- B26: a re-attached File's item moves with it ---------------------------------------------
+# --- B26: a re-attached File's item moves with it, in a job --------------------------------------
 
 
 class TestReattachedFileMoves(FilesTestCase):
@@ -691,24 +691,42 @@ class TestReattachedFileMoves(FilesTestCase):
 		files.upload_file(self.file.name)  # into self.todo's folder, FOLDER (FakeGraph)
 		self.item = frappe.db.get_value("File", self.file.name, "custom_microsoft_item_id")
 		self.second = frappe.get_doc({"doctype": "ToDo", "description": "second"}).insert()
-		files.add_folder_row(
-			MAPPED,
-			self.second.name,
-			{"drive_id": "DRIVE", "item_id": "FOLDER2", "folder_name": "S", "folder_path": "Projects/S"},
-		)
+		self.second_folder("DRIVE", "FOLDER2")
 		self.jobs = patch.object(frappe, "enqueue").start()
 		self.addCleanup(patch.stopall)
 		real_graph(self)
+		self.fake = network(self, self.answer)
+		self.fail_patch = None
+
+	def second_folder(self, drive_id, item_id):
+		frappe.db.delete("SharePoint Folder", {"reference_name": self.second.name})
+		files.add_folder_row(
+			MAPPED,
+			self.second.name,
+			{"drive_id": drive_id, "item_id": item_id, "folder_name": "S", "folder_path": "Projects/S"},
+		)
+
+	def delete_remote(self, on):
+		"""SharePoint Settings' "remove from SharePoint" option (configure restores it)."""
+		frappe.db.set_single_value("SharePoint Settings", "files_delete_remote", 1 if on else 0)
+		frappe.clear_document_cache("SharePoint Settings", "SharePoint Settings")
 
 	def reattach(self, doctype=MAPPED, name=None):
+		frappe.db.commit.reset_mock()
 		doc = frappe.get_doc("File", self.file.name)
 		doc.attached_to_doctype = doctype
 		doc.attached_to_name = name or self.second.name
 		doc.save()
 
+	def run_job(self):
+		job = self.jobs.call_args.kwargs
+		files.follow_attachment(job["file_name"], job["old_doctype"], job["old_name"])
+
 	def answer(self, method, url, kwargs):
 		path = url[len(GRAPH) :]
 		if (method, path) == ("PATCH", f"/drives/DRIVE/items/{self.item}"):
+			if self.fail_patch:
+				return self.fail_patch
 			return HttpResponse(
 				200,
 				{
@@ -719,79 +737,155 @@ class TestReattachedFileMoves(FilesTestCase):
 			)
 		if (method, path) == ("GET", f"/drives/DRIVE/items/{self.item}/content"):
 			return HttpResponse(200, body=b"the bytes")
-		if (method, path) == ("PUT", f"/drives/DRIVE/items/FOLDER2:/{self.name}:/content"):
-			return HttpResponse(
-				201, {"id": "OWN-COPY", "parentReference": {"driveId": "DRIVE", "id": "FOLDER2"}}
-			)
+		for drive, folder in (("DRIVE", "FOLDER2"), ("DRIVE2", "OTHER-LIBRARY")):
+			if (method, path) == ("PUT", f"/drives/{drive}/items/{folder}:/{self.name}:/content"):
+				return HttpResponse(
+					201, {"id": "OWN-COPY", "parentReference": {"driveId": drive, "id": folder}}
+				)
 		if (method, path) == ("DELETE", f"/drives/DRIVE/items/{self.item}"):
 			return HttpResponse(204)
 		raise AssertionError(f"unexpected {method} {url}")
 
-	def location(self):
+	def row(self):
 		return frappe.db.get_value(
-			"File", self.file.name, ["custom_microsoft_item_id", "custom_microsoft_folder_id"], as_dict=True
+			"File",
+			self.file.name,
+			[
+				"custom_microsoft_status",
+				"custom_microsoft_item_id",
+				"custom_microsoft_folder_id",
+				"custom_microsoft_error",
+				"custom_microsoft_attempts",
+				"file_url",
+			],
+			as_dict=True,
 		)
 
-	def test_re_attaching_moves_the_item_to_the_new_records_folder(self):
-		fake = network(self, self.answer)
+	def methods(self):
+		return [m for m, _u, _k in self.fake.calls]
+
+	def test_the_save_only_marks_the_file_moving_and_queues_the_job(self):
 		self.reattach()
+		self.assertEqual(self.fake.calls, [])  # nothing reaches SharePoint inside the save
+		frappe.db.commit.assert_not_called()  # and the save stays one transaction
+		self.assertEqual(self.row().custom_microsoft_status, files.MOVING)
+		job = self.jobs.call_args
+		self.assertEqual(job.args, ("frappe_microsoft365.microsoft_files.follow_attachment",))
+		self.assertEqual(job.kwargs["job_id"], f"microsoft365-follow-{self.file.name}")
+		self.assertTrue(job.kwargs["enqueue_after_commit"])
+		self.assertTrue(job.kwargs["deduplicate"])
+
+	def test_a_moving_file_still_opens(self):
+		self.reattach()
+		with patch.object(files, "_stream", return_value="STREAM"):
+			self.assertEqual(files.open_file(self.file.name), "STREAM")
+
+	def test_the_job_moves_the_item_to_the_new_records_folder(self):
+		self.reattach()
+		self.run_job()
 		self.assertEqual(
-			[(m, u) for m, u, _k in fake.calls], [("PATCH", f"{GRAPH}/drives/DRIVE/items/{self.item}")]
+			[(m, u) for m, u, _k in self.fake.calls], [("PATCH", f"{GRAPH}/drives/DRIVE/items/{self.item}")]
 		)
-		self.assertEqual(fake.calls[0][2]["json"], {"parentReference": {"id": "FOLDER2"}})
-		self.assertEqual(fake.calls[0][2]["params"], {"@microsoft.graph.conflictBehavior": "rename"})
+		self.assertEqual(self.fake.calls[0][2]["json"], {"parentReference": {"id": "FOLDER2"}})
+		self.assertEqual(self.fake.calls[0][2]["params"], {"@microsoft.graph.conflictBehavior": "rename"})
+		row = self.row()
 		self.assertEqual(
-			self.location(), {"custom_microsoft_item_id": self.item, "custom_microsoft_folder_id": "FOLDER2"}
+			(row.custom_microsoft_status, row.custom_microsoft_folder_id), (files.STORED, "FOLDER2")
 		)
-		# Readers of the first record no longer find it through that record; readers of the second do.
 		files.assert_app_item(frappe.get_doc("File", self.file.name))
 
 	def test_an_item_shared_with_attachment_copies_is_copied_for_the_file_that_moved(self):
+		self.delete_remote(True)
 		frappe.get_doc("File", self.file.name).create_attachment_copy("Note", "anything")
-		fake = network(self, self.answer)
 		self.reattach()
-		self.assertEqual(fake.calls, [])  # bytes are moved by a job, not in the save
-		job = self.jobs.call_args.kwargs
-		self.assertEqual((job["file_name"], job["old_name"]), (self.file.name, self.todo.name))
-		files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
+		self.run_job()
+		self.assertEqual(self.methods(), ["GET", "PUT"])  # never removed: the copies still use it
+		row = self.row()
 		self.assertEqual(
-			[m for m, _u, _k in fake.calls], ["GET", "PUT"]
-		)  # its own copy; the original stays for the copies
-		self.assertEqual(
-			self.location(), {"custom_microsoft_item_id": "OWN-COPY", "custom_microsoft_folder_id": "FOLDER2"}
+			(row.custom_microsoft_status, row.custom_microsoft_item_id), (files.STORED, "OWN-COPY")
 		)
 
-	def test_re_attached_to_an_unmapped_record_it_comes_back_to_this_server(self):
-		fake = network(self, self.answer)
+	def test_to_an_unmapped_record_with_remove_off_it_comes_back_and_sharepoint_keeps_it(self):
+		self.delete_remote(False)
 		self.reattach("Note", "unmapped")
-		files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
-		row = frappe.db.get_value(
-			"File", self.file.name, ["file_url", "custom_microsoft_status"], as_dict=True
-		)
+		self.run_job()
+		self.assertEqual(self.methods(), ["GET"])
+		row = self.row()
+		self.addCleanup(remove, files.local_path(row.file_url))
 		self.assertFalse(row.custom_microsoft_status)
 		self.assertTrue(row.file_url.startswith("/private/files/"))
-		self.addCleanup(remove, files.local_path(row.file_url))
-		self.assertEqual([m for m, _u, _k in fake.calls], ["GET", "DELETE"])
 
-	def test_an_item_that_was_not_in_the_old_records_folder_is_not_moved(self):
+	def test_to_an_unmapped_record_with_remove_on_the_old_item_goes_to_the_recycle_bin(self):
+		self.delete_remote(True)
+		self.reattach("Note", "unmapped")
+		self.run_job()
+		self.addCleanup(remove, files.local_path(self.row().file_url))
+		self.assertEqual(self.methods(), ["GET", "DELETE"])
+
+	def test_between_libraries_with_remove_off_the_old_item_stays(self):
+		self.delete_remote(False)
+		self.second_folder("DRIVE2", "OTHER-LIBRARY")
+		self.reattach()
+		self.run_job()
+		self.assertEqual(self.methods(), ["GET", "PUT"])
+		row = self.row()
+		self.assertEqual(
+			(row.custom_microsoft_item_id, row.custom_microsoft_folder_id), ("OWN-COPY", "OTHER-LIBRARY")
+		)
+
+	def test_between_libraries_with_remove_on_it_is_a_move(self):
+		self.delete_remote(True)
+		self.second_folder("DRIVE2", "OTHER-LIBRARY")
+		self.reattach()
+		self.run_job()
+		self.assertEqual(self.methods(), ["GET", "PUT", "DELETE"])
+
+	def test_a_failed_move_is_recorded_and_retried_hourly(self):
+		patch.object(frappe.db, "rollback").start()
+		self.fail_patch = HttpResponse(503, {"error": {"code": "serviceNotAvailable"}})
+		self.reattach()
+		self.run_job()
+		row = self.row()
+		self.assertEqual((row.custom_microsoft_status, row.custom_microsoft_attempts), (files.MOVING, 1))
+		self.assertIn("503", row.custom_microsoft_error)
+		frappe.db.set_value("File", self.file.name, "modified", "2020-01-01 00:00:00", update_modified=False)
+		self.jobs.reset_mock()
+		files.retry_pending()
+		self.assertIn(self.file.name, [c.kwargs.get("file_name") for c in self.jobs.call_args_list])
+		self.fail_patch = None
+		files.follow_attachment(self.file.name)  # the retry knows no previous record, and needs none
+		self.assertEqual(self.row().custom_microsoft_status, files.STORED)
+
+	def test_an_item_that_was_not_in_the_old_records_folder_is_not_touched(self):
 		third = frappe.get_doc({"doctype": "ToDo", "description": "third"}).insert()
-		fake = network(self, self.answer)
-		files.follow_attachment(self.file.name, MAPPED, third.name, in_job=True)
-		self.assertEqual(fake.calls, [])
+		frappe.db.set_value("File", self.file.name, "attached_to_name", third.name)  # a copy, say
+		self.reattach()
+		self.jobs.assert_not_called()
+		self.assertEqual(self.row().custom_microsoft_status, files.STORED)
+
+	def test_a_file_moved_before_its_folder_was_recorded_is_checked_in_the_job(self):
+		frappe.db.set_value("File", self.file.name, "custom_microsoft_folder_id", None)
+		self.reattach()
+		job = self.jobs.call_args.kwargs
+		self.assertEqual((job["old_doctype"], job["old_name"]), (MAPPED, self.todo.name))
+		with patch.object(files, "_known_folder_holding", return_value="FOLDER"):
+			self.run_job()
+		self.assertEqual(self.row().custom_microsoft_folder_id, "FOLDER2")
+		with patch.object(files, "_known_folder_holding", return_value="FOLDER"):
+			files.follow_attachment(self.file.name)  # nothing left to do
+		self.assertEqual(self.methods(), ["PATCH"])
 
 	def test_saving_without_re_attaching_does_nothing(self):
-		fake = network(self, self.answer)
-		doc = frappe.get_doc("File", self.file.name)
-		doc.save()
-		self.assertEqual(fake.calls, [])
+		frappe.get_doc("File", self.file.name).save()
+		self.jobs.assert_not_called()
+		self.assertEqual(self.fake.calls, [])
 
 	def test_nothing_moves_while_storage_is_off(self):
-		fake = network(self, self.answer)
+		self.reattach("Note", "unmapped")
 		with patch.object(files, "files_enabled", return_value=False):
-			self.reattach("Note", "unmapped")
-			files.follow_attachment(self.file.name, MAPPED, self.todo.name, in_job=True)
-		self.assertEqual(fake.calls, [])
-		self.assertEqual(frappe.db.get_value("File", self.file.name, "custom_microsoft_status"), files.STORED)
+			self.run_job()
+		self.assertEqual(self.fake.calls, [])
+		self.assertEqual(self.row().custom_microsoft_status, files.MOVING)
 
 
 # --- B30: get_content never reads a huge file into memory -------------------------------------
