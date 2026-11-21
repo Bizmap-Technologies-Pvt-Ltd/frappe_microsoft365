@@ -75,8 +75,22 @@ MAX_ATTEMPTS = 5
 #: Minutes a Pending/Failed file waits before the hourly sweep picks it up again.
 RETRY_AFTER_MINUTES = 15
 
-#: How far up the tree open_item walks to prove an item sits inside a record's folder.
-MAX_FOLDER_DEPTH = 10
+#: SharePoint's limit on a file's whole decoded path, counted from the site's address on
+#: (``sites/Sales/Shared Documents/Projects/PRJ-0001/spec.pdf``).
+MAX_PATH_LENGTH = 400
+
+#: What a mapping's base folder must leave of MAX_PATH_LENGTH for a record's folder and the
+#: files in it; a base path longer than that is refused when the mapping is saved.
+MIN_ROOM_FOR_RECORDS = 100
+
+#: What a record's folder must leave for the name of a file in it. A longer folder name is
+#: shortened when the folder is created, and a file name that does not fit is shortened.
+MIN_ROOM_FOR_FILE_NAME = 50
+
+#: How far up the tree open_item walks to prove an item sits inside a record's folder. Not a
+#: limit SharePoint has; its path limit allows at most this many levels (one character and a
+#: slash each), so no file anyone can reach is ever refused for being deep.
+MAX_FOLDER_DEPTH = MAX_PATH_LENGTH // 2
 
 OPEN_METHOD = "frappe_microsoft365.microsoft_files.open_file"
 
@@ -400,6 +414,62 @@ def encode_path(segments):
 	return "/".join(quote(segment, safe="") for segment in segments)
 
 
+def library_path(row):
+	"""The decoded path of a mapping's library, from the site's address on. Pure.
+
+	Counted the way SharePoint counts its path limit. The library a Teams team keeps its files in
+	is called Documents but lives at Shared Documents; any other library is assumed to live at its
+	name, which is what SharePoint uses unless the library was renamed after it was made.
+	"""
+	_host, site_path = parse_site_url(row.get("site_url"))
+	library = (row.get("library") or "").strip()
+	if library.lower() in ("", "documents", "shared documents"):
+		library = "Shared Documents"
+	return "/".join(part for part in (site_path.strip("/"), library) if part)
+
+
+def base_path_length(row):
+	"""How much of SharePoint's path limit a mapping's library and base folder use. Pure."""
+	return len("/".join([library_path(row), *base_segments(row)]))
+
+
+def assert_base_path_fits(row):
+	"""Refuse a base folder that leaves no room for record folders and their files."""
+	used = base_path_length(row)
+	if used > MAX_PATH_LENGTH - MIN_ROOM_FOR_RECORDS:
+		frappe.throw(
+			_(
+				"The library and base folder path is {0} characters long, counted from the site address. SharePoint allows {1} characters for a file's whole path, so this leaves too little room for each record's folder and the files in it (at least {2} are needed). Use a shorter base folder."
+			).format(used, MAX_PATH_LENGTH, MIN_ROOM_FOR_RECORDS),
+			title=_("SharePoint path too long"),
+		)
+
+
+def folder_path_length(folder, row=None):
+	"""How much of SharePoint's path limit a record folder's own path uses.
+
+	Read from the folder's address when there is one (the real path, whatever the folder was
+	called or moved to since), else from the mapping and the recorded path.
+	"""
+	from urllib.parse import unquote
+
+	if folder.get("web_url"):
+		return len(unquote(urlparse(folder.web_url).path).strip("/"))
+	row = row or mapping_for(folder.get("reference_doctype")) or {}
+	return len("/".join(part for part in (library_path(row), folder.get("folder_path") or "") if part))
+
+
+def fit_file_name(name, room):
+	"""``name`` shortened, keeping its extension, to ``room`` characters; None if it cannot be. Pure."""
+	if len(name) <= room:
+		return name
+	stem, ext = os.path.splitext(name)
+	keep = room - len(ext)
+	if keep < 8:
+		return None
+	return stem[:keep].rstrip(" .-") + ext
+
+
 def parse_site_url(url):
 	"""``(hostname, server-relative path)`` for the site a URL belongs to.
 
@@ -693,8 +763,11 @@ def new_folder_values(row, doctype, name):
 	administrator does on purpose, with Existing Folder on the mapping's Folders table.
 	"""
 	doc = frappe.get_doc(doctype, name)
-	folder_name = render_pattern(row.folder_pattern, doc)
+	assert_base_path_fits(row)
 	base = base_segments(row)
+	# The record's folder must leave room for the names of the files that go in it.
+	room = MAX_PATH_LENGTH - base_path_length(row) - 1 - MIN_ROOM_FOR_FILE_NAME
+	folder_name = safe_name(render_pattern(row.folder_pattern, doc), max_length=min(MAX_FOLDER_NAME, room))
 
 	def create(drive_id):
 		parent_id = ensure_path(drive_id, base)["id"] if base else None
@@ -1245,8 +1318,24 @@ def _repoint_links(file_doc, old_url, new_url):
 	)
 
 
-def _upload(file_doc, folder):
+def upload_name(file_doc, folder):
+	"""The name a File is stored under in its record's folder: made safe for SharePoint, and
+	shortened (keeping its extension) where the whole path would pass SharePoint's limit."""
 	name = safe_file_name(file_doc.file_name or os.path.basename(file_doc.file_url or ""))
+	used = folder_path_length(folder)
+	fitted = fit_file_name(name, MAX_PATH_LENGTH - used - 1)
+	if not fitted:
+		frappe.throw(
+			_(
+				"This record's SharePoint folder path is already {0} characters long, counted from the site address, and SharePoint allows {1} for a file's whole path, so no file fits in it. Shorten the mapping's base folder, or the folder's name in SharePoint."
+			).format(used, MAX_PATH_LENGTH),
+			MsGraphError,
+		)
+	return fitted
+
+
+def _upload(file_doc, folder):
+	name = upload_name(file_doc, folder)
 	content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
 	if is_local(file_doc):
 		# get_full_path refuses anything outside the site's files directories.
@@ -2692,3 +2781,43 @@ def upgrade_check_orphaned_kept_copies():
 			),
 		)
 	]
+
+
+def upgrade_check_long_paths():
+	"""SharePoint Mappings whose library and base folder leave little of SharePoint's path limit.
+
+	SharePoint refuses a file whose whole path passes 400 characters. From 1.2.0 a mapping whose
+	base path leaves too little room is refused when it is saved, and record folders are named to
+	leave room for their files; mappings saved before are listed here. Read only, without Graph.
+	"""
+	from frappe_microsoft365.doctor import WARN, finding
+
+	if not frappe.db.table_exists("SharePoint Mapping"):
+		return []
+	out = []
+	for row in frappe.get_all(
+		"SharePoint Mapping",
+		fields=["name", "reference_doctype", "site_url", "library", "use_base_folder", "base_folder"],
+		order_by="name asc",
+	):
+		try:
+			used = base_path_length(row)
+		except Exception:
+			continue  # an unreadable site address is the doctor's to report
+		if used <= MAX_PATH_LENGTH - MIN_ROOM_FOR_RECORDS:
+			continue
+		out.append(
+			finding(
+				"upgrade.sharepoint_long_paths",
+				WARN,
+				_("The {0} mapping's base folder uses {1} of SharePoint's {2} path characters").format(
+					_(row.reference_doctype), used, MAX_PATH_LENGTH
+				),
+				"/".join([library_path(row), *base_segments(row)]),
+				_(
+					"Uploads into it fail once a record folder and a file name take the path past {0} characters. Shorten the Base Folder on the mapping (and rename or move the folder in SharePoint to match); the mapping cannot be saved again until its base path leaves at least {1} characters."
+				).format(MAX_PATH_LENGTH, MIN_ROOM_FOR_RECORDS),
+				target=row.reference_doctype,
+			)
+		)
+	return out

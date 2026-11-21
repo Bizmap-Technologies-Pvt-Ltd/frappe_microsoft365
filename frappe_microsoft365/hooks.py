@@ -36,6 +36,7 @@ microsoft365_upgrade_checks = {
 	],
 	"1.2.0": [
 		"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies",
+		"frappe_microsoft365.microsoft_files.upgrade_check_long_paths",
 	],
 }
 

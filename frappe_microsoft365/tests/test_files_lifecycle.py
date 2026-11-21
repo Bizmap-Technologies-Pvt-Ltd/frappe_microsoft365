@@ -498,3 +498,84 @@ class TestRecreatedLibrary(FilesTestCase):
 		with self.assertRaises(graph.MsGraphNotFound):
 			files.new_folder_values(files.mapping_for(MAPPED), MAPPED, self.todo.name)
 		self.assertNotIn("/sites/", " ".join(u for _m, u, _k in fake.calls))
+
+
+# --- B24: SharePoint's 400-character path limit, and deep folders -----------------------------
+
+
+class TestPathLimits(FilesTestCase):
+	def long_base(self, length):
+		"""A base folder of segments of 100, making the library and base path ``length`` long."""
+		mapping = frappe.get_doc("SharePoint Mapping", MAPPED)
+		prefix = len("sites/Sales/Shared Documents/")
+		base, left = [], length - prefix
+		while left > 0:
+			take = min(100, left)
+			base.append("B" * take)
+			left -= take + 1
+		mapping.base_folder = "/".join(base)
+		return mapping
+
+	def test_the_library_path_is_counted_from_the_site(self):
+		row = frappe._dict(site_url="https://contoso.sharepoint.com/sites/Sales", library="Documents")
+		self.assertEqual(files.library_path(row), "sites/Sales/Shared Documents")
+		row.update(use_base_folder=1, base_folder="Projects/2026")
+		self.assertEqual(files.base_path_length(row), len("sites/Sales/Shared Documents/Projects/2026"))
+
+	def test_a_mapping_whose_base_path_leaves_no_room_is_refused(self):
+		mapping = self.long_base(files.MAX_PATH_LENGTH - files.MIN_ROOM_FOR_RECORDS + 5)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			mapping.save()
+		self.assertIn("400", str(caught.exception))
+		self.long_base(files.MAX_PATH_LENGTH - files.MIN_ROOM_FOR_RECORDS - 5).save()
+
+	def test_a_folder_is_not_created_under_a_base_path_that_is_too_long(self):
+		row = files.mapping_for(MAPPED)
+		row.base_folder = "/".join(["B" * 120] * 4)
+		with self.assertRaises(frappe.ValidationError):
+			files.new_folder_values(row, MAPPED, self.todo.name)
+		self.assertNotIn("POST", [m for m, _p in self.graph.calls])
+
+	def test_a_record_folder_name_leaves_room_for_its_files(self):
+		self.long_base(files.MAX_PATH_LENGTH - files.MIN_ROOM_FOR_RECORDS).save()
+		frappe.db.set_value(MAPPED, self.todo.name, "description", "D" * 200)
+		frappe.db.set_value("SharePoint Mapping", MAPPED, "folder_pattern", "{description}")
+		files.clear_mapping_cache()
+		row = files.mapping_for(MAPPED)
+		with patch.object(files, "ensure_path", return_value={"id": "BASE"}):
+			values = files.new_folder_values(row, MAPPED, self.todo.name)
+		used = files.base_path_length(row) + 1 + len(values["folder_name"])
+		self.assertEqual(used, files.MAX_PATH_LENGTH - files.MIN_ROOM_FOR_FILE_NAME)
+
+	def test_a_file_name_is_shortened_to_fit_keeping_its_extension(self):
+		folder = frappe._dict(web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 300)
+		f = frappe._dict(file_name="quotation " * 20 + ".pdf", file_url="/private/files/q.pdf")
+		name = files.upload_name(f, folder)
+		self.assertTrue(name.endswith(".pdf"))
+		self.assertEqual(len("sites/Sales/Shared Documents/" + "F" * 300) + 1 + len(name), files.MAX_PATH_LENGTH)
+
+	def test_a_folder_with_no_room_left_gives_a_clear_error(self):
+		folder = frappe._dict(web_url="https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/" + "F" * 395)
+		with self.assertRaises(MsGraphError) as caught:
+			files.upload_name(frappe._dict(file_name="spec.pdf"), folder)
+		self.assertIn("SharePoint allows 400", str(caught.exception))
+
+	def test_a_file_twelve_levels_down_in_the_records_folder_opens(self):
+		folder = files.ensure_folder(MAPPED, self.todo.name)
+		parent = folder.item_id
+		for level in range(12):
+			self.graph.items[f"SUB{level}"] = {"id": f"SUB{level}", "parent": parent}
+			parent = f"SUB{level}"
+		self.graph.items["DEEP"] = {"id": "DEEP", "parent": parent, "name": "deep.txt"}
+		files._assert_inside(folder, "DEEP")
+		self.graph.items["OUTSIDE"] = {"id": "OUTSIDE", "parent": "BASE"}
+		with self.assertRaises(frappe.PermissionError):
+			files._assert_inside(folder, "OUTSIDE")
+
+	def test_mappings_close_to_the_limit_are_reported(self):
+		self.assertEqual(files.upgrade_check_long_paths(), [])
+		frappe.db.set_value("SharePoint Mapping", MAPPED, "base_folder", "/".join(["B" * 100] * 3))
+		found = files.upgrade_check_long_paths()
+		self.assertEqual([f["check"] for f in found], ["upgrade.sharepoint_long_paths"])
+		self.assertEqual(found[0]["target"], MAPPED)
+		self.assertIn("frappe_microsoft365.microsoft_files.upgrade_check_long_paths", upgrade_checks())

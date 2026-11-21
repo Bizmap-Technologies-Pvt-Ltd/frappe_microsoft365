@@ -127,7 +127,11 @@ asks for `Sites.ReadWrite.All`.
      SharePoint*. Paste the address; anything after `/sites/<name>` is ignored.
    - **Document Library**: `Documents` for Teams.
    - **Base Folder**: the channel name, e.g. `Projects`. Nested paths like `Projects/2026` work.
-     The folder is created if it is missing.
+     The folder is created if it is missing. SharePoint allows 400 characters for a file's whole
+     path, counted from the site address (`sites/Sales/Shared Documents/Projects/…`), so a base
+     path that leaves fewer than 100 for record folders and file names is refused. A record
+     folder's name is shortened to leave 50 for file names, and a file name that would pass the
+     limit is shortened, keeping its extension.
    - **Folder Name Pattern**: `{name}` by default. `{title}` is the record's title (its DocType's
      Title Field, or the name when there is none), and `{fieldname}` any field, e.g.
      `{name} - {title}` gives `DEV-00042 - Scan-Line 920B`, or `{name} - {customer}`.
