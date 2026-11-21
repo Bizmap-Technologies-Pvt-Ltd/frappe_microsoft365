@@ -21,9 +21,11 @@ The endpoint/permission contract these steps satisfy is documented in
      come from *any* organisation's directory, and whoever runs that directory chooses its users'
      addresses — including ones that match your Frappe users. Set Up refuses to create the sign-in
      record unless Tenant ID names your directory, the doctor reports an existing one on a
-     multi-tenant authority as a failure, and on Frappe 16 a sign-in from any other directory is
-     refused. People from partner organisations who need access should be invited into your
-     directory as guests, which keeps them inside it.
+     multi-tenant authority as a failure, and a sign-in from any other directory is refused, on
+     Frappe 15 and 16 alike. From 1.2.0, while Tenant ID is `common`, `organizations`,
+     `consumers` or empty, **every** Microsoft sign-in is refused, and people see a page asking
+     them to contact their administrator. People from partner organisations who need access
+     should be invited into your directory as guests, which keeps them inside it.
    - App-only features (SharePoint document storage, app-only mail) need a specific tenant too.
    - Personal Microsoft accounts (consumer) are **not** supported for the Teams/transcript scopes.
 4. Leave the redirect URI blank for now (added in the next step). Click **Register**.
