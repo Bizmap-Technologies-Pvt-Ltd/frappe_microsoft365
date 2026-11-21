@@ -178,8 +178,8 @@ The File list shows each file's SharePoint Status in its own column (empty for f
 | --- | --- |
 | An attachment is deleted in the ERP | SharePoint keeps the file, unless *Remove from SharePoint when the attachment is deleted* is on for that record type, in SharePoint Settings or on its mapping (then it goes to the recycle bin) |
 | A record is deleted | Its SharePoint folder and files stay; only the ERP's link to the folder is removed |
-| A record is renamed | Its folder is renamed to match |
-| A record's title or another field in the pattern changes | The folder keeps its name; only a rename of the record renames it |
+| A record is renamed | Its folder stays linked to it under the new name. The folder keeps its name in SharePoint: it is never renamed, so a folder linked by hand (a Teams channel's, say) is never touched. Rename it in SharePoint yourself if you want the names to match |
+| A record's title or another field in the pattern changes | The folder keeps its name |
 | The folder is renamed or moved in Teams | The link keeps working; the ERP tracks the folder by its id, not its path |
 | The folder is deleted in Teams | The next attachment creates a new folder |
 | The mapping's site or library is changed | New folders go to the new place; existing folders stay where they are |

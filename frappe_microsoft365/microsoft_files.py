@@ -26,7 +26,6 @@ Graph contract used (all v1.0, see docs/graph-api-reference.md):
 * ``POST .../{filename}:/createUploadSession`` then ``PUT {uploadUrl}`` in ranges — large upload
 * ``GET /drives/{drive-id}/items/{item-id}/content`` — download (302 to a pre-signed URL)
 * ``GET /drives/{drive-id}/items/{item-id}/children`` — folder listing
-* ``PATCH /drives/{drive-id}/items/{item-id}`` — rename
 * ``DELETE /drives/{drive-id}/items/{item-id}`` — to the site recycle bin
 """
 
@@ -1576,7 +1575,14 @@ def on_doc_trash(doc, method=None):
 
 
 def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
-	"""Any document's after_rename: keep the folder record, and rename the folder to match."""
+	"""Any document's after_rename: keep the record's folder linked to it under its new name.
+
+	The SharePoint folder itself is never renamed. It may be one an administrator linked by hand
+	(a Teams channel's folder, shared by people who never use the ERP), people bookmark and sync
+	folders by name, and the link does not need it: it is kept by the folder's item id. Frappe
+	normally rewrites the folder row's reference_name (a Dynamic Link) before this runs; this
+	covers a row it did not.
+	"""
 	if doc.doctype not in mapped_doctypes():
 		return
 	folder = get_folder(doc.doctype, old)
@@ -1584,32 +1590,10 @@ def on_doc_rename(doc, method=None, old=None, new=None, merge=False):
 		return
 	touch_mapping(doc.doctype)
 	if merge or get_folder(doc.doctype, new):
+		# Merged into a record that has a folder of its own: that one stays its folder.
 		frappe.db.delete("SharePoint Folder", {"name": folder.name})
 		return
 	frappe.db.set_value("SharePoint Folder", folder.name, "reference_name", new, update_modified=False)
-	row = mapping_for(doc.doctype)
-	new_name = render_pattern(row.folder_pattern, frappe.get_doc(doc.doctype, new))
-	if new_name == folder.folder_name:
-		return
-	try:
-		item = graph.graph_request(
-			"PATCH",
-			f"/drives/{folder.drive_id}/items/{folder.item_id}",
-			APP,
-			json={
-				"name": new_name,
-				"@microsoft.graph.conflictBehavior": "fail",
-			},
-		)
-		frappe.db.set_value(
-			"SharePoint Folder",
-			folder.name,
-			{"folder_name": new_name, "web_url": item.get("webUrl")},
-			update_modified=False,
-		)
-	except Exception:
-		# The record is renamed either way; the folder keeps its old name and still links.
-		frappe.log_error(title=_("Microsoft 365: could not rename SharePoint folder"))
 
 
 # --- retries and migration ---------------------------------------------------------------

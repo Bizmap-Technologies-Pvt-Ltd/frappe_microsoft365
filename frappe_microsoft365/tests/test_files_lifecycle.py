@@ -387,3 +387,38 @@ class TestOldLinks(FilesTestCase):
 		files.upload_file(a.name)
 		self.assertTrue(os.path.exists(files.local_path(b.file_url)))  # b still uses the bytes
 		self.assertIsNone(self.follow(b.file_url, self.USER))
+
+
+# --- B21: record folders are never renamed ---------------------------------------------------
+
+
+class TestRenamingARecord(FilesTestCase):
+	def renamed(self):
+		files.ensure_folder(MAPPED, self.todo.name)
+		new = self.todo.name + "-renamed"
+		frappe.rename_doc(MAPPED, self.todo.name, new, force=True)
+		return new
+
+	def test_the_folder_stays_linked_and_keeps_its_name(self):
+		folder = files.ensure_folder(MAPPED, self.todo.name)
+		new = self.renamed()
+		self.assertIsNone(files.get_folder(MAPPED, self.todo.name))
+		row = files.get_folder(MAPPED, new)
+		self.assertEqual((row.item_id, row.folder_name), (folder.item_id, folder.folder_name))
+		self.assertNotIn("PATCH", [m for m, _p in self.graph.calls])
+
+	def test_a_row_frappe_did_not_rewrite_follows_without_renaming_the_folder(self):
+		folder = files.ensure_folder(MAPPED, self.todo.name)
+		old, new = self.todo.name, self.todo.name + "-renamed"
+		frappe.db.set_value(MAPPED, old, "name", new)
+		files.on_doc_rename(frappe.get_doc(MAPPED, new), old=old, new=new)
+		self.assertEqual(files.get_folder(MAPPED, new).item_id, folder.item_id)
+		self.assertNotIn("PATCH", [m for m, _p in self.graph.calls])
+
+	def test_merging_into_a_record_with_its_own_folder_keeps_that_folder(self):
+		other = frappe.get_doc({"doctype": "ToDo", "description": "merge target"}).insert()
+		files.ensure_folder(MAPPED, self.todo.name)
+		target = files.ensure_folder(MAPPED, other.name)
+		files.on_doc_rename(other, old=self.todo.name, new=other.name, merge=True)
+		self.assertIsNone(files.get_folder(MAPPED, self.todo.name))
+		self.assertEqual(files.get_folder(MAPPED, other.name).item_id, target.item_id)

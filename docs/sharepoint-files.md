@@ -131,8 +131,9 @@ asks for `Sites.ReadWrite.All`.
    - **Folder Name Pattern**: `{name}` by default. `{title}` is the record's title (its DocType's
      Title Field, or the name when there is none), and `{fieldname}` any field, e.g.
      `{name} - {title}` gives `DEV-00042 - Scan-Line 920B`, or `{name} - {customer}`.
-     The name is set when the folder is created and follows a rename of the record, not later
-     edits to the title or other fields.
+     The name is set once, when the folder is created. The app never renames a folder: not
+     when the record is renamed (the folder stays linked, by its id), and not when the title or
+     other fields change.
 4. Save the mapping, then click **Site Grant Script** on it. A SharePoint or Global administrator
    runs the script in Microsoft Graph PowerShell. (The *Site Grant Script* section of
    *SharePoint Settings* gives one script for every mapped site.) For each site it runs:
@@ -237,5 +238,4 @@ All Graph v1.0, application permission `Sites.Selected`:
 | Upload > 4 MB | `POST …:/{name}:/createUploadSession`, then `PUT {uploadUrl}` in 320 KiB-multiple ranges, without a bearer token |
 | Download | `GET /drives/{drive-id}/items/{item-id}/content` (302 to a pre-authenticated URL) |
 | List | `GET /drives/{drive-id}/items/{item-id}/children` |
-| Rename (record renamed) | `PATCH /drives/{drive-id}/items/{item-id}` |
 | Remove (opt-in) | `DELETE /drives/{drive-id}/items/{item-id}`, which goes to the site recycle bin |
