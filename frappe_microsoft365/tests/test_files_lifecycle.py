@@ -853,6 +853,8 @@ class TestReattachedFileMoves(FilesTestCase):
 		files.retry_pending()
 		self.assertIn(self.file.name, [c.kwargs.get("file_name") for c in self.jobs.call_args_list])
 		self.fail_patch = None
+		# The hourly retry is a new job: the throttling pause the 503 left on this one is gone.
+		graph.clear_token_cache()
 		files.follow_attachment(self.file.name)  # the retry knows no previous record, and needs none
 		self.assertEqual(self.row().custom_microsoft_status, files.STORED)
 

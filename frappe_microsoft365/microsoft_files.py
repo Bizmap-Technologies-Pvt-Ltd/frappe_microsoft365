@@ -1609,7 +1609,8 @@ def _send_ranges(upload_url, fh, size, start=0):
 		status = resp.status_code if resp is not None else None
 		if resp is not None:
 			graph._release(resp)
-		if wait is None or tries > UPLOAD_RETRIES_PER_RANGE:
+		# Longer than one call may sleep (graph._max_inline_wait): keep the session for next time.
+		if wait is None or wait > graph._max_inline_wait() or tries > UPLOAD_RETRIES_PER_RANGE:
 			raise UploadInterrupted(
 				_(
 					"The upload to SharePoint stopped at byte {0} of {1} ({2}); the next attempt carries on from there."
