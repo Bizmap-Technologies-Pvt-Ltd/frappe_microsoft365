@@ -1927,6 +1927,48 @@ class TestUpgradeCheckEventOwners(SyncTestCase):
 		# Read-only: the links are still there.
 		self.assertEqual(frappe.db.get_value("Event", first.name, "custom_microsoft_calendar"), CALENDAR)
 
+	def _made_for_a_colleague(self):
+		"""Events an administrator created on a colleague's calendar, as on a real site after 1.1.1."""
+		with patch.object(frappe, "enqueue"), patch.object(graph, "graph_request"):
+			events = [self._local_event(ms_id="ms-give-1"), self._local_event()]
+		colleague = _ensure_user("m365-give-test@example.com")
+		frappe.db.set_value("Microsoft Calendar", CALENDAR, "user", colleague)
+		return events, colleague
+
+	def test_give_linked_events_counts_first_and_changes_nothing(self):
+		events, colleague = self._made_for_a_colleague()
+		out = sync.give_linked_events_to_calendar_user(CALENDAR)
+		self.assertEqual((out["user"], out["count"]), (colleague, 2))
+		self.assertNotEqual(frappe.db.get_value("Event", events[0].name, "owner"), colleague)
+
+	def test_give_linked_events_hands_them_over_and_clears_the_report(self):
+		events, colleague = self._made_for_a_colleague()
+		previous = events[0].owner
+		out = sync.give_linked_events_to_calendar_user(CALENDAR, apply=1)
+		self.assertEqual(sorted(out["changed"]), sorted(e.name for e in events))
+		for event in events:
+			self.assertEqual(frappe.db.get_value("Event", event.name, "owner"), colleague)
+		comment = frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "Event", "reference_name": events[0].name, "comment_type": "Info"},
+			pluck="content",
+		)
+		self.assertTrue(any(previous in c and colleague in c for c in comment))
+		self.assertEqual([f for f in sync.upgrade_check_event_owners() if f["target"] == CALENDAR], [])
+		self.assertTrue(sync._is_owners_calendar(colleague, CALENDAR))
+
+	def test_give_linked_events_is_for_system_managers(self):
+		self._made_for_a_colleague()
+		frappe.set_user("Guest")
+		# Frappe 15's only_for lets everyone through while tests run; real requests are checked.
+		in_test, frappe.flags.in_test = frappe.flags.in_test, False
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				sync.give_linked_events_to_calendar_user(CALENDAR, apply=1)
+		finally:
+			frappe.flags.in_test = in_test
+			frappe.set_user("Administrator")
+
 	def test_registered_for_the_release(self):
 		checks = frappe.get_hooks("microsoft365_upgrade_checks", app_name="frappe_microsoft365")
 		self.assertIn(

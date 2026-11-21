@@ -52,6 +52,7 @@ import frappe
 from frappe import _
 from frappe.utils import (
 	add_to_date,
+	cint,
 	get_datetime,
 	get_system_timezone,
 	now_datetime,
@@ -1679,20 +1680,7 @@ def upgrade_check_event_owners():
 	):
 		return []
 
-	# Only Events that would ever reach Microsoft: ticked for sync, or already carrying an id —
-	# deleting one of those is a write to the mailbox even when sync was later unticked.
-	rows = frappe.db.sql(
-		"""
-		select e.name, e.owner, e.custom_microsoft_calendar as calendar, c.`user` as calendar_user
-		from `tabEvent` e
-		inner join `tabMicrosoft Calendar` c on c.name = e.custom_microsoft_calendar
-		where (e.custom_sync_with_microsoft_calendar = 1
-				or coalesce(e.custom_microsoft_event_id, '') != '')
-			and (coalesce(c.`user`, '') = '' or e.owner != c.`user`)
-		order by e.custom_microsoft_calendar, e.creation
-		""",
-		as_dict=True,
-	)
+	rows = _events_of_others()
 
 	by_calendar = {}
 	for row in rows:
@@ -1719,10 +1707,62 @@ def upgrade_check_event_owners():
 					"ticked. Nothing was changed."
 				).format(group["user"] or _("no user"), sample),
 				_(
-					"Have each event's owner link it to their own Microsoft Calendar, or untick "
-					"Sync with Microsoft Calendar on it."
-				),
+					"If they were made for {0} (by an administrator, say), open Microsoft Calendar {1} "
+					"and choose Microsoft > Give Linked Events to {0}. Otherwise have each event's owner "
+					"link it to their own Microsoft Calendar, or untick Sync with Microsoft Calendar on it."
+				).format(group["user"] or _("its user"), calendar),
 				target=calendar,
 			)
 		)
 	return findings
+
+
+def _events_of_others(calendar=None):
+	"""Events linked to a Microsoft Calendar whose owner is not that calendar's user.
+
+	Only Events that would ever reach Microsoft: ticked for sync, or already carrying an id —
+	deleting one of those is a write to the mailbox even when sync was later unticked.
+	"""
+	return frappe.db.sql(
+		f"""
+		select e.name, e.owner, e.custom_microsoft_calendar as calendar, c.`user` as calendar_user
+		from `tabEvent` e
+		inner join `tabMicrosoft Calendar` c on c.name = e.custom_microsoft_calendar
+		where (e.custom_sync_with_microsoft_calendar = 1
+				or coalesce(e.custom_microsoft_event_id, '') != '')
+			and (coalesce(c.`user`, '') = '' or e.owner != c.`user`)
+			{"and c.name = %(calendar)s" if calendar else ""}
+		order by e.custom_microsoft_calendar, e.creation
+		""",
+		{"calendar": calendar},
+		as_dict=True,
+	)
+
+
+@frappe.whitelist(methods=["POST"])
+def give_linked_events_to_calendar_user(calendar_name: str, apply: int = 0):
+	"""Make the calendar's user the owner of the Events linked to it that someone else owns.
+
+	Events an administrator created for a colleague's calendar stopped syncing in 1.1.1, when
+	only an Event's owner's own calendar could be written to, and Frappe offers no way to change
+	an owner from the form. This is that way, for System Managers, one calendar at a time. With
+	``apply`` unset it only counts, so the form can say what is about to change. Ownership decides
+	who sees a private Event, so each one gets a comment naming its previous owner.
+	"""
+	frappe.only_for("System Manager")
+	user = frappe.db.get_value("Microsoft Calendar", calendar_name, "user")
+	if not user:
+		frappe.throw(_("Microsoft Calendar {0} has no user to give events to.").format(calendar_name))
+	events = _events_of_others(calendar_name)
+	if not cint(apply):
+		return {"user": user, "count": len(events)}
+	for row in events:
+		frappe.db.set_value("Event", row.name, "owner", user, update_modified=False)
+		frappe.get_doc("Event", row.name).add_comment(
+			"Info",
+			_("Owner changed from {0} to {1} so the event syncs with {1}'s Microsoft calendar.").format(
+				row.owner or _("no owner"), user
+			),
+		)
+	return {"user": user, "count": len(events), "changed": [row.name for row in events]}
+
