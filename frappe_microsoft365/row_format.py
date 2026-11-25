@@ -91,7 +91,7 @@ def upgrade_check():
 			FAIL,
 			_("The {0} table is stored ROW_FORMAT=COMPRESSED").format(_(doctype)),
 			_(
-				"With this app's indexed columns, MariaDB cannot rebuild a compressed tab{0}, so any change to the {0} table fails with \"Row size too large\", including other apps' migrations. Migrate tries to convert it and could not."
+				"With this app's indexed columns, MariaDB cannot rebuild a compressed tab{0}, so any change to the {0} table fails with 'Row size too large', including other apps' migrations. Migrate tries to convert it and could not."
 			).format(doctype),
 			manual_steps(doctype),
 			target=doctype,
