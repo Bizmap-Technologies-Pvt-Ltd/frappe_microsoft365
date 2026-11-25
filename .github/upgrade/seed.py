@@ -327,6 +327,28 @@ def seed_sharepoint():
 	return {"mapping": mapping.name, "folders": len(todos), "files": files}
 
 
+def compress_tables():
+	"""Store tabFile and tabEvent ROW_FORMAT=COMPRESSED, as on a site whose tables an older Frappe
+	created (#68). Strict mode off, as such tables came to be; in strict mode MariaDB then refuses
+	to rebuild a compressed tabFile carrying the app's indexed columns, so any ALTER of it fails.
+	Returns ``{doctype: whether an ALTER of the compressed table failed}``.
+	"""
+	out = {}
+	for doctype in ("File", "Event"):
+		table = f"tab{doctype}"
+		frappe.db.sql_ddl("set session innodb_strict_mode = 0")
+		frappe.db.sql_ddl(f"alter table `{table}` row_format=compressed")
+		frappe.db.sql_ddl("set session innodb_strict_mode = 1")
+		try:
+			frappe.db.sql_ddl(f"alter table `{table}` add column upgrade_seed_probe int")
+			frappe.db.sql_ddl(f"alter table `{table}` drop column upgrade_seed_probe")
+			out[doctype] = False
+		except Exception as e:
+			print(f"{table} compressed: an ALTER now fails, as on the reporting site: {e}")
+			out[doctype] = True
+	return out
+
+
 def main(site, manifest_path):
 	frappe.init(site=site, sites_path=".")
 	frappe.connect()
@@ -342,6 +364,7 @@ def main(site, manifest_path):
 		events = seed_events()
 		sharepoint = seed_sharepoint()
 		frappe.db.commit()
+		compressed = compress_tables()
 
 		manifest = {
 			"from_version": __version__,
@@ -354,6 +377,7 @@ def main(site, manifest_path):
 				"Patch Log", filters={"patch": ["like", "frappe_microsoft365.%"]}, pluck="patch"
 			),
 			"sharepoint": sharepoint,
+			"compressed": compressed,
 			"counts": {
 				"Event": frappe.db.count("Event", {"subject": ["like", "upgrade-seed %"]}),
 				"Microsoft Calendar": frappe.db.count("Microsoft Calendar"),

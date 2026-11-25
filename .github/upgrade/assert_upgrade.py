@@ -201,6 +201,26 @@ def assert_upgrade_report(manifest):
 	frappe.db.rollback()
 
 
+def assert_tables_dynamic(manifest):
+	"""Seeded compressed, tabFile and tabEvent are DYNAMIC after migrate and take an ALTER (#68)."""
+	print("Row format:")
+	for doctype, alter_failed in (manifest.get("compressed") or {}).items():
+		table = f"tab{doctype}"
+		fmt = frappe.db.sql(
+			"""select row_format from information_schema.tables
+			where table_schema = database() and table_name = %s""",
+			table,
+		)[0][0]
+		check(fmt == "Dynamic", f"{table} is Dynamic (was seeded Compressed, ALTER failed then: {alter_failed})")
+		frappe.db.sql_ddl("set session innodb_strict_mode = 1")
+		try:
+			frappe.db.sql_ddl(f"alter table `{table}` add column upgrade_assert_probe int")
+			frappe.db.sql_ddl(f"alter table `{table}` drop column upgrade_assert_probe")
+			check(True, f"{table} takes an ALTER")
+		except Exception as e:
+			check(False, f"{table} takes an ALTER ({e})")
+
+
 def main(site, manifest_path):
 	with open(manifest_path) as f:
 		manifest = json.load(f)
@@ -213,6 +233,7 @@ def main(site, manifest_path):
 		print(f"Upgraded {manifest['from_version']} -> {__version__} on Frappe {frappe.__version__}")
 		assert_data_kept(manifest)
 		assert_patches(manifest)
+		assert_tables_dynamic(manifest)
 		assert_upgrade_report(manifest)
 	finally:
 		frappe.destroy()

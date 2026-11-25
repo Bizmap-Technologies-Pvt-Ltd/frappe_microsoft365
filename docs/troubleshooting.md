@@ -106,6 +106,7 @@ Three causes account for most of the reports.
 
 - [`Unknown column 'custom_…microsoft…'`](#unknown-column)
 - [`Data too long for column` / `(1406, …)`](#data-too-long)
+- [`Row size too large` on `tabFile` or `tabEvent` during migrate](#row-size-too-large) — a compressed table
 - [`The scheduler is off` / `No background worker is running`](#background-jobs)
 - [`This app's scheduled jobs have stopped running`](#jobs-stale)
 
@@ -1118,6 +1119,34 @@ on screen still reports success: sign-in "worked" and the calendar id was never 
 
 **Fix.** `bench --site <site> migrate` (Frappe Cloud: **Migrate** in the site dashboard) to pick up
 the widened columns, then **Re-authorize** the connection so the values are written again.
+
+<a id="row-size-too-large"></a>
+
+### `Failed to alter schema using query: ALTER TABLE `tabFile` …` / `Row size too large (> 8126)` / `(1118, …)`
+
+The site's `tabFile` (or `tabEvent`) is stored `ROW_FORMAT=COMPRESSED`, as tables created by older
+Frappe versions can be; Frappe creates them `DYNAMIC` today but never converts an existing one.
+With this app's indexed columns, MariaDB cannot rebuild a compressed `tabFile` at all, so **every**
+change to the File table fails, other apps' migrations included.
+
+From 1.2.1, migrate converts both tables to `DYNAMIC` before anything else and says so in its
+output (`Microsoft 365: converting `tabFile` …`). If that conversion fails too, or on 1.1.0–1.2.0,
+convert it by hand.
+
+**Fix.** Take a backup, then:
+
+```bash
+bench --site <site> mariadb
+```
+
+```sql
+ALTER TABLE `tabFile` ROW_FORMAT=DYNAMIC KEY_BLOCK_SIZE=0;
+```
+
+and `bench --site <site> migrate` again. `KEY_BLOCK_SIZE=0` matters: a table compressed with an
+explicit block size refuses `ROW_FORMAT=DYNAMIC` alone (`1478 … does not support the create option
+'KEY_BLOCK_SIZE'`). The `ALTER` rebuilds the table and holds writes to File while it runs; on a
+large `tabFile`, run it in a quiet window. Same for `tabEvent` if the error names it.
 
 <a id="background-jobs"></a>
 
