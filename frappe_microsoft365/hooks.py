@@ -18,6 +18,9 @@ has_permission = {
 # ------------------------------------------------------------------------------
 # Microsoft 365 — post-migrate setup, Event sync, scheduler
 # ------------------------------------------------------------------------------
+# A compressed tabFile or tabEvent cannot take this app's indexed columns: convert it first (#68).
+before_install = "frappe_microsoft365.row_format.before_install"
+before_migrate = "frappe_microsoft365.row_format.before_migrate"
 after_install = "frappe_microsoft365.setup.after_install"
 after_migrate = "frappe_microsoft365.setup.after_migrate"
 
@@ -41,6 +44,9 @@ microsoft365_upgrade_checks = {
 		"frappe_microsoft365.microsoft_calendar_sync.upgrade_check_orphaned_events",
 		"frappe_microsoft365.microsoft_files.upgrade_check_orphaned_kept_copies",
 		"frappe_microsoft365.microsoft_files.upgrade_check_long_paths",
+	],
+	"1.2.1": [
+		"frappe_microsoft365.row_format.upgrade_check",
 	],
 }
 
