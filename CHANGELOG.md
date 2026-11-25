@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.2.1 — 2026-11-25
+
+A fix for sites whose `tabFile` is stored in MariaDB's compressed row format, where updating to
+1.2.0 failed during migrate with "Row size too large". After updating, run
+`bench --site <site> migrate` (`bench update` does it).
+
+### Fixed
+
+- **Migrate no longer fails with `Row size too large (> 8126)` on `ALTER TABLE `tabFile``.** A
+  `tabFile` stored `ROW_FORMAT=COMPRESSED` (tables created by older Frappe versions can be) could
+  not be rebuilt once it carried this app's indexed `custom_microsoft_local_url`, so every change
+  to the File table failed, including Frappe's and other apps' own migrations. Before migrate and
+  before install, `tabFile` and `tabEvent` are now converted to `ROW_FORMAT=DYNAMIC`, the format
+  Frappe declares for them, when they are compressed. (#68)
+
+### Upgrade notes
+
+- **Behaviour changes**
+  - On a site whose `tabFile` or `tabEvent` is compressed, the first migrate prints
+    `Microsoft 365: converting `tabFile` from ROW_FORMAT=COMPRESSED to DYNAMIC …` and rebuilds that
+    table once. The rebuild holds writes to File (or Event) while it runs; on a large table, update
+    in a quiet window. Sites whose tables are already `DYNAMIC` (any site created by a current
+    Frappe) see nothing.
+- **Warnings to expect**
+  - `upgrade.compressed_tables` (fail) if a table could not be converted, for instance because
+    the rebuild timed out waiting for a lock. Migrate prints MariaDB's reason; run
+    `ALTER TABLE `tabFile` ROW_FORMAT=DYNAMIC KEY_BLOCK_SIZE=0;` in `bench --site <site> mariadb`
+    and migrate again (see docs/troubleshooting.md, *Row size too large*).
+- **Manual steps**
+  - A site stuck on a failed update to 1.2.0 can update straight to 1.2.1 and migrate. If
+    `tabFile` was already converted by hand, nothing more is needed.
+
 ## 1.2.0 — 2026-11-21
 
 Every bug found in the November audit, fixed and verified against the audit's reproductions:
