@@ -72,7 +72,7 @@ callback.
 
 | | Frappe version-15 | Frappe version-16 |
 | --- | --- | --- |
-| `requires-python` | `>=3.10,<3.15` | `>=3.14,<3.15` |
+| `requires-python` | `>=3.11,<3.15` (since 15.128; earlier `>=3.10`) | `>=3.14,<3.15` |
 | Node | 18+ | 24+ |
 | This app's floor | `requires-python = ">=3.10"` in `pyproject.toml`, ruff `target-version = "py310"` | same |
 
@@ -166,7 +166,7 @@ If the versions ever diverge in a way a capability's `min_frappe` cannot express
 
 ## Keeping it true
 
-CI (`.github/workflows/ci.yml`) runs a matrix: `version-15` on Python 3.10 and `version-16` on
+CI (`.github/workflows/ci.yml`) runs a matrix: `version-15` on Python 3.11 and `version-16` on
 Python 3.14. Each job does a real `bench init`, `new-site`, `install-app`, `migrate`, `bench build
 --app frappe_microsoft365` (checking both bundles were emitted) and the full test suite. A change that breaks either version fails before it merges. Do not drop a matrix leg
 to make a build green.
